@@ -1,0 +1,53 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# HUNTRESS Specific
+# Sensitive configuration
+config/*.env
+config/.env.*
+!config/.env.example
+
+# Recordings and backups
+recordings/*
+!recordings/.gitkeep
+backups/*
+!backups/.gitkeep
+
+# Proxy lists and scope files
+config/proxies.txt
+config/scope.json
+config/*.key
+
+# Rust
+target/
+Cargo.lock
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+logs/
+*.log
