@@ -1,0 +1,15 @@
+{
+  "current_production": null,
+  "versions": [],
+  "metadata": {
+    "last_updated": null,
+    "total_versions": 0,
+    "last_training": null
+  },
+  "schema_version": "1.0",
+  "notes": [
+    "This file tracks all trained model versions.",
+    "It is automatically updated by the ModelVersionManager.",
+    "Do not edit manually unless you know what you're doing."
+  ]
+}

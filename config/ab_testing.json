@@ -1,0 +1,34 @@
+{
+  "defaultConfig": {
+    "trafficSplit": 0.5,
+    "minSampleSize": 30,
+    "significanceLevel": 0.05,
+    "minImprovement": 0.05,
+    "maxDuration": 168
+  },
+  "rolloutStages": [
+    {
+      "name": "Canary",
+      "percentage": 10,
+      "durationHours": 24,
+      "healthCheckInterval": 30
+    },
+    {
+      "name": "Expanded",
+      "percentage": 50,
+      "durationHours": 24,
+      "healthCheckInterval": 60
+    },
+    {
+      "name": "Full",
+      "percentage": 100,
+      "durationHours": 0,
+      "healthCheckInterval": 0
+    }
+  ],
+  "successCriteria": {
+    "minSuccessRate": 0.65,
+    "maxFalsePositiveRate": 0.15,
+    "maxAvgTimeIncrease": 0.20
+  }
+}

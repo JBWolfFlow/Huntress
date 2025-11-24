@@ -1,0 +1,67 @@
+{
+  "training": {
+    "trigger_conditions": {
+      "min_new_examples": 10,
+      "max_days_since_training": 7,
+      "performance_decline_threshold": 0.10
+    },
+    "schedule": {
+      "preferred_hours": [2, 3, 4, 5],
+      "max_training_hours": 12,
+      "delay_between_sessions": 300
+    },
+    "resources": {
+      "max_gpu_memory": 0.8,
+      "max_cpu_cores": 12,
+      "max_disk_space_gb": 500,
+      "gpu_memory_threshold": 0.8
+    },
+    "data_preparation": {
+      "format": "jsonl",
+      "output_dir": "training_data",
+      "validation_split": 0.1,
+      "shuffle": true,
+      "quality_threshold": 0.6,
+      "max_examples": 1000
+    },
+    "model": {
+      "base_model": "meta-llama/Llama-3.1-70B-Instruct",
+      "base_model_path": "./models/llama-3.1-70b",
+      "lora_output_dir": "./models/huntress-lora",
+      "config_path": "./config/axolotl_config.yml"
+    },
+    "validation": {
+      "min_success_rate": 0.65,
+      "max_false_positive_rate": 0.15,
+      "min_test_coverage": 20,
+      "required_improvement": 0.05
+    },
+    "deployment": {
+      "strategy": "gradual",
+      "initial_traffic": 0.1,
+      "ramp_up_hours": 48,
+      "auto_rollback": true,
+      "rollback_threshold": 0.9
+    }
+  },
+  "monitoring": {
+    "track_quality_metrics": true,
+    "log_storage_operations": true,
+    "alert_on_low_quality": true,
+    "quality_alert_threshold": 0.5,
+    "metrics_collection_interval": 3600,
+    "performance_check_interval": 1800
+  },
+  "versioning": {
+    "max_versions": 10,
+    "keep_last_n": 5,
+    "cleanup_interval_days": 30,
+    "archive_old_versions": true
+  },
+  "logging": {
+    "level": "info",
+    "log_dir": "logs/training",
+    "max_log_size_mb": 100,
+    "max_log_files": 10
+  }
+}

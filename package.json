@@ -11,9 +11,11 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.70.1",
+    "@tailwindcss/postcss": "^4.1.17",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "axios": "^1.13.2",
+    "openid-client": "^6.8.1",
     "qdrant-client": "^0.0.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
@@ -23,6 +25,7 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "@types/node": "^24.10.1",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",

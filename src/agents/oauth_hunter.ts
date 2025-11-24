@@ -1,13 +1,13 @@
 /**
- * OAuth Hunter Agent
- * 
- * Specialized mini-agent for discovering OAuth misconfigurations and vulnerabilities.
- * Tests for common OAuth security issues including:
- * - Missing state parameter (CSRF)
- * - Open redirects in redirect_uri
- * - Token leakage
- * - Scope manipulation
+ * OAuth Hunter Agent (Legacy Wrapper)
+ *
+ * This file maintains backward compatibility while delegating to the new modular implementation.
+ * For new code, import from './oauth/' instead.
+ *
+ * @deprecated Use OAuthHunter from './oauth/index' for new implementations
  */
+
+import { OAuthHunter as NewOAuthHunter, OAuthHunterConfig, OAuthVulnerability, OAuthHuntResult } from './oauth';
 
 export interface OAuthConfig {
   authorizationEndpoint: string;
@@ -17,83 +17,48 @@ export interface OAuthConfig {
   scope: string[];
 }
 
-export interface OAuthVulnerability {
-  type: 'missing_state' | 'open_redirect' | 'token_leak' | 'scope_manipulation';
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  description: string;
-  evidence: string;
-  remediation: string;
-}
-
+/**
+ * Legacy OAuth Hunter class
+ * @deprecated Use OAuthHunter from './oauth/index' instead
+ */
 export class OAuthHunter {
   private config: OAuthConfig;
+  private newHunter: NewOAuthHunter;
 
   constructor(config: OAuthConfig) {
     this.config = config;
+    
+    // Extract target from authorization endpoint
+    const target = new URL(config.authorizationEndpoint).hostname;
+    
+    // Initialize new modular hunter
+    const hunterConfig: OAuthHunterConfig = {
+      target,
+      clientId: config.clientId,
+      redirectUri: config.redirectUri,
+    };
+    
+    this.newHunter = new NewOAuthHunter(hunterConfig);
   }
 
   /**
    * Test OAuth flow for vulnerabilities
+   * @deprecated Use hunt() method from new OAuthHunter instead
    */
   async testOAuthFlow(): Promise<OAuthVulnerability[]> {
-    const vulnerabilities: OAuthVulnerability[] = [];
-
-    // Test for missing state parameter
-    const stateVuln = await this.testMissingState();
-    if (stateVuln) vulnerabilities.push(stateVuln);
-
-    // Test for open redirect in redirect_uri
-    const redirectVuln = await this.testRedirectUri();
-    if (redirectVuln) vulnerabilities.push(redirectVuln);
-
-    // Test for token leakage
-    const tokenVuln = await this.testTokenLeakage();
-    if (tokenVuln) vulnerabilities.push(tokenVuln);
-
-    // Test for scope manipulation
-    const scopeVuln = await this.testScopeManipulation();
-    if (scopeVuln) vulnerabilities.push(scopeVuln);
-
-    return vulnerabilities;
-  }
-
-  private async testMissingState(): Promise<OAuthVulnerability | null> {
-    // TODO: Implement state parameter testing
-    return null;
-  }
-
-  private async testRedirectUri(): Promise<OAuthVulnerability | null> {
-    // TODO: Implement redirect_uri validation testing
-    return null;
-  }
-
-  private async testTokenLeakage(): Promise<OAuthVulnerability | null> {
-    // TODO: Implement token leakage testing
-    return null;
-  }
-
-  private async testScopeManipulation(): Promise<OAuthVulnerability | null> {
-    // TODO: Implement scope manipulation testing
-    return null;
+    const result = await this.newHunter.hunt();
+    return result.vulnerabilities;
   }
 
   /**
    * Generate proof of concept for OAuth vulnerability
    */
   generatePoC(vuln: OAuthVulnerability): string {
-    return `
-# OAuth Vulnerability: ${vuln.type}
-
-**Severity:** ${vuln.severity.toUpperCase()}
-**Description:** ${vuln.description}
-
-## Evidence:
-${vuln.evidence}
-
-## Remediation:
-${vuln.remediation}
-    `.trim();
+    return this.newHunter.generateReport(vuln);
   }
 }
 
+// Re-export new implementation for direct use
+export { NewOAuthHunter as OAuthHunterV2 };
+export type { OAuthHunterConfig, OAuthVulnerability, OAuthHuntResult };
 export default OAuthHunter;

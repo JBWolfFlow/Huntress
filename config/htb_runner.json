@@ -1,0 +1,43 @@
+{
+  "htb": {
+    "api_url": "https://www.hackthebox.com/api/v4",
+    "vpn_config": "/etc/openvpn/htb.ovpn",
+    "rate_limit_per_minute": 50
+  },
+  "runner": {
+    "max_concurrent_sessions": 1,
+    "session_timeout": 7200,
+    "delay_between_sessions": 300,
+    "max_retries": 3
+  },
+  "machine_selection": {
+    "strategy": "progressive",
+    "difficulty_thresholds": {
+      "easy_to_medium": 0.40,
+      "medium_to_hard": 0.60
+    },
+    "prefer_retired": true,
+    "avoid_insane_until_success_rate": 0.60
+  },
+  "agent": {
+    "model": "llama-3.1-70b-lora",
+    "max_iterations": 50,
+    "timeout": 7200,
+    "record_all": true,
+    "verbose_mode": true
+  },
+  "data_collection": {
+    "storage": "qdrant",
+    "quality_threshold": 0.6,
+    "auto_cleanup": true,
+    "retention_days": 90,
+    "save_recordings": true,
+    "recording_format": "asciinema"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "htb_runner.log",
+    "max_size_mb": 100,
+    "backup_count": 5
+  }
+}

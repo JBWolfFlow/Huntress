@@ -7,6 +7,7 @@ export default {
   theme: {
     extend: {
       colors: {
+        // Professional NSA-grade dark theme
         primary: {
           50: '#f0f9ff',
           100: '#e0f2fe',
@@ -31,6 +32,34 @@ export default {
           800: '#991b1b',
           900: '#7f1d1d',
         },
+        // SpaceX-inspired professional palette
+        space: {
+          50: '#f8fafc',
+          100: '#f1f5f9',
+          200: '#e2e8f0',
+          300: '#cbd5e1',
+          400: '#94a3b8',
+          500: '#64748b',
+          600: '#475569',
+          700: '#334155',
+          800: '#1e293b',
+          900: '#0f172a',
+          950: '#020617',
+        },
+        cyber: {
+          green: '#00ff41',
+          blue: '#00d9ff',
+          red: '#ff0040',
+          yellow: '#ffcc00',
+          purple: '#b026ff',
+        },
+      },
+      fontFamily: {
+        mono: ['JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', 'monospace'],
+        sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+      },
+      letterSpacing: {
+        'ultra-wide': '0.2em',
       },
     },
   },

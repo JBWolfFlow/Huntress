@@ -1,0 +1,223 @@
+{
+  "testEnvironment": "node",
+  "testTimeout": 30000,
+  "setupFilesAfterEnv": ["<rootDir>/src/tests/phase5_test_utils.ts"],
+  
+  "thresholds": {
+    "performance": {
+      "dataCollection": {
+        "maxProcessingTime": 5000,
+        "maxExamplesPerSecond": 10
+      },
+      "training": {
+        "maxSetupTime": 10000,
+        "maxTrainingTimePerExample": 1000
+      },
+      "modelLoading": {
+        "maxLoadTime": 30000,
+        "maxMemoryMB": 10000
+      },
+      "deployment": {
+        "maxRolloutTime": 300000,
+        "maxRollbackTime": 300000
+      },
+      "healthCheck": {
+        "maxCheckTime": 5000,
+        "maxOverhead": 0.05
+      }
+    },
+    
+    "reliability": {
+      "minSuccessRate": 0.95,
+      "maxRetries": 3,
+      "maxFailureRate": 0.05,
+      "recoveryTimeSeconds": 60
+    },
+    
+    "quality": {
+      "minCodeCoverage": 0.80,
+      "minSuccessRate": 0.65,
+      "maxFalsePositiveRate": 0.15,
+      "minTestSamples": 30
+    },
+    
+    "security": {
+      "sensitivePatterns": [
+        "password",
+        "api_key",
+        "token",
+        "secret",
+        "private_key"
+      ],
+      "maxSensitiveDataLeaks": 0
+    }
+  },
+  
+  "mockData": {
+    "htbMachines": [
+      {
+        "id": 1,
+        "name": "TestMachine1",
+        "os": "linux",
+        "difficulty": "easy",
+        "ip": "10.10.10.1"
+      },
+      {
+        "id": 2,
+        "name": "TestMachine2",
+        "os": "windows",
+        "difficulty": "medium",
+        "ip": "10.10.10.2"
+      },
+      {
+        "id": 3,
+        "name": "TestMachine3",
+        "os": "linux",
+        "difficulty": "hard",
+        "ip": "10.10.10.3"
+      }
+    ],
+    
+    "trainingExamples": {
+      "count": 100,
+      "successRate": 0.70,
+      "avgDuration": 3600,
+      "difficulties": {
+        "easy": 30,
+        "medium": 40,
+        "hard": 30
+      }
+    },
+    
+    "modelVersions": {
+      "count": 5,
+      "productionVersion": "v20250101-000000",
+      "testingVersion": "v20250102-000000"
+    }
+  },
+  
+  "testScenarios": {
+    "unit": {
+      "htbAPI": {
+        "testConnection": true,
+        "testMachineListing": true,
+        "testSpawning": true,
+        "testFlagSubmission": true,
+        "testRateLimiting": true
+      },
+      "dataCollector": {
+        "testQualityScoring": true,
+        "testSensitiveDataFiltering": true,
+        "testQdrantStorage": true,
+        "testDataCleaning": true
+      },
+      "trainingManager": {
+        "testDataPreparation": true,
+        "testJobSubmission": true,
+        "testProgressMonitoring": true,
+        "testResourceValidation": true
+      },
+      "modelManager": {
+        "testVersioning": true,
+        "testPromotion": true,
+        "testRollback": true,
+        "testCleanup": true
+      },
+      "learningLoop": {
+        "testTriggerDetection": true,
+        "testWorkflowOrchestration": true,
+        "testStateManagement": true,
+        "testErrorRecovery": true
+      },
+      "abTesting": {
+        "testStatisticalTests": true,
+        "testWinnerSelection": true,
+        "testGradualRollout": true,
+        "testMetricsCollection": true
+      },
+      "performanceMonitor": {
+        "testMetricsCollection": true,
+        "testAnomalyDetection": true,
+        "testTrendAnalysis": true,
+        "testAlertGeneration": true
+      },
+      "deploymentManager": {
+        "testValidationGates": true,
+        "testHealthChecks": true,
+        "testRollback": true,
+        "testStrategies": true
+      },
+      "healthChecker": {
+        "testComponentChecks": true,
+        "testSelfHealing": true,
+        "testAlertGeneration": true,
+        "testResourceMonitoring": true
+      },
+      "readinessChecker": {
+        "testQualityGates": true,
+        "testSystemHealth": true,
+        "testSecurityAudit": true,
+        "testRollbackCapability": true
+      }
+    },
+    
+    "integration": {
+      "dataCollectionPipeline": true,
+      "trainingPipeline": true,
+      "learningLoopWorkflow": true,
+      "abTestingFlow": true,
+      "deploymentFlow": true,
+      "healthMonitoring": true,
+      "endToEnd": true
+    },
+    
+    "performance": {
+      "dataCollectionSpeed": true,
+      "trainingSpeed": true,
+      "modelLoadingSpeed": true,
+      "deploymentSpeed": true,
+      "rollbackSpeed": true,
+      "healthCheckOverhead": true,
+      "concurrentOperations": true,
+      "resourceUsage": true
+    },
+    
+    "reliability": {
+      "networkFailures": true,
+      "resourceExhaustion": true,
+      "trainingFailures": true,
+      "deploymentFailures": true,
+      "rollbackScenarios": true,
+      "stateRecovery": true,
+      "idempotency": true,
+      "circuitBreakers": true
+    },
+    
+    "security": {
+      "sensitiveDataFiltering": true,
+      "dataIsolation": true,
+      "accessControl": true,
+      "auditLogging": true,
+      "configurationSecurity": true,
+      "modelSecurity": true,
+      "apiSecurity": true
+    }
+  },
+  
+  "cicd": {
+    "enabled": true,
+    "parallelJobs": 4,
+    "retryFailedTests": true,
+    "maxRetries": 2,
+    "coverageReporting": true,
+    "artifactRetention": 30
+  },
+  
+  "reporting": {
+    "format": "json",
+    "outputDir": "test-results",
+    "includeTimings": true,
+    "includeCoverage": true,
+    "includeMetrics": true
+  }
+}

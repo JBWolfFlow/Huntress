@@ -1,0 +1,84 @@
+{
+  "testSet": {
+    "totalMachines": 20,
+    "distribution": {
+      "easy": 10,
+      "medium": 7,
+      "hard": 3
+    },
+    "timeout": 7200,
+    "retries": 0
+  },
+  "qualityGates": {
+    "minSuccessRate": {
+      "enabled": true,
+      "threshold": 0.65,
+      "critical": true,
+      "description": "Minimum 65% success rate required for production"
+    },
+    "maxFalsePositiveRate": {
+      "enabled": true,
+      "threshold": 0.15,
+      "critical": true,
+      "description": "Maximum 15% false positive rate allowed"
+    },
+    "maxExecutionTime": {
+      "enabled": true,
+      "threshold": 7200,
+      "critical": false,
+      "description": "Maximum 2 hours average execution time"
+    },
+    "minTestSamples": {
+      "enabled": true,
+      "threshold": 20,
+      "critical": true,
+      "description": "Minimum 20 test samples required"
+    }
+  },
+  "performanceTargets": {
+    "byDifficulty": {
+      "easy": {
+        "minSuccessRate": 0.70,
+        "maxExecutionTime": 2400
+      },
+      "medium": {
+        "minSuccessRate": 0.50,
+        "maxExecutionTime": 4800
+      },
+      "hard": {
+        "minSuccessRate": 0.30,
+        "maxExecutionTime": 7200
+      }
+    }
+  },
+  "statisticalTests": {
+    "chiSquare": {
+      "enabled": true,
+      "significanceLevel": 0.05,
+      "description": "Chi-square test for success rate difference"
+    },
+    "tTest": {
+      "enabled": true,
+      "significanceLevel": 0.05,
+      "description": "T-test for execution time difference"
+    },
+    "effectSize": {
+      "enabled": true,
+      "minEffectSize": 0.2,
+      "description": "Cohen's d effect size calculation"
+    }
+  },
+  "regressionDetection": {
+    "enabled": true,
+    "maxPerformanceDrop": 0.05,
+    "maxFalsePositiveIncrease": 0.20,
+    "description": "Detect performance regression vs baseline"
+  },
+  "reporting": {
+    "outputDir": "test-reports/phase5-validation",
+    "formats": ["json", "markdown"],
+    "includeDetailedResults": true,
+    "includeMachineByMachine": true,
+    "includeStatisticalAnalysis": true
+  }
+}

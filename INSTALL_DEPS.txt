@@ -1,0 +1,70 @@
+================================================================================
+HUNTRESS - Quick Dependency Installation
+================================================================================
+
+OPTION 1: Run the setup script (RECOMMENDED)
+---------------------------------------------
+cd huntress
+./setup.sh
+
+
+OPTION 2: Manual installation command
+--------------------------------------
+sudo apt-get update && sudo apt-get install -y \
+  libglib2.0-dev \
+  libgtk-3-dev \
+  libwebkit2gtk-4.1-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  patchelf \
+  build-essential \
+  curl \
+  wget \
+  file \
+  libssl-dev \
+  pkg-config
+
+
+OPTION 3: Individual packages (if you have issues)
+---------------------------------------------------
+sudo apt-get update
+sudo apt-get install -y libglib2.0-dev
+sudo apt-get install -y libgtk-3-dev
+sudo apt-get install -y libwebkit2gtk-4.1-dev
+sudo apt-get install -y libayatana-appindicator3-dev
+sudo apt-get install -y librsvg2-dev
+sudo apt-get install -y patchelf
+sudo apt-get install -y build-essential
+sudo apt-get install -y curl wget file
+sudo apt-get install -y libssl-dev pkg-config
+
+
+After installing dependencies:
+-------------------------------
+1. Install Node.js dependencies:
+   npm install
+
+2. Build the Rust backend:
+   cd src-tauri && cargo build
+
+3. Run in development mode:
+   npm run tauri dev
+
+4. Build for production:
+   npm run tauri build
+
+
+Troubleshooting:
+----------------
+If you get "package not found" errors:
+- Make sure you're on a Debian/Ubuntu-based system
+- Try: sudo apt-get update
+- Check your /etc/apt/sources.list
+
+If cargo build still fails:
+- Check Rust is installed: rustc --version
+- Update Rust: rustup update
+- Clean build: cargo clean && cargo build
+
+For more help, see SETUP.md
+================================================================================

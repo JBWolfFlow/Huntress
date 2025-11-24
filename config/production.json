@@ -1,0 +1,155 @@
+{
+  "environment": "production",
+  "deployment": {
+    "strategy": "gradual",
+    "autoApprove": false,
+    "requireManualApproval": true,
+    "approvers": ["admin"],
+    "maintenanceWindow": {
+      "enabled": false,
+      "startHour": 2,
+      "endHour": 6,
+      "timezone": "America/Chicago"
+    }
+  },
+  "readiness": {
+    "qualityGates": {
+      "minSuccessRate": {
+        "enabled": true,
+        "threshold": 0.65,
+        "critical": true
+      },
+      "maxFalsePositiveRate": {
+        "enabled": true,
+        "threshold": 0.15,
+        "critical": true
+      },
+      "maxExecutionTime": {
+        "enabled": true,
+        "threshold": 7200,
+        "critical": false
+      },
+      "minTestSamples": {
+        "enabled": true,
+        "threshold": 20,
+        "critical": true
+      }
+    },
+    "systemHealth": {
+      "checkQdrant": true,
+      "checkGPU": true,
+      "checkDiskSpace": true,
+      "checkMemory": true,
+      "minDiskSpaceGB": 100,
+      "minMemoryGB": 32,
+      "maxGPUUtilization": 0.8
+    },
+    "security": {
+      "checkSensitiveData": true,
+      "checkCredentials": true,
+      "checkAPIKeys": true
+    },
+    "performance": {
+      "runBenchmarks": true,
+      "benchmarkTimeout": 3600,
+      "compareToBaseline": true
+    },
+    "rollback": {
+      "verifyCapability": true,
+      "testRollback": false
+    }
+  },
+  "rollback": {
+    "maxRollbackTime": 300,
+    "validateAfterRollback": true,
+    "runHealthChecks": true,
+    "notifyOnRollback": true,
+    "backupBeforeRollback": true,
+    "auditLog": {
+      "enabled": true,
+      "path": "logs/rollback-audit.log"
+    },
+    "autoRollback": {
+      "enabled": true,
+      "triggers": {
+        "performanceDrop": {
+          "enabled": true,
+          "threshold": 0.15,
+          "description": "Rollback if performance drops >15%"
+        },
+        "errorRateSpike": {
+          "enabled": true,
+          "threshold": 0.10,
+          "description": "Rollback if error rate exceeds 10%"
+        },
+        "healthCheckFailure": {
+          "enabled": true,
+          "consecutiveFailures": 3,
+          "description": "Rollback after 3 consecutive health check failures"
+        }
+      }
+    }
+  },
+  "monitoring": {
+    "enabled": true,
+    "metricsCollectionInterval": 3600,
+    "healthCheckInterval": 300,
+    "alerting": {
+      "enabled": true,
+      "channels": ["log", "email"],
+      "thresholds": {
+        "successRateDrop": 0.10,
+        "falsePositiveSpike": 5,
+        "executionTimeIncrease": 0.20,
+        "resourceUtilization": 0.90
+      }
+    },
+    "retention": {
+      "metricsRetentionDays": 90,
+      "logsRetentionDays": 30,
+      "deploymentsRetentionDays": 365
+    }
+  },
+  "safety": {
+    "killSwitch": {
+      "enabled": true,
+      "triggers": ["manual", "critical_error", "security_breach"]
+    },
+    "rateLimiting": {
+      "enabled": true,
+      "maxRequestsPerHour": 100,
+      "maxConcurrentSessions": 5
+    },
+    "scopeValidation": {
+      "enabled": true,
+      "strictMode": true,
+      "requireApproval": true
+    }
+  },
+  "performance": {
+    "caching": {
+      "enabled": true,
+      "ttl": 3600
+    },
+    "optimization": {
+      "batchProcessing": true,
+      "parallelExecution": false,
+      "maxConcurrency": 1
+    }
+  },
+  "backup": {
+    "enabled": true,
+    "schedule": "0 2 * * *",
+    "retention": 7,
+    "includeModels": true,
+    "includeConfigs": true,
+    "includeMetrics": true,
+    "destination": "backups/"
+  },
+  "compliance": {
+    "auditLogging": true,
+    "dataRetention": true,
+    "accessControl": true,
+    "encryptionAtRest": true
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "strategy": "gradual",
+  "validation": {
+    "enabled": true,
+    "minSuccessRate": 0.65,
+    "maxFalsePositiveRate": 0.15,
+    "minTestSamples": 20
+  },
+  "rollout": {
+    "stages": [
+      {
+        "name": "Initial Rollout",
+        "trafficPercentage": 10,
+        "durationMinutes": 60,
+        "successCriteria": {
+          "minSuccessRate": 0.65,
+          "maxErrorRate": 0.05
+        }
+      },
+      {
+        "name": "Expanded Rollout",
+        "trafficPercentage": 50,
+        "durationMinutes": 120,
+        "successCriteria": {
+          "minSuccessRate": 0.65,
+          "maxErrorRate": 0.05
+        }
+      },
+      {
+        "name": "Full Deployment",
+        "trafficPercentage": 100,
+        "durationMinutes": 0,
+        "successCriteria": {
+          "minSuccessRate": 0.65,
+          "maxErrorRate": 0.05
+        }
+      }
+    ],
+    "healthCheckInterval": 300,
+    "rollbackThreshold": 10
+  },
+  "monitoring": {
+    "enabled": true,
+    "alertOnDegradation": true,
+    "metricsRetentionDays": 90
+  },
+  "scheduler": {
+    "enabled": true,
+    "checkIntervalMinutes": 60,
+    "preferredHours": [2, 3, 4],
+    "timezone": "America/Chicago",
+    "maintenanceWindows": [],
+    "resourceThresholds": {
+      "maxGpuUtilization": 0.8,
+      "maxCpuUtilization": 0.8,
+      "maxMemoryUtilization": 0.8,
+      "maxDiskUtilization": 0.9,
+      "minAvailableDiskGB": 100
+    },
+    "priority": "normal"
+  }
+}

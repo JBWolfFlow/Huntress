@@ -1,0 +1,28 @@
+{
+  "triggers": {
+    "minNewExamples": 10,
+    "maxDaysSinceTraining": 7,
+    "performanceDeclineThreshold": 10,
+    "manualTrigger": false
+  },
+  "training": {
+    "minExamples": 10,
+    "qualityThreshold": 0.6,
+    "configPath": "config/axolotl_config.yml",
+    "outputDir": "models"
+  },
+  "validation": {
+    "minSuccessRate": 0.65,
+    "maxFalsePositiveRate": 0.15,
+    "testSetSize": 20
+  },
+  "deployment": {
+    "strategy": "gradual",
+    "gradualRolloutSteps": [10, 50, 100],
+    "autoRollback": true
+  },
+  "monitoring": {
+    "checkIntervalMs": 3600000,
+    "metricsRetentionDays": 90
+  }
+}

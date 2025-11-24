@@ -1,0 +1,349 @@
+{
+  "general": {
+    "enabled": true,
+    "environment": "production",
+    "updateInterval": 5000,
+    "retentionDays": 90
+  },
+  "metrics": {
+    "collection": {
+      "enabled": true,
+      "interval": 3600,
+      "batchSize": 50,
+      "timeout": 30000
+    },
+    "categories": {
+      "performance": {
+        "enabled": true,
+        "metrics": [
+          "successRate",
+          "avgTimeToSuccess",
+          "medianTimeToSuccess",
+          "falsePositiveRate",
+          "duplicateRate"
+        ]
+      },
+      "efficiency": {
+        "enabled": true,
+        "metrics": [
+          "avgToolsUsed",
+          "avgIterations",
+          "novelTechniques",
+          "techniqueReuse"
+        ]
+      },
+      "resources": {
+        "enabled": true,
+        "metrics": [
+          "gpuMemory",
+          "gpuUtilization",
+          "cpuUsage",
+          "memoryUsage",
+          "diskIO"
+        ]
+      },
+      "quality": {
+        "enabled": true,
+        "metrics": [
+          "validationLoss",
+          "trainingAccuracy",
+          "testAccuracy",
+          "dataQuality"
+        ]
+      }
+    },
+    "aggregation": {
+      "enabled": true,
+      "windows": [
+        {"name": "1hour", "seconds": 3600},
+        {"name": "6hours", "seconds": 21600},
+        {"name": "24hours", "seconds": 86400},
+        {"name": "7days", "seconds": 604800}
+      ]
+    }
+  },
+  "healthChecks": {
+    "enabled": true,
+    "interval": 300,
+    "timeout": 10000,
+    "checks": {
+      "qdrant": {
+        "enabled": true,
+        "critical": true,
+        "timeout": 5000
+      },
+      "modelManager": {
+        "enabled": true,
+        "critical": true,
+        "timeout": 5000
+      },
+      "performanceMonitor": {
+        "enabled": true,
+        "critical": false,
+        "timeout": 5000
+      },
+      "fileSystem": {
+        "enabled": true,
+        "critical": true,
+        "timeout": 5000
+      },
+      "gpu": {
+        "enabled": true,
+        "critical": false,
+        "timeout": 5000
+      },
+      "memory": {
+        "enabled": true,
+        "critical": true,
+        "timeout": 5000
+      },
+      "diskSpace": {
+        "enabled": true,
+        "critical": true,
+        "timeout": 5000
+      }
+    },
+    "failureThresholds": {
+      "consecutiveFailures": 3,
+      "failureRateWindow": 300,
+      "maxFailureRate": 0.5
+    }
+  },
+  "alerting": {
+    "enabled": true,
+    "channels": {
+      "console": {
+        "enabled": true,
+        "minSeverity": "warning"
+      },
+      "log": {
+        "enabled": true,
+        "minSeverity": "info",
+        "path": "logs/alerts.log"
+      },
+      "email": {
+        "enabled": false,
+        "minSeverity": "critical",
+        "recipients": [],
+        "smtpConfig": {}
+      },
+      "webhook": {
+        "enabled": false,
+        "minSeverity": "high",
+        "url": "",
+        "headers": {}
+      }
+    },
+    "rules": {
+      "performanceDegradation": {
+        "enabled": true,
+        "severity": "high",
+        "condition": "successRate < baseline * 0.85",
+        "description": "Success rate dropped >15% from baseline",
+        "cooldown": 3600
+      },
+      "falsePositiveSpike": {
+        "enabled": true,
+        "severity": "medium",
+        "condition": "falsePositiveRate > baseline + 5",
+        "description": "False positive rate increased significantly",
+        "cooldown": 3600
+      },
+      "executionTimeIncrease": {
+        "enabled": true,
+        "severity": "medium",
+        "condition": "avgTimeToSuccess > baseline * 1.5",
+        "description": "Execution time increased >50%",
+        "cooldown": 3600
+      },
+      "resourceExhaustion": {
+        "enabled": true,
+        "severity": "critical",
+        "conditions": [
+          "diskSpace < 10GB",
+          "memory < 4GB",
+          "gpuMemory > 95%"
+        ],
+        "description": "System resources critically low",
+        "cooldown": 1800
+      },
+      "healthCheckFailure": {
+        "enabled": true,
+        "severity": "critical",
+        "condition": "consecutiveFailures >= 3",
+        "description": "Multiple consecutive health check failures",
+        "cooldown": 900
+      },
+      "deploymentFailure": {
+        "enabled": true,
+        "severity": "critical",
+        "condition": "deployment.status === 'failed'",
+        "description": "Deployment failed",
+        "cooldown": 0
+      },
+      "rollbackTriggered": {
+        "enabled": true,
+        "severity": "high",
+        "condition": "rollback.triggered === true",
+        "description": "Emergency rollback executed",
+        "cooldown": 0
+      }
+    },
+    "escalation": {
+      "enabled": true,
+      "levels": [
+        {
+          "severity": "critical",
+          "delay": 0,
+          "channels": ["console", "log", "email"]
+        },
+        {
+          "severity": "high",
+          "delay": 300,
+          "channels": ["console", "log"]
+        },
+        {
+          "severity": "medium",
+          "delay": 900,
+          "channels": ["log"]
+        }
+      ]
+    }
+  },
+  "anomalyDetection": {
+    "enabled": true,
+    "algorithms": {
+      "statisticalOutlier": {
+        "enabled": true,
+        "stdDevThreshold": 3,
+        "minSamples": 20
+      },
+      "trendAnalysis": {
+        "enabled": true,
+        "windowSize": 20,
+        "significanceLevel": 0.05
+      },
+      "seasonalDecomposition": {
+        "enabled": false,
+        "period": 24
+      }
+    },
+    "metrics": [
+      "successRate",
+      "falsePositiveRate",
+      "avgTimeToSuccess",
+      "resourceUtilization"
+    ]
+  },
+  "dashboard": {
+    "enabled": true,
+    "refreshInterval": 5000,
+    "widgets": {
+      "currentMetrics": {
+        "enabled": true,
+        "position": {"row": 0, "col": 0, "width": 6, "height": 2}
+      },
+      "performanceTrends": {
+        "enabled": true,
+        "position": {"row": 0, "col": 6, "width": 6, "height": 2}
+      },
+      "healthStatus": {
+        "enabled": true,
+        "position": {"row": 2, "col": 0, "width": 4, "height": 2}
+      },
+      "activeAlerts": {
+        "enabled": true,
+        "position": {"row": 2, "col": 4, "width": 4, "height": 2}
+      },
+      "resourceUsage": {
+        "enabled": true,
+        "position": {"row": 2, "col": 8, "width": 4, "height": 2}
+      },
+      "deploymentHistory": {
+        "enabled": true,
+        "position": {"row": 4, "col": 0, "width": 6, "height": 2}
+      },
+      "modelVersions": {
+        "enabled": true,
+        "position": {"row": 4, "col": 6, "width": 6, "height": 2}
+      },
+      "abTestResults": {
+        "enabled": true,
+        "position": {"row": 6, "col": 0, "width": 12, "height": 2}
+      }
+    },
+    "charts": {
+      "successRate": {
+        "type": "line",
+        "timeWindow": "24hours",
+        "showBaseline": true,
+        "showThreshold": true
+      },
+      "executionTime": {
+        "type": "line",
+        "timeWindow": "24hours",
+        "showMedian": true
+      },
+      "resourceUtilization": {
+        "type": "area",
+        "timeWindow": "6hours",
+        "stacked": true
+      },
+      "difficultyBreakdown": {
+        "type": "bar",
+        "groupBy": "difficulty"
+      }
+    }
+  },
+  "reporting": {
+    "enabled": true,
+    "schedule": {
+      "daily": {
+        "enabled": true,
+        "time": "08:00",
+        "timezone": "America/Chicago"
+      },
+      "weekly": {
+        "enabled": true,
+        "day": "monday",
+        "time": "09:00",
+        "timezone": "America/Chicago"
+      },
+      "monthly": {
+        "enabled": true,
+        "day": 1,
+        "time": "10:00",
+        "timezone": "America/Chicago"
+      }
+    },
+    "formats": ["json", "markdown", "pdf"],
+    "includeCharts": true,
+    "includeRawData": false,
+    "destination": "reports/monitoring"
+  },
+  "dataExport": {
+    "enabled": true,
+    "formats": ["json", "csv"],
+    "compression": true,
+    "encryption": false,
+    "destination": "exports/monitoring",
+    "schedule": "0 0 * * 0"
+  },
+  "integration": {
+    "prometheus": {
+      "enabled": false,
+      "port": 9090,
+      "path": "/metrics"
+    },
+    "grafana": {
+      "enabled": false,
+      "url": "",
+      "apiKey": ""
+    },
+    "elasticsearch": {
+      "enabled": false,
+      "url": "",
+      "index": "huntress-metrics"
+    }
+  }
+}

@@ -25,29 +25,95 @@ dist-ssr
 
 # HUNTRESS Specific
 # Sensitive configuration
+.env
+.env.*
+!.env.example
 config/*.env
 config/.env.*
 !config/.env.example
+
+# API Keys and Credentials
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*_rsa
+*_dsa
+*_ecdsa
+*_ed25519
 
 # Recordings and backups
 recordings/*
 !recordings/.gitkeep
 backups/*
 !backups/.gitkeep
+src-tauri/recordings/*
+!src-tauri/recordings/.gitkeep
+
+# Tool outputs
+src-tauri/huntress_tool_outputs/*
+!src-tauri/huntress_tool_outputs/.gitkeep
 
 # Proxy lists and scope files
 config/proxies.txt
+config/proxies.json
 config/scope.json
+config/scope.txt
 config/*.key
+
+# Training data and models
+models/*
+!models/.gitkeep
+training_data/*
+!training_data/.gitkeep
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Qdrant data
+qdrant_storage/
+.qdrant/
 
 # Rust
 target/
 Cargo.lock
+**/*.rs.bk
 
 # Database
 *.db
 *.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
 
 # Logs
 logs/
 *.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Kill switch state
+config/kill_switch.lock

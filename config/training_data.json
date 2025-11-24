@@ -1,0 +1,65 @@
+{
+  "collection": {
+    "name": "training_data",
+    "vector_size": 1536,
+    "distance": "cosine"
+  },
+  "quality": {
+    "min_quality_score": 0.6,
+    "weights": {
+      "completeness": 0.3,
+      "clarity": 0.2,
+      "efficiency": 0.2,
+      "novelty": 0.15,
+      "reliability": 0.15
+    }
+  },
+  "filtering": {
+    "remove_sensitive_data": true,
+    "normalize_outputs": true,
+    "extract_patterns": true,
+    "max_output_length": 10000
+  },
+  "sensitive_patterns": [
+    "password[=:]\\s*\\S+",
+    "api[_-]?key[=:]\\s*\\S+",
+    "token[=:]\\s*\\S+",
+    "secret[=:]\\s*\\S+",
+    "Bearer\\s+[A-Za-z0-9\\-._~+/]+=*",
+    "sk-[A-Za-z0-9]{48}",
+    "ghp_[A-Za-z0-9]{36}"
+  ],
+  "storage": {
+    "qdrant_url": "${QDRANT_URL}",
+    "qdrant_api_key": "${QDRANT_API_KEY}",
+    "backup_enabled": true,
+    "backup_interval_hours": 24,
+    "backup_retention_days": 30
+  },
+  "embeddings": {
+    "provider": "openai",
+    "model": "text-embedding-ada-002",
+    "api_key": "${OPENAI_API_KEY}",
+    "batch_size": 100,
+    "max_retries": 3
+  },
+  "training": {
+    "trigger_conditions": {
+      "min_new_examples": 10,
+      "max_days_since_training": 7,
+      "performance_decline_threshold": 0.10
+    },
+    "data_preparation": {
+      "format": "jsonl",
+      "output_dir": "training_data",
+      "validation_split": 0.1,
+      "shuffle": true
+    }
+  },
+  "monitoring": {
+    "track_quality_metrics": true,
+    "log_storage_operations": true,
+    "alert_on_low_quality": true,
+    "quality_alert_threshold": 0.5
+  }
+}
