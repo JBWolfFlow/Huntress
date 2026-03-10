@@ -39,4 +39,6 @@ ctrlc = "3.4"
 hostname = "0.4"
 dirs = "5"
 ring = "0.17"
+bollard = { version = "0.18", features = ["ssl"] }
+futures-util = "0.3"
 

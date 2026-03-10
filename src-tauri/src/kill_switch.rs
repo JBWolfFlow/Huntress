@@ -387,6 +387,7 @@ pub async fn get_last_kill_event(
 /// CRITICAL PRODUCTION FIX:
 /// - Wires SIGTERM/SIGINT (Ctrl+C) to kill switch
 /// - Ensures all processes are killed on termination
+/// - Destroys all sandbox containers on emergency stop
 /// - Prevents stuck processes that continue making requests
 /// - Uses the same shared KillSwitch instance as Tauri commands
 pub fn setup_signal_handlers(kill_switch: Arc<Mutex<KillSwitch>>) {
@@ -405,6 +406,26 @@ pub fn setup_signal_handlers(kill_switch: Arc<Mutex<KillSwitch>>) {
             }
         } else {
             error!("Failed to acquire kill switch lock during signal handler");
+        }
+
+        // Emergency sandbox cleanup — destroy all containers
+        // Run in a blocking tokio context since we're in a signal handler
+        if let Ok(rt) = tokio::runtime::Runtime::new() {
+            rt.block_on(async {
+                match crate::sandbox::SandboxManager::new().await {
+                    Ok(mgr) => {
+                        match mgr.destroy_all().await {
+                            Ok(count) => {
+                                if count > 0 {
+                                    error!("Emergency: destroyed {} sandbox containers", count);
+                                }
+                            }
+                            Err(e) => error!("Failed to destroy sandboxes on signal: {}", e),
+                        }
+                    }
+                    Err(_) => {} // Docker/Podman not available, nothing to clean up
+                }
+            });
         }
 
         // Give processes time to clean up

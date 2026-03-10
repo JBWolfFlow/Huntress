@@ -29,6 +29,7 @@ pub mod proxy_pool;
 pub mod h1_api;
 pub mod secure_storage;
 pub mod tool_checker;
+pub mod sandbox;
 
 // Re-exports for convenience
 pub use safe_to_test::{ScopeEntry, ScopeValidator, ScopeError};
@@ -37,6 +38,7 @@ pub use kill_switch::{KillSwitch, KillReason, KillEvent, KillSwitchError};
 pub use proxy_pool::{ProxyPool, ProxyConfig, ProxyType, RotationStrategy, HealthStatus, ProxyError};
 
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as TokioMutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize the application
@@ -93,9 +95,32 @@ pub fn run() {
     // Wire signal handlers to the shared instance
     kill_switch::setup_signal_handlers(Arc::clone(&kill_switch));
 
+    // Initialize SandboxManager (Docker/Podman) — wrapped in Option because
+    // the runtime might not be available on all systems
+    let sandbox_state: Arc<TokioMutex<Option<sandbox::SandboxManager>>> =
+        Arc::new(TokioMutex::new(None));
+
+    // Try to connect to Docker/Podman asynchronously during startup
+    let sandbox_init = Arc::clone(&sandbox_state);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async {
+            match sandbox::SandboxManager::new().await {
+                Ok(mgr) => {
+                    tracing::info!("Sandbox manager initialized (runtime: {})", mgr.runtime_type());
+                    *sandbox_init.lock().await = Some(mgr);
+                }
+                Err(e) => {
+                    tracing::warn!("Sandbox manager unavailable: {} — sandbox features disabled", e);
+                }
+            }
+        });
+    });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(kill_switch)
+        .manage(sandbox_state)
         .invoke_handler(tauri::generate_handler![
             // Safe-to-test commands
             safe_to_test::load_scope,
@@ -127,6 +152,12 @@ pub fn run() {
             tool_checker::check_installed_tools,
             tool_checker::get_missing_required_tools,
             tool_checker::get_tool_summary,
+            // Sandbox commands
+            sandbox::create_sandbox,
+            sandbox::sandbox_exec,
+            sandbox::destroy_sandbox,
+            sandbox::list_sandboxes,
+            sandbox::destroy_all_sandboxes,
             // File operations for tool output management
             write_tool_output,
             read_tool_output,
