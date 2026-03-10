@@ -63,6 +63,7 @@ import { OOBServer } from '../validation/oob_server';
 import type { OOBCallback } from '../validation/oob_server';
 import { FeedbackLoop } from '../training/feedback_loop';
 import type { SubmittedReport, FeedbackStats } from '../training/feedback_loop';
+import { deduplicateFindings } from './finding_dedup';
 
 // ─── Callback Types ───────────────────────────────────────────────────────────
 
@@ -1171,12 +1172,17 @@ What is your next action?`;
     this.huntSession.activeAgents = Math.max(0, this.huntSession.activeAgents - 1);
     this.huntSession.completedDispatches++;
 
-    // Collect findings
+    // Collect findings — deduplicate against existing findings first
     if (result.findings.length > 0) {
-      this.huntSession.allFindings.push(...result.findings);
+      const combined = [...this.huntSession.allFindings, ...result.findings];
+      const deduped = deduplicateFindings(combined);
+      // Only add findings that survived dedup and aren't already in allFindings
+      const existingIds = new Set(this.huntSession.allFindings.map(f => f.id));
+      const newFindings = deduped.filter(f => !existingIds.has(f.id));
+      this.huntSession.allFindings = deduped;
 
-      // Emit each finding to the chat and post to blackboard
-      for (const finding of result.findings) {
+      // Emit each NEW finding to the chat and post to blackboard
+      for (const finding of newFindings) {
         this.addFinding({
           title: finding.title,
           severity: finding.severity as Severity,

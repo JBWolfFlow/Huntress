@@ -8,6 +8,12 @@
 import type { ModelProvider } from '../core/providers/types';
 import type { BaseAgent, AgentTask, AgentResult, AgentStatus } from './base_agent';
 import { getAllAgents, findAgentsForVulnClass, initializeCatalog } from './agent_catalog';
+import {
+  classifyTaskComplexity,
+  selectModelForTask,
+  type AgentModelOverride,
+  type SelectedModel,
+} from '../core/orchestrator/cost_router';
 
 // Import all agent modules to trigger catalog registration
 import './recon_agent';
@@ -21,6 +27,10 @@ export interface RouterConfig {
   model: string;
   /** Maximum number of agents that can run concurrently */
   maxConcurrent?: number;
+  /** Additional providers available for cost-optimized routing */
+  additionalProviders?: Array<{ provider: ModelProvider; models: string[] }>;
+  /** Per-agent model overrides from user settings */
+  agentModelOverrides?: Record<string, AgentModelOverride>;
 }
 
 export class AgentRouter {
@@ -140,6 +150,27 @@ export class AgentRouter {
     }));
   }
 
+  /** Select provider/model for this task using cost-optimized routing */
+  private selectModelForAgent(agentId: string, task: AgentTask): SelectedModel {
+    const complexity = classifyTaskComplexity(agentId, task.description);
+
+    // Build available providers list: default provider + any additional
+    const available: Array<{ provider: ModelProvider; models: string[] }> = [
+      { provider: this.config.provider, models: [this.config.model] },
+      ...(this.config.additionalProviders ?? []),
+    ];
+
+    const selected = selectModelForTask(
+      complexity,
+      available,
+      this.config.agentModelOverrides,
+      agentId,
+    );
+
+    // Fall back to default config if routing returns null
+    return selected ?? { provider: this.config.provider, model: this.config.model };
+  }
+
   /** Always create a fresh agent instance from the catalog (no reuse) */
   private async createFreshAgent(task: AgentTask, preferredAgentId?: string): Promise<BaseAgent> {
     const entries = preferredAgentId
@@ -152,7 +183,8 @@ export class AgentRouter {
       for (const entry of allEntries) {
         const agent = entry.factory();
         if (agent.validate(task.target)) {
-          await agent.initialize(this.config.provider, this.config.model);
+          const { provider, model } = this.selectModelForAgent(entry.metadata.id, task);
+          await agent.initialize(provider, model);
           const instanceId = `${entry.metadata.id}_${Date.now()}`;
           this.activeAgents.set(instanceId, agent);
           this.emitStatusUpdate();
@@ -164,7 +196,8 @@ export class AgentRouter {
 
     const entry = entries[0];
     const agent = entry.factory();
-    await agent.initialize(this.config.provider, this.config.model);
+    const { provider, model } = this.selectModelForAgent(entry.metadata.id, task);
+    await agent.initialize(provider, model);
     const instanceId = `${entry.metadata.id}_${Date.now()}`;
     this.activeAgents.set(instanceId, agent);
     this.emitStatusUpdate();

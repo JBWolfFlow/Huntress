@@ -111,6 +111,12 @@ export interface AlloySettings {
   strategy: 'random' | 'round_robin' | 'weighted';
 }
 
+/** Per-agent model override */
+export interface AgentModelOverride {
+  providerId: string;
+  modelId: string;
+}
+
 export interface AppSettings {
   firstRunComplete: boolean;
   orchestratorModel: ModelSelection;
@@ -127,6 +133,8 @@ export interface AppSettings {
   };
   /** Model Alloy configuration (alternate between 2 providers per iteration) */
   alloy: AlloySettings;
+  /** Per-agent model overrides (agentType -> provider/model) */
+  agentModelOverrides: Record<string, AgentModelOverride>;
   /** Terminal appearance customization */
   terminal: TerminalConfig;
   theme: 'dark';
@@ -149,6 +157,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     weight: 70,
     strategy: 'random',
   },
+  agentModelOverrides: {},
   terminal: {
     theme: 'hacker',
     promptStyle: 'huntress',

@@ -12,6 +12,14 @@
 import { QdrantClient, type SearchResult } from '../core/memory/qdrant_client';
 import { FindingSummarizer, type Finding } from '../core/memory/summarizer';
 
+// Re-export SimHash utilities from finding_dedup for convenience
+export {
+  computeSimHash,
+  simHashDistance,
+  groupBySimHash,
+} from '../core/orchestrator/finding_dedup';
+export type { SimHashTarget, SimHashGroup } from '../core/orchestrator/finding_dedup';
+
 export interface Vulnerability {
   id: string;
   type: string;
