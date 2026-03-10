@@ -27,6 +27,8 @@ pub mod pty_manager;
 pub mod kill_switch;
 pub mod proxy_pool;
 pub mod h1_api;
+pub mod secure_storage;
+pub mod tool_checker;
 
 // Re-exports for convenience
 pub use safe_to_test::{ScopeEntry, ScopeValidator, ScopeError};
@@ -34,6 +36,7 @@ pub use pty_manager::{PtySession, PtyManager, PtyError, SessionStatus};
 pub use kill_switch::{KillSwitch, KillReason, KillEvent, KillSwitchError};
 pub use proxy_pool::{ProxyPool, ProxyConfig, ProxyType, RotationStrategy, HealthStatus, ProxyError};
 
+use std::sync::{Arc, Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize the application
@@ -84,8 +87,15 @@ pub fn run() {
     // Initialize logging
     init();
 
+    // Create shared KillSwitch instance as managed state
+    let kill_switch = Arc::new(Mutex::new(KillSwitch::new()));
+
+    // Wire signal handlers to the shared instance
+    kill_switch::setup_signal_handlers(Arc::clone(&kill_switch));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .manage(kill_switch)
         .invoke_handler(tauri::generate_handler![
             // Safe-to-test commands
             safe_to_test::load_scope,
@@ -108,6 +118,15 @@ pub fn run() {
             proxy_pool::get_proxy_stats,
             // HackerOne API commands
             h1_api::fetch_h1_program,
+            // Secure storage commands
+            secure_storage::store_secret,
+            secure_storage::get_secret,
+            secure_storage::delete_secret,
+            secure_storage::list_secret_keys,
+            // Tool checker commands
+            tool_checker::check_installed_tools,
+            tool_checker::get_missing_required_tools,
+            tool_checker::get_tool_summary,
             // File operations for tool output management
             write_tool_output,
             read_tool_output,

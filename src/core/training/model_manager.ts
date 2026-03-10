@@ -80,6 +80,7 @@ export class ModelVersionManager extends EventEmitter {
   private versionsDir: string;
   private modelsDir: string;
   private maxVersions: number;
+  private versionCounter = 0;
 
   constructor(config: {
     versionsDir?: string;
@@ -145,7 +146,7 @@ export class ModelVersionManager extends EventEmitter {
       const target = await fs.readlink(symlinkPath);
       
       // Extract version from path
-      const versionMatch = target.match(/huntress-lora-(v\d{8}-\d{6})/);
+      const versionMatch = target.match(/huntress-lora-(v\d{8}-\d{6,})/);
       if (versionMatch) {
         this.currentProduction = versionMatch[1];
       }
@@ -466,14 +467,14 @@ export class ModelVersionManager extends EventEmitter {
       try {
         // Delete version metadata
         const metadataPath = path.join(this.versionsDir, `${version.version}.json`);
-        await fs.unlink(metadataPath);
-        
+        await fs.unlink(metadataPath).catch(() => {});
+
         // Delete LoRA adapter directory
-        await fs.rm(version.loraPath, { recursive: true, force: true });
-        
+        await fs.rm(version.loraPath, { recursive: true, force: true }).catch(() => {});
+
         this.versions.delete(version.version);
         deleted++;
-        
+
         console.log(`[ModelManager] Deleted version ${version.version}`);
       } catch (error) {
         console.error(`[ModelManager] Failed to delete ${version.version}:`, error);
@@ -486,13 +487,16 @@ export class ModelVersionManager extends EventEmitter {
   }
 
   /**
-   * Generate version string (v{YYYYMMDD}-{HHMMSS})
+   * Generate version string (v{YYYYMMDD}-{HHMMSS}{SEQ})
+   * Includes a monotonic counter to guarantee uniqueness in tight loops.
    */
   private generateVersionString(): string {
+    this.versionCounter++;
     const date = new Date();
     const dateStr = date.toISOString().split('T')[0].replace(/-/g, '');
     const timeStr = date.toTimeString().split(' ')[0].replace(/:/g, '');
-    return `v${dateStr}-${timeStr}`;
+    const seq = String(this.versionCounter).padStart(3, '0');
+    return `v${dateStr}-${timeStr}${seq}`;
   }
 
   /**

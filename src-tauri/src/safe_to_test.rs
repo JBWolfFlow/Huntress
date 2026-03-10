@@ -94,7 +94,7 @@ pub struct ScopeValidator {
     /// Exact out-of-scope domains
     out_of_scope_patterns: Vec<Regex>,
     /// Wildcard domains for matching
-    wildcard_domains: Vec<String>,
+    _wildcard_domains: Vec<String>,
     /// Raw scope entries for reference
     entries: Vec<ScopeEntry>,
 }
@@ -132,7 +132,7 @@ impl ScopeValidator {
         Ok(Self {
             in_scope_patterns,
             out_of_scope_patterns,
-            wildcard_domains,
+            _wildcard_domains: wildcard_domains,
             entries: entries.clone(),
         })
     }
@@ -220,7 +220,7 @@ impl ScopeValidator {
     /// # Security Rules
     /// - Default deny if scope is empty
     /// - Out-of-scope patterns override in-scope patterns
-    /// - Wildcard matching: *.example.com matches subdomains AND example.com itself
+    /// - Wildcard matching: *.example.com matches subdomains only (not example.com itself)
     pub fn is_in_scope(&self, target: &str) -> bool {
         // Default deny for empty scope
         if self.in_scope_patterns.is_empty() {
@@ -243,17 +243,6 @@ impl ScopeValidator {
             if pattern.is_match(&domain) {
                 info!("Target {} matched in-scope pattern", domain);
                 return true;
-            }
-        }
-
-        // Special case: If *.example.com is in scope, allow example.com too
-        for entry in &self.entries {
-            if entry.in_scope && entry.target.starts_with("*.") {
-                let base_domain = &entry.target[2..]; // Remove "*."
-                if domain == base_domain {
-                    info!("Target {} matched base domain of wildcard pattern {}", domain, entry.target);
-                    return true;
-                }
             }
         }
 
@@ -339,7 +328,7 @@ impl ScopeValidator {
     }
 
     /// Match wildcard patterns (*.example.com matches api.example.com but NOT example.com)
-    fn matches_wildcard(&self, domain: &str, pattern: &str) -> bool {
+    fn _matches_wildcard(&self, domain: &str, pattern: &str) -> bool {
         if !pattern.contains('*') {
             return domain == pattern;
         }

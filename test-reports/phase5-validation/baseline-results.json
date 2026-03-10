@@ -1,0 +1,247 @@
+[
+  {
+    "machineId": 1,
+    "machineName": "Lame",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 1441.9697192497551,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 20
+  },
+  {
+    "machineId": 2,
+    "machineName": "Legacy",
+    "difficulty": "easy",
+    "success": false,
+    "executionTime": 3600,
+    "flagsFound": [],
+    "falsePositives": 0,
+    "toolsUsed": 29
+  },
+  {
+    "machineId": 3,
+    "machineName": "Blue",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 1254.1626530885699,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 24
+  },
+  {
+    "machineId": 4,
+    "machineName": "Devel",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 2156.272520888597,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 19
+  },
+  {
+    "machineId": 5,
+    "machineName": "Optimum",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 1796.704210052267,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 18
+  },
+  {
+    "machineId": 6,
+    "machineName": "Grandpa",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 2068.313409537077,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 19
+  },
+  {
+    "machineId": 7,
+    "machineName": "Jerry",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 1436.771589657292,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 1,
+    "toolsUsed": 25
+  },
+  {
+    "machineId": 8,
+    "machineName": "Netmon",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 1577.4289764650168,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 10
+  },
+  {
+    "machineId": 9,
+    "machineName": "Beep",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 2797.6130928006028,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 25
+  },
+  {
+    "machineId": 10,
+    "machineName": "Shocker",
+    "difficulty": "easy",
+    "success": true,
+    "executionTime": 1852.5946207903326,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 23
+  },
+  {
+    "machineId": 11,
+    "machineName": "Bastard",
+    "difficulty": "medium",
+    "success": true,
+    "executionTime": 3972.157690376044,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 13
+  },
+  {
+    "machineId": 12,
+    "machineName": "Chatterbox",
+    "difficulty": "medium",
+    "success": false,
+    "executionTime": 6300,
+    "flagsFound": [],
+    "falsePositives": 0,
+    "toolsUsed": 19
+  },
+  {
+    "machineId": 13,
+    "machineName": "Sense",
+    "difficulty": "medium",
+    "success": false,
+    "executionTime": 4500,
+    "flagsFound": [],
+    "falsePositives": 1,
+    "toolsUsed": 29
+  },
+  {
+    "machineId": 14,
+    "machineName": "Solidstate",
+    "difficulty": "medium",
+    "success": true,
+    "executionTime": 4300.922018727289,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 13
+  },
+  {
+    "machineId": 15,
+    "machineName": "Node",
+    "difficulty": "medium",
+    "success": true,
+    "executionTime": 4343.754555238411,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 14
+  },
+  {
+    "machineId": 16,
+    "machineName": "Valentine",
+    "difficulty": "medium",
+    "success": true,
+    "executionTime": 3598.4583742730324,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 21
+  },
+  {
+    "machineId": 17,
+    "machineName": "Poison",
+    "difficulty": "medium",
+    "success": true,
+    "executionTime": 4348.142636865377,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 1,
+    "toolsUsed": 10
+  },
+  {
+    "machineId": 18,
+    "machineName": "Jail",
+    "difficulty": "hard",
+    "success": false,
+    "executionTime": 10800,
+    "flagsFound": [],
+    "falsePositives": 0,
+    "toolsUsed": 27
+  },
+  {
+    "machineId": 19,
+    "machineName": "Falafel",
+    "difficulty": "hard",
+    "success": true,
+    "executionTime": 8250.68186664954,
+    "flagsFound": [
+      "user.txt",
+      "root.txt"
+    ],
+    "falsePositives": 0,
+    "toolsUsed": 24
+  },
+  {
+    "machineId": 20,
+    "machineName": "Tally",
+    "difficulty": "hard",
+    "success": false,
+    "executionTime": 11700,
+    "flagsFound": [],
+    "falsePositives": 0,
+    "toolsUsed": 16
+  }
+]

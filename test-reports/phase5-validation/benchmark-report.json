@@ -1,0 +1,28 @@
+{
+  "modelVersion": "test-model",
+  "totalAttempts": 20,
+  "successes": 16,
+  "successRate": 0.8,
+  "avgExecutionTime": 3036.5308053506305,
+  "medianExecutionTime": 2536.295126080513,
+  "falsePositiveRate": 0.15,
+  "byDifficulty": {
+    "easy": {
+      "attempts": 10,
+      "successes": 10,
+      "rate": 1
+    },
+    "medium": {
+      "attempts": 7,
+      "successes": 5,
+      "rate": 0.7142857142857143
+    },
+    "hard": {
+      "attempts": 3,
+      "successes": 1,
+      "rate": 0.3333333333333333
+    }
+  },
+  "passedValidation": true,
+  "issues": []
+}

@@ -7,6 +7,7 @@
 
 import React, { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useSettings } from '../contexts/SettingsContext';
 
 export interface ProgramGuidelines {
   programHandle: string;
@@ -36,6 +37,7 @@ interface GuidelinesImporterProps {
 }
 
 export const GuidelinesImporter: React.FC<GuidelinesImporterProps> = ({ onImport }) => {
+  const { settings } = useSettings();
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,7 +71,9 @@ export const GuidelinesImporter: React.FC<GuidelinesImporterProps> = ({ onImport
     // Use Tauri backend command to bypass CORS restrictions
     try {
       const result = await invoke<any>('fetch_h1_program', {
-        programHandle
+        programHandle,
+        apiUsername: settings.hackerOneUsername || null,
+        apiToken: settings.hackerOneToken || null,
       });
       
       // Convert snake_case from Rust to camelCase for TypeScript
@@ -210,11 +214,11 @@ export const GuidelinesImporter: React.FC<GuidelinesImporterProps> = ({ onImport
                 {loading ? 'Importing...' : 'Import'}
               </button>
             </div>
-            <p className="text-xs text-gray-400 mt-2">
+            <p className="text-xs text-gray-300 mt-2">
               Example: https://hackerone.com/security or https://hackerone.com/bookingcom
             </p>
             <p className="text-xs text-green-400 mt-1">
-              ✅ Using Tauri backend to bypass CORS restrictions
+              Using Tauri backend to bypass CORS restrictions
             </p>
           </div>
         ) : (

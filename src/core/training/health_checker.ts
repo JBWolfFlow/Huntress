@@ -307,23 +307,23 @@ export class HealthCheckSystem extends EventEmitter {
         components.push(await this.checkDeploymentManager());
       }
 
-      // Generate report
+      // Process alerts BEFORE generating report so current alerts are included
+      await this.processAlerts(components);
+
+      // Generate report (includes current alerts)
       const report = this.generateReport(components);
-      
+
       // Save to history
       this.healthHistory.push(report);
       if (this.healthHistory.length > 1000) {
         this.healthHistory.shift();
       }
-      
+
       // Save to disk periodically
       if (this.healthHistory.length % 10 === 0) {
         await this.saveHistory();
       }
-      
-      // Process alerts
-      await this.processAlerts(report);
-      
+
       // Attempt self-healing if needed
       if (this.config.selfHealing.enabled) {
         await this.attemptSelfHealing(report);
@@ -850,11 +850,11 @@ export class HealthCheckSystem extends EventEmitter {
   }
 
   /**
-   * Process alerts based on health report
+   * Process alerts based on component health status
    */
-  private async processAlerts(report: SystemHealthReport): Promise<void> {
+  private async processAlerts(components: ComponentHealth[]): Promise<void> {
     // Generate alerts for unhealthy components
-    for (const component of report.components) {
+    for (const component of components) {
       if (component.status === 'unhealthy' || component.status === 'degraded') {
         const alertId = `${component.component}_${component.status}`;
         

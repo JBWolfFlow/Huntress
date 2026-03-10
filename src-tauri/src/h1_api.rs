@@ -38,8 +38,15 @@ pub struct SeverityPayouts {
 }
 
 /// Fetch program guidelines from HackerOne API
+///
+/// Accepts optional API credentials from the frontend. Falls back to
+/// environment variables if not provided.
 #[tauri::command]
-pub async fn fetch_h1_program(program_handle: String) -> Result<ProgramGuidelines, String> {
+pub async fn fetch_h1_program(
+    program_handle: String,
+    api_username: Option<String>,
+    api_token: Option<String>,
+) -> Result<ProgramGuidelines, String> {
     tracing::info!("Fetching HackerOne program: {}", program_handle);
 
     // Build API URL
@@ -48,9 +55,13 @@ pub async fn fetch_h1_program(program_handle: String) -> Result<ProgramGuideline
         program_handle
     );
 
-    // Check for API credentials in environment
-    let api_username = std::env::var("HACKERONE_API_USERNAME").ok();
-    let api_token = std::env::var("HACKERONE_API_TOKEN").ok();
+    // Use credentials from frontend first, fall back to environment variables
+    let username = api_username
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HACKERONE_API_USERNAME").ok());
+    let token = api_token
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HACKERONE_API_TOKEN").ok());
 
     // Make HTTP request
     let client = reqwest::Client::new();
@@ -58,12 +69,12 @@ pub async fn fetch_h1_program(program_handle: String) -> Result<ProgramGuideline
         .get(&api_url)
         .header("Accept", "application/json")
         .header("User-Agent", "Huntress/1.0")
-        .timeout(std::time::Duration::from_secs(10));
+        .timeout(std::time::Duration::from_secs(15));
 
     // Add authentication if credentials are available
-    if let (Some(username), Some(token)) = (api_username, api_token) {
-        tracing::info!("Using authenticated HackerOne API request");
-        request = request.basic_auth(username, Some(token));
+    if let (Some(ref u), Some(ref t)) = (&username, &token) {
+        tracing::info!("Using authenticated HackerOne API request for user: {}", u);
+        request = request.basic_auth(u, Some(t));
     } else {
         tracing::warn!("No HackerOne API credentials found - attempting unauthenticated request");
     }
@@ -76,9 +87,19 @@ pub async fn fetch_h1_program(program_handle: String) -> Result<ProgramGuideline
     if !response.status().is_success() {
         let status = response.status();
         let error_msg = if status == 401 {
+            if username.is_none() || token.is_none() {
+                "Authentication required. Please configure both your HackerOne API Identifier \
+                and API Token in Settings. You can generate these at \
+                https://hackerone.com/settings/api_token/edit".to_string()
+            } else {
+                "Authentication failed. Your HackerOne API credentials were rejected. \
+                Please verify your API Identifier and API Token are correct. \
+                You can regenerate them at https://hackerone.com/settings/api_token/edit".to_string()
+            }
+        } else if status == 404 {
             format!(
-                "Authentication required. Please set HACKERONE_API_USERNAME and HACKERONE_API_TOKEN environment variables. \
-                See https://docs.hackerone.com/programs/api-tokens.html for instructions."
+                "Program '{}' not found on HackerOne. Check the program handle and try again.",
+                program_handle
             )
         } else {
             format!(
@@ -257,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_public_program() {
         // Test with a known public program
-        let result = fetch_h1_program("security".to_string()).await;
+        let result = fetch_h1_program("security".to_string(), None, None).await;
         
         match result {
             Ok(guidelines) => {

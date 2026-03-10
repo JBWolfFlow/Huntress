@@ -107,8 +107,12 @@ pub struct KillSwitch {
 impl KillSwitch {
     /// Create a new kill switch
     pub fn new() -> Self {
+        Self::with_state_file(PathBuf::from("config/kill_switch.lock"))
+    }
+
+    /// Create a kill switch with a custom state file path
+    pub fn with_state_file(state_file: PathBuf) -> Self {
         let (tx, _) = broadcast::channel(100);
-        let state_file = PathBuf::from("config/kill_switch.lock");
 
         // Try to load persisted state
         let (active, last_event, count) = Self::load_state(&state_file)
@@ -209,6 +213,9 @@ impl KillSwitch {
             "KILL SWITCH ACTIVATED - ALL OPERATIONS TERMINATED"
         );
 
+        // Release locks before persist_state (which re-acquires them)
+        drop(count);
+
         // Broadcast kill event
         if let Err(e) = self.tx.send(event) {
             error!("Failed to broadcast kill event: {}", e);
@@ -307,7 +314,11 @@ macro_rules! check_kill {
 
 /// Tauri command: Activate kill switch
 #[tauri::command]
-pub async fn activate_kill_switch(reason: String, context: Option<String>) -> Result<(), String> {
+pub async fn activate_kill_switch(
+    state: tauri::State<'_, Arc<Mutex<KillSwitch>>>,
+    reason: String,
+    context: Option<String>,
+) -> Result<(), String> {
     info!("Tauri command: activate_kill_switch - reason: {}", reason);
 
     // Parse reason string into KillReason enum
@@ -327,8 +338,8 @@ pub async fn activate_kill_switch(reason: String, context: Option<String>) -> Re
         _ => KillReason::ManualStop,
     };
 
-    // In production, this would use a global kill switch instance
-    let kill_switch = KillSwitch::new();
+    let kill_switch = state.lock()
+        .map_err(|e| format!("Failed to acquire kill switch lock: {}", e))?;
     kill_switch
         .activate(kill_reason, context)
         .map_err(|e| format!("Failed to activate kill switch: {}", e))
@@ -336,19 +347,24 @@ pub async fn activate_kill_switch(reason: String, context: Option<String>) -> Re
 
 /// Tauri command: Check kill switch status
 #[tauri::command]
-pub async fn is_kill_switch_active() -> Result<bool, String> {
-    // In production, this would use a global kill switch instance
-    let kill_switch = KillSwitch::new();
+pub async fn is_kill_switch_active(
+    state: tauri::State<'_, Arc<Mutex<KillSwitch>>>,
+) -> Result<bool, String> {
+    let kill_switch = state.lock()
+        .map_err(|e| format!("Failed to acquire kill switch lock: {}", e))?;
     Ok(kill_switch.is_active())
 }
 
 /// Tauri command: Reset kill switch
 #[tauri::command]
-pub async fn reset_kill_switch(confirmation: String) -> Result<(), String> {
+pub async fn reset_kill_switch(
+    state: tauri::State<'_, Arc<Mutex<KillSwitch>>>,
+    confirmation: String,
+) -> Result<(), String> {
     info!("Tauri command: reset_kill_switch");
 
-    // In production, this would use a global kill switch instance
-    let kill_switch = KillSwitch::new();
+    let kill_switch = state.lock()
+        .map_err(|e| format!("Failed to acquire kill switch lock: {}", e))?;
     kill_switch
         .reset(&confirmation)
         .map_err(|e| format!("Failed to reset kill switch: {}", e))
@@ -356,61 +372,75 @@ pub async fn reset_kill_switch(confirmation: String) -> Result<(), String> {
 
 /// Tauri command: Get last kill event
 #[tauri::command]
-pub async fn get_last_kill_event() -> Result<Option<KillEvent>, String> {
-    // In production, this would use a global kill switch instance
-    let kill_switch = KillSwitch::new();
+pub async fn get_last_kill_event(
+    state: tauri::State<'_, Arc<Mutex<KillSwitch>>>,
+) -> Result<Option<KillEvent>, String> {
+    let kill_switch = state.lock()
+        .map_err(|e| format!("Failed to acquire kill switch lock: {}", e))?;
     kill_switch
         .get_last_event()
         .map_err(|e| format!("Failed to get last event: {}", e))
 }
 
-/// Setup signal handlers for kill switch
+/// Setup signal handlers for kill switch using shared managed state
 ///
 /// CRITICAL PRODUCTION FIX:
 /// - Wires SIGTERM/SIGINT (Ctrl+C) to kill switch
 /// - Ensures all processes are killed on termination
 /// - Prevents stuck processes that continue making requests
-pub fn setup_signal_handlers() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    
-    let kill_switch = Arc::new(KillSwitch::new());
+/// - Uses the same shared KillSwitch instance as Tauri commands
+pub fn setup_signal_handlers(kill_switch: Arc<Mutex<KillSwitch>>) {
     let kill_switch_clone = Arc::clone(&kill_switch);
-    
+
     // Setup Ctrl+C handler
     ctrlc::set_handler(move || {
         error!("SIGINT/SIGTERM received - activating kill switch");
-        
-        if let Err(e) = kill_switch_clone.activate(
-            KillReason::ExternalSignal,
-            Some("Ctrl+C or SIGTERM received".to_string())
-        ) {
-            error!("Failed to activate kill switch on signal: {}", e);
+
+        if let Ok(ks) = kill_switch_clone.lock() {
+            if let Err(e) = ks.activate(
+                KillReason::ExternalSignal,
+                Some("Ctrl+C or SIGTERM received".to_string())
+            ) {
+                error!("Failed to activate kill switch on signal: {}", e);
+            }
+        } else {
+            error!("Failed to acquire kill switch lock during signal handler");
         }
-        
+
         // Give processes time to clean up
         std::thread::sleep(std::time::Duration::from_millis(500));
-        
+
         // Force exit
         std::process::exit(0);
     }).expect("Failed to set Ctrl+C handler");
-    
+
     info!("Kill switch signal handlers installed");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// Monotonic counter to generate unique temp file paths per test
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn test_kill_switch() -> KillSwitch {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(format!("/tmp/huntress_ks_test_{id}.lock"));
+        let _ = std::fs::remove_file(&path);
+        KillSwitch::with_state_file(path)
+    }
 
     #[test]
     fn test_kill_switch_creation() {
-        let kill_switch = KillSwitch::new();
+        let kill_switch = test_kill_switch();
         assert!(!kill_switch.is_active());
     }
 
     #[test]
     fn test_kill_switch_activation() {
-        let kill_switch = KillSwitch::new();
+        let kill_switch = test_kill_switch();
 
         kill_switch
             .activate(KillReason::ManualStop, None)
@@ -421,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_kill_switch_double_activation() {
-        let kill_switch = KillSwitch::new();
+        let kill_switch = test_kill_switch();
 
         kill_switch
             .activate(KillReason::ManualStop, None)
@@ -433,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_kill_switch_reset() {
-        let kill_switch = KillSwitch::new();
+        let kill_switch = test_kill_switch();
 
         kill_switch
             .activate(KillReason::ManualStop, None)
@@ -447,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_kill_switch_reset_without_confirmation() {
-        let kill_switch = KillSwitch::new();
+        let kill_switch = test_kill_switch();
 
         kill_switch
             .activate(KillReason::ManualStop, None)
@@ -460,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_kill_switch_subscription() {
-        let kill_switch = KillSwitch::new();
+        let kill_switch = test_kill_switch();
         let mut rx = kill_switch.subscribe();
 
         kill_switch
@@ -484,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_activation_count() {
-        let kill_switch = KillSwitch::new();
+        let kill_switch = test_kill_switch();
 
         assert_eq!(kill_switch.get_activation_count().unwrap(), 0);
 
@@ -505,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_last_event() {
-        let kill_switch = KillSwitch::new();
+        let kill_switch = test_kill_switch();
 
         assert!(kill_switch.get_last_event().unwrap().is_none());
 

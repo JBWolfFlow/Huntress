@@ -129,7 +129,7 @@ pub struct ProxyPool {
     /// Maximum failures before marking proxy as unhealthy
     max_failures: u32,
     /// Health check interval
-    health_check_interval: Duration,
+    _health_check_interval: Duration,
     /// Path to proxy config file
     config_file: Option<PathBuf>,
 }
@@ -141,7 +141,7 @@ impl ProxyPool {
             proxies: Arc::new(Mutex::new(VecDeque::new())),
             strategy,
             max_failures: 3,
-            health_check_interval: Duration::from_secs(300), // 5 minutes
+            _health_check_interval: Duration::from_secs(300), // 5 minutes
             config_file: None,
         }
     }
@@ -535,21 +535,43 @@ pub async fn load_proxies(path: String) -> Result<usize, String> {
 
     let count = pool.count().map_err(|e| format!("Failed to get count: {}", e))?;
 
+    // Store into the global pool so get_next_proxy / get_proxy_stats work
+    set_global_pool(pool);
+
     Ok(count)
+}
+
+/// Global proxy pool instance shared across Tauri commands
+static GLOBAL_POOL: std::sync::LazyLock<Mutex<ProxyPool>> =
+    std::sync::LazyLock::new(|| Mutex::new(ProxyPool::new(RotationStrategy::RoundRobin)));
+
+/// Set the global pool from a loaded config (called by load_proxies)
+fn set_global_pool(pool: ProxyPool) {
+    let mut global = GLOBAL_POOL.lock().expect("global pool lock poisoned");
+    *global = pool;
 }
 
 /// Tauri command: Get next proxy
 #[tauri::command]
 pub async fn get_next_proxy() -> Result<String, String> {
-    // In production, this would use a global proxy pool instance
-    Err("Proxy pool not initialized".to_string())
+    let mut pool = GLOBAL_POOL
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+
+    pool.next_proxy()
+        .map(|p| p.url)
+        .ok_or_else(|| "No healthy proxies available".to_string())
 }
 
 /// Tauri command: Get proxy pool stats
 #[tauri::command]
 pub async fn get_proxy_stats() -> Result<PoolStats, String> {
-    // In production, this would use a global proxy pool instance
-    Err("Proxy pool not initialized".to_string())
+    let pool = GLOBAL_POOL
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+
+    pool.get_stats()
+        .map_err(|e| format!("Failed to get stats: {}", e))
 }
 
 #[cfg(test)]

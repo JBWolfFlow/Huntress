@@ -263,20 +263,33 @@ export class CommandValidator {
     const warnings: string[] = [];
     const foundDangerousFlags: string[] = [];
 
-    // Check each flag in the command
-    for (const [flag] of parsed.flags) {
-      for (const dangerousPattern of tool.dangerousFlags) {
-        if (flag.includes(dangerousPattern) || dangerousPattern.includes(flag)) {
-          foundDangerousFlags.push(flag);
-        }
-      }
-    }
+    // Check each flag in the command against dangerous patterns.
+    // Dangerous patterns can be:
+    //   - A flag+value pair like "--level 5" or "-t 1000" — only matches that exact value
+    //   - A standalone flag like "--os-shell" or "-active" — matches the flag regardless of value
+    for (const dangerousPattern of tool.dangerousFlags) {
+      const patternParts = dangerousPattern.trim().split(/\s+/);
+      const patternFlag = patternParts[0];
+      const patternValue = patternParts.length > 1 ? patternParts.slice(1).join(' ') : null;
 
-    // Check arguments for dangerous patterns
-    for (const arg of parsed.args) {
-      for (const dangerousPattern of tool.dangerousFlags) {
-        if (arg.includes(dangerousPattern)) {
-          foundDangerousFlags.push(arg);
+      if (patternValue !== null) {
+        // Flag+value pattern: only dangerous if the command uses this flag with this exact value
+        const flagValue = parsed.flags.get(patternFlag);
+        if (typeof flagValue === 'string' && flagValue === patternValue) {
+          foundDangerousFlags.push(`${patternFlag} ${flagValue}`);
+        }
+      } else {
+        // Standalone flag pattern: dangerous if the flag appears at all
+        for (const [flag] of parsed.flags) {
+          if (flag === patternFlag) {
+            foundDangerousFlags.push(flag);
+          }
+        }
+        // Also check arguments (e.g., "-active" passed as a positional arg)
+        for (const arg of parsed.args) {
+          if (arg === patternFlag) {
+            foundDangerousFlags.push(arg);
+          }
         }
       }
     }

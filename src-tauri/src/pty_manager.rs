@@ -343,7 +343,7 @@ impl PtySession {
         
         if writer_guard.is_none() {
             // First write - take the writer from master and store it
-            let mut master = self
+            let master = self
                 .master
                 .lock()
                 .map_err(|e| PtyError::LockError(e.to_string()))?;

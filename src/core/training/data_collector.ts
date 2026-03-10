@@ -150,16 +150,30 @@ export class TrainingDataCleaner {
   }
 
   /**
-   * Remove sensitive information from data
+   * Remove sensitive information from data by walking the object tree
    */
   private removeSensitiveData(data: any): any {
-    let cleaned = JSON.stringify(data);
-    
-    for (const pattern of this.sensitivePatterns) {
-      cleaned = cleaned.replace(pattern, '[REDACTED]');
+    if (typeof data === 'string') {
+      let cleaned = data;
+      for (const pattern of this.sensitivePatterns) {
+        cleaned = cleaned.replace(pattern, '[REDACTED]');
+      }
+      return cleaned;
     }
-    
-    return JSON.parse(cleaned);
+    if (Array.isArray(data)) {
+      return data.map(item => this.removeSensitiveData(item));
+    }
+    if (data instanceof Date) {
+      return data;
+    }
+    if (data !== null && typeof data === 'object') {
+      const cleaned: any = {};
+      for (const [key, value] of Object.entries(data)) {
+        cleaned[key] = this.removeSensitiveData(value);
+      }
+      return cleaned;
+    }
+    return data;
   }
 
   /**

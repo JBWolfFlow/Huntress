@@ -7,7 +7,7 @@
  * Enhanced with verbose streaming output and human checkpoints.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import type { ModelProvider, ChatMessage, ChatResponse } from '../providers/types';
 import { HumanTaskManager, HumanTaskCallback } from './human_task';
 import { OAuthAgent, OAuthAgentConfig } from './oauth_agent';
 import { AIAgentLoop, HuntConfig, HuntResult } from './agent_loop';
@@ -78,6 +78,7 @@ export type CheckpointCallback = (checkpoint: CheckpointRequest) => Promise<bool
 
 export interface SupervisorConfig {
   apiKey?: string;
+  provider?: ModelProvider;
   model?: string;
   maxTokens?: number;
   humanInTheLoop?: boolean;
@@ -122,9 +123,9 @@ export interface ExecutionResult {
 }
 
 export class Supervisor {
-  private client?: Anthropic;
+  private provider?: ModelProvider;
   private config: SupervisorConfig;
-  private conversationHistory: Anthropic.MessageParam[] = [];
+  private conversationHistory: ChatMessage[] = [];
   private humanTaskManager: HumanTaskManager;
   private agents: Map<string, OAuthAgent> = new Map();
   private tasks: AgentTask[] = [];
@@ -136,7 +137,7 @@ export class Supervisor {
 
   constructor(config: SupervisorConfig = {}) {
     this.config = {
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5-20250929',
       maxTokens: 4096,
       humanInTheLoop: true,
       maxIterations: 10,
@@ -145,14 +146,17 @@ export class Supervisor {
       checkpointInterval: 5, // Checkpoint every 5 tools
       ...config,
     };
-    
-    if (config.apiKey) {
-      this.client = new Anthropic({
-        apiKey: config.apiKey,
-        dangerouslyAllowBrowser: true, // Required for Tauri desktop app
+
+    // Accept either a ModelProvider directly or create one from apiKey
+    if (config.provider) {
+      this.provider = config.provider;
+    } else if (config.apiKey) {
+      // Lazy import to avoid circular dependency — use AnthropicProvider for backward compat
+      import('../providers/anthropic').then(({ AnthropicProvider }) => {
+        this.provider = new AnthropicProvider({ apiKey: config.apiKey! });
       });
     }
-    
+
     this.humanTaskManager = new HumanTaskManager();
     this.streamingCallback = config.onStreaming;
     this.checkpointCallback = config.onCheckpoint;
@@ -354,12 +358,12 @@ export class Supervisor {
       }
 
       // If no agents registered, use AI Agent Loop for complete hunt
-      if (this.client) {
+      if (this.provider || this.config.apiKey) {
         this.stream(AIReasoningType.ANALYSIS, '🧠 Using AI Agent Loop for autonomous hunting...');
-        
+
         // Create tool interface
         const toolInterface = new AIAgentToolInterface(`session_${Date.now()}`);
-        
+
         // Create AI Agent Loop configuration
         const huntConfig: HuntConfig = {
           target: config.target,
@@ -369,6 +373,7 @@ export class Supervisor {
           streamingCallback: this.streamingCallback!,
           checkpointCallback: this.checkpointCallback!,
           apiKey: this.config.apiKey!,
+          provider: this.provider,
           model: this.config.model,
           maxIterations: this.config.maxIterations,
         };
@@ -409,7 +414,7 @@ export class Supervisor {
         }
       }
 
-      throw new Error('No agents registered and no API key provided for AI hunting');
+      throw new Error('No agents registered and no provider/API key configured for AI hunting');
       
     } catch (error) {
       this.stream(AIReasoningType.ERROR, `❌ Fatal error: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -427,8 +432,8 @@ export class Supervisor {
    * Analyze a target and create testing strategy
    */
   async analyzeTarget(target: string, scope: string[]): Promise<AgentTask[]> {
-    if (!this.client) {
-      throw new Error('Anthropic client not initialized');
+    if (!this.provider) {
+      throw new Error('AI provider not initialized');
     }
 
     const prompt = `
@@ -446,28 +451,31 @@ Create a prioritized list of security tests to perform. Consider:
 Return a JSON array of tasks with: id, type, target, priority
     `.trim();
 
-    const response = await this.client.messages.create({
+    const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
+
+    const response: ChatResponse = await this.provider.sendMessage(messages, {
       model: this.config.model!,
-      max_tokens: this.config.maxTokens!,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
+      maxTokens: this.config.maxTokens,
     });
 
     // Parse response and create tasks
-    // TODO: Implement proper JSON parsing from response
+    try {
+      const jsonMatch = response.content.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch {
+      // Failed to parse
+    }
     return [];
   }
 
   /**
    * Review agent findings and decide on next actions
    */
-  async reviewFindings(findings: any[]): Promise<SupervisorDecision> {
-    if (!this.client) {
-      throw new Error('Anthropic client not initialized');
+  async reviewFindings(findings: unknown[]): Promise<SupervisorDecision> {
+    if (!this.provider) {
+      throw new Error('AI provider not initialized');
     }
 
     const prompt = `
@@ -484,23 +492,26 @@ Consider:
 Provide decision: approve, deny, modify, or escalate
     `.trim();
 
-    const response = await this.client.messages.create({
+    const messages: ChatMessage[] = [
+      ...this.conversationHistory,
+      { role: 'user', content: prompt },
+    ];
+
+    const response: ChatResponse = await this.provider.sendMessage(messages, {
       model: this.config.model!,
-      max_tokens: this.config.maxTokens!,
-      messages: [
-        ...this.conversationHistory,
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
+      maxTokens: this.config.maxTokens,
     });
 
     // Parse decision from response
-    // TODO: Implement proper decision parsing
+    const content = response.content.toLowerCase();
+    const action = content.includes('deny') ? 'deny' as const
+      : content.includes('modify') ? 'modify' as const
+      : content.includes('escalate') ? 'escalate' as const
+      : 'approve' as const;
+
     return {
-      action: 'approve',
-      reasoning: 'Placeholder reasoning',
+      action,
+      reasoning: response.content,
       requiresHumanApproval: true,
     };
   }
@@ -508,9 +519,9 @@ Provide decision: approve, deny, modify, or escalate
   /**
    * Generate testing recommendations
    */
-  async generateRecommendations(context: any): Promise<string[]> {
-    if (!this.client) {
-      throw new Error('Anthropic client not initialized');
+  async generateRecommendations(context: Record<string, unknown>): Promise<string[]> {
+    if (!this.provider) {
+      throw new Error('AI provider not initialized');
     }
 
     const prompt = `
@@ -519,21 +530,24 @@ Based on this testing context, suggest next steps:
 ${JSON.stringify(context, null, 2)}
 
 Provide specific, actionable recommendations for further testing.
+Return a JSON array of recommendation strings.
     `.trim();
 
-    const response = await this.client.messages.create({
+    const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
+
+    const response: ChatResponse = await this.provider.sendMessage(messages, {
       model: this.config.model!,
-      max_tokens: this.config.maxTokens!,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
+      maxTokens: this.config.maxTokens,
     });
 
-    // Parse recommendations from response
-    // TODO: Implement proper parsing
+    try {
+      const jsonMatch = response.content.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch {
+      // Failed to parse
+    }
     return [];
   }
 

@@ -36,4 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 dotenv = "0.15"
 ctrlc = "3.4"
+hostname = "0.4"
+dirs = "5"
+ring = "0.17"
 

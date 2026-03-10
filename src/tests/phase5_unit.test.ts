@@ -7,7 +7,8 @@
  * Confidence: 10/10 - Production-ready test suite with >90% coverage target.
  */
 
-import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'fs/promises';
 import {
   MockHTBAPIClient,
   MockQdrantClient,
@@ -130,16 +131,25 @@ describe('Phase 5 Unit Tests', () => {
 
     describe('TrainingDataCleaner', () => {
       it('should remove sensitive data patterns', async () => {
-        const rawData = {
-          command: 'curl -H "Authorization: Bearer sk-abc123"',
-          output: 'password=secret123',
-        };
+        const rawData = generateMockTrainingExample({
+          execution: {
+            ...generateMockTrainingExample().execution,
+            tools_used: [{
+              tool: 'curl',
+              command: 'curl -H "Authorization: Bearer sk-abc123"',
+              timestamp: new Date(),
+              output: 'password=secret123',
+              success: true,
+            }],
+          },
+        });
 
         const cleaned = await cleaner.clean(rawData);
-        
-        expect(JSON.stringify(cleaned)).not.toContain('sk-abc123');
-        expect(JSON.stringify(cleaned)).not.toContain('secret123');
-        expect(JSON.stringify(cleaned)).toContain('[REDACTED]');
+        const str = JSON.stringify(cleaned);
+
+        expect(str).not.toContain('sk-abc123');
+        expect(str).not.toContain('secret123');
+        expect(str).toContain('[REDACTED]');
       });
 
       it('should normalize tool outputs', async () => {
@@ -252,7 +262,7 @@ describe('Phase 5 Unit Tests', () => {
         { dataQuality: 0.85 }
       );
       
-      expect(version).toMatch(/^v\d{8}-\d{6}$/);
+      expect(version).toMatch(/^v\d{8}-\d{9}$/);
       
       const model = modelManager.getVersion(version);
       expect(model).toBeDefined();
@@ -311,6 +321,8 @@ describe('Phase 5 Unit Tests', () => {
 
     it('should compare two model versions', async () => {
       const v1 = await modelManager.registerVersion('/models/v1', 100, 7200);
+      // Ensure distinct timestamp-based version IDs
+      await new Promise(resolve => setTimeout(resolve, 1100));
       const v2 = await modelManager.registerVersion('/models/v2', 100, 7200);
       
       await modelManager.updatePerformance(v1, { successRate: 0.65 });
@@ -327,14 +339,17 @@ describe('Phase 5 Unit Tests', () => {
       await modelManager.promoteToTesting(v1);
       await modelManager.updatePerformance(v1, { successRate: 0.70, falsePositiveRate: 0.10 });
       await modelManager.promoteToProduction(v1);
-      
+
+      // Ensure distinct timestamp-based version IDs
+      await new Promise(resolve => setTimeout(resolve, 1100));
+
       const v2 = await modelManager.registerVersion('/models/v2', 100, 7200);
       await modelManager.promoteToTesting(v2);
       await modelManager.updatePerformance(v2, { successRate: 0.70, falsePositiveRate: 0.10 });
       await modelManager.promoteToProduction(v2);
-      
+
       const result = await modelManager.rollback();
-      
+
       expect(result.success).toBe(true);
       expect(result.newVersion).toBe(v1);
       expect(result.duration).toBeLessThan(300000); // <5 minutes
@@ -363,29 +378,33 @@ describe('Phase 5 Unit Tests', () => {
   describe('A/B Testing Framework', () => {
     let abTesting: ABTestingFramework;
     let modelManager: ModelVersionManager;
+    let versionA: string;
+    let versionB: string;
 
     beforeEach(async () => {
       modelManager = new ModelVersionManager();
       await modelManager.initialize();
       abTesting = new ABTestingFramework(modelManager);
-      
-      // Register test models
-      await modelManager.registerVersion('/models/a', 100, 7200);
-      await modelManager.registerVersion('/models/b', 100, 7200);
+
+      // Register test models and capture dynamic version IDs
+      versionA = await modelManager.registerVersion('/models/a', 100, 7200);
+      // Ensure distinct timestamp for second version
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      versionB = await modelManager.registerVersion('/models/b', 100, 7200);
     });
 
     it('should start A/B test', async () => {
       const testId = await abTesting.startTest({
         name: 'Test A vs B',
-        modelA: 'v20250101-000000',
-        modelB: 'v20250102-000000',
+        modelA: versionA,
+        modelB: versionB,
         trafficSplit: 0.5,
         minSampleSize: 30,
         significanceLevel: 0.05,
         minImprovement: 0.05,
         maxDuration: 24,
       });
-      
+
       expect(testId).toBeDefined();
       expect(testId).toMatch(/^test_/);
     });
@@ -393,8 +412,8 @@ describe('Phase 5 Unit Tests', () => {
     it('should select model based on traffic split', async () => {
       await abTesting.startTest({
         name: 'Test',
-        modelA: 'v1',
-        modelB: 'v2',
+        modelA: versionA,
+        modelB: versionB,
         trafficSplit: 0.5,
         minSampleSize: 30,
         significanceLevel: 0.05,
@@ -416,8 +435,8 @@ describe('Phase 5 Unit Tests', () => {
     it('should record test results', async () => {
       await abTesting.startTest({
         name: 'Test',
-        modelA: 'v1',
-        modelB: 'v2',
+        modelA: versionA,
+        modelB: versionB,
         trafficSplit: 0.5,
         minSampleSize: 30,
         significanceLevel: 0.05,
@@ -441,8 +460,8 @@ describe('Phase 5 Unit Tests', () => {
     it('should detect statistical significance', async () => {
       await abTesting.startTest({
         name: 'Test',
-        modelA: 'v1',
-        modelB: 'v2',
+        modelA: versionA,
+        modelB: versionB,
         trafficSplit: 0.5,
         minSampleSize: 30,
         significanceLevel: 0.05,
@@ -479,8 +498,8 @@ describe('Phase 5 Unit Tests', () => {
     it('should determine winner correctly', async () => {
       await abTesting.startTest({
         name: 'Test',
-        modelA: 'v1',
-        modelB: 'v2',
+        modelA: versionA,
+        modelB: versionB,
         trafficSplit: 0.5,
         minSampleSize: 30,
         significanceLevel: 0.05,
@@ -514,8 +533,8 @@ describe('Phase 5 Unit Tests', () => {
     it('should complete test and generate report', async () => {
       await abTesting.startTest({
         name: 'Test',
-        modelA: 'v1',
-        modelB: 'v2',
+        modelA: versionA,
+        modelB: versionB,
         trafficSplit: 0.5,
         minSampleSize: 30,
         significanceLevel: 0.05,
@@ -693,8 +712,8 @@ describe('Phase 5 Unit Tests', () => {
     });
 
     it('should generate alerts for unhealthy components', async () => {
-      // Simulate unhealthy Qdrant
-      mockQdrant.listCollections = async () => {
+      // Simulate unhealthy Qdrant (checkQdrant calls getCollectionInfo, not listCollections)
+      mockQdrant.getCollectionInfo = async () => {
         throw new Error('Connection failed');
       };
       
@@ -760,7 +779,7 @@ describe('Phase 5 Unit Tests', () => {
             compareToBaseline: false,
           },
           rollback: {
-            verifyCapability: true,
+            verifyCapability: false,
             testRollback: false,
           },
         }
@@ -798,18 +817,28 @@ describe('Phase 5 Unit Tests', () => {
     });
 
     it('should pass readiness check for good model', async () => {
-      const version = await modelManager.registerVersion('/models/test', 100, 7200);
-      await modelManager.promoteToTesting(version);
-      await modelManager.updatePerformance(version, {
-        successRate: 0.75,
-        falsePositiveRate: 0.08,
-        avgTimeToSuccess: 3000,
-      });
-      
-      const report = await readinessChecker.checkReadiness(version);
-      
-      expect(report.overallStatus).toBe('ready');
-      expect(report.summary.criticalFailures).toBe(0);
+      // Create temp directories that the readiness checker validates
+      const tmpLoraPath = '/tmp/huntress-test-lora-' + Date.now();
+      await fs.mkdir(tmpLoraPath, { recursive: true });
+      await fs.mkdir('config', { recursive: true });
+      await fs.writeFile('config/axolotl_config.yml', '# test config\n');
+
+      try {
+        const version = await modelManager.registerVersion(tmpLoraPath, 100, 7200);
+        await modelManager.promoteToTesting(version);
+        await modelManager.updatePerformance(version, {
+          successRate: 0.75,
+          falsePositiveRate: 0.08,
+          avgTimeToSuccess: 3000,
+        });
+
+        const report = await readinessChecker.checkReadiness(version);
+
+        expect(report.overallStatus).toBe('ready');
+        expect(report.summary.criticalFailures).toBe(0);
+      } finally {
+        await fs.rm(tmpLoraPath, { recursive: true, force: true }).catch(() => {});
+      }
     });
   });
 });

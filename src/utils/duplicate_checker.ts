@@ -304,8 +304,8 @@ export class DuplicateChecker {
       for (const result of similar) {
         matches.push({
           source: 'internal',
-          title: result.payload.type || 'Unknown',
-          url: result.payload.url || '',
+          title: String(result.payload.type || 'Unknown'),
+          url: String(result.payload.url || ''),
           similarity: result.score,
         });
       }

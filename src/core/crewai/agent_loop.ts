@@ -11,7 +11,7 @@
  * 7. Automatically creates target files from recon results for active testing
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import type { ModelProvider, ChatMessage, ChatResponse } from '../providers/types';
 import { AIAgentToolInterface } from './tool_integration';
 import type { ExecutionResult } from '../tools/tool_executor';
 import { StreamingCallback, CheckpointCallback, HuntPhase, AIReasoningType } from './supervisor';
@@ -82,6 +82,7 @@ export interface HuntConfig {
   streamingCallback: StreamingCallback;
   checkpointCallback: CheckpointCallback;
   apiKey: string;
+  provider?: ModelProvider;
   model?: string;
   maxIterations?: number;
 }
@@ -92,26 +93,34 @@ export interface HuntConfig {
  * Orchestrates the complete hunt with real tool execution
  */
 export class AIAgentLoop {
-  private client: Anthropic;
+  private provider: ModelProvider;
   private config: HuntConfig;
-  private conversationHistory: Anthropic.MessageParam[] = [];
+  private conversationHistory: ChatMessage[] = [];
   private toolsExecuted: number = 0;
   private findings: Finding[] = [];
   private vulnerabilities: Vulnerability[] = [];
   private currentPhase: HuntPhase = HuntPhase.INITIALIZATION;
   private reconSessionIds: string[] = []; // Track recon tool session IDs for file creation
+  private providerReady: Promise<void>;
 
   constructor(config: HuntConfig) {
     this.config = {
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5-20250929',
       maxIterations: 20,
       ...config,
     };
 
-    this.client = new Anthropic({
-      apiKey: config.apiKey,
-      dangerouslyAllowBrowser: true,
-    });
+    if (config.provider) {
+      this.provider = config.provider;
+      this.providerReady = Promise.resolve();
+    } else {
+      // Backward compatibility: create AnthropicProvider from apiKey
+      // Use a temporary provider that will be replaced once the import resolves
+      this.provider = null as unknown as ModelProvider;
+      this.providerReady = import('../providers/anthropic').then(({ AnthropicProvider }) => {
+        this.provider = new AnthropicProvider({ apiKey: config.apiKey });
+      });
+    }
   }
 
   /**
@@ -119,6 +128,7 @@ export class AIAgentLoop {
    */
   async executeHunt(): Promise<HuntResult> {
     const startTime = Date.now();
+    await this.providerReady;
 
     try {
       // Phase 1: Reconnaissance
@@ -307,34 +317,30 @@ Return a JSON array of tool decisions:
 
 Return ONLY the JSON array, no other text.`;
 
-    const response = await this.client.messages.create({
-      model: this.config.model!,
-      max_tokens: 2048,
-      messages: [
-        ...this.conversationHistory,
-        { role: 'user', content: prompt },
-      ],
-    });
+    const allMessages: ChatMessage[] = [
+      ...this.conversationHistory,
+      { role: 'user', content: prompt },
+    ];
 
-    const content = response.content[0];
-    if (content.type !== 'text') {
-      return [];
-    }
+    const response: ChatResponse = await this.provider.sendMessage(allMessages, {
+      model: this.config.model!,
+      maxTokens: 2048,
+    });
 
     // Parse JSON from response
     try {
-      const jsonMatch = content.text.match(/\[[\s\S]*\]/);
+      const jsonMatch = response.content.match(/\[[\s\S]*\]/);
       if (!jsonMatch) {
         await this.stream(AIReasoningType.WARNING, '⚠️ AI did not return valid JSON for tool decisions');
         return [];
       }
 
       const decisions: ToolDecision[] = JSON.parse(jsonMatch[0]);
-      
+
       // Add to conversation history
       this.conversationHistory.push(
         { role: 'user', content: prompt },
-        { role: 'assistant', content: content.text }
+        { role: 'assistant', content: response.content }
       );
 
       return decisions;
@@ -400,32 +406,28 @@ Return a JSON array of tool decisions:
 
 Return ONLY the JSON array, no other text.`;
 
-    const response = await this.client.messages.create({
+    const activeMessages: ChatMessage[] = [
+      ...this.conversationHistory,
+      { role: 'user', content: prompt },
+    ];
+
+    const response: ChatResponse = await this.provider.sendMessage(activeMessages, {
       model: this.config.model!,
-      max_tokens: 2048,
-      messages: [
-        ...this.conversationHistory,
-        { role: 'user', content: prompt },
-      ],
+      maxTokens: 2048,
     });
 
-    const content = response.content[0];
-    if (content.type !== 'text') {
-      return [];
-    }
-
     try {
-      const jsonMatch = content.text.match(/\[[\s\S]*\]/);
+      const jsonMatch = response.content.match(/\[[\s\S]*\]/);
       if (!jsonMatch) {
         await this.stream(AIReasoningType.WARNING, '⚠️ AI did not return valid JSON for tool decisions');
         return [];
       }
 
       const decisions: ToolDecision[] = JSON.parse(jsonMatch[0]);
-      
+
       this.conversationHistory.push(
         { role: 'user', content: prompt },
-        { role: 'assistant', content: content.text }
+        { role: 'assistant', content: response.content }
       );
 
       return decisions;
@@ -665,22 +667,18 @@ Return a JSON array of vulnerabilities:
 
 Return ONLY the JSON array, no other text. If no real vulnerabilities found, return empty array [].`;
 
-    const response = await this.client.messages.create({
+    const analysisMessages: ChatMessage[] = [
+      ...this.conversationHistory,
+      { role: 'user', content: prompt },
+    ];
+
+    const response: ChatResponse = await this.provider.sendMessage(analysisMessages, {
       model: this.config.model!,
-      max_tokens: 4096,
-      messages: [
-        ...this.conversationHistory,
-        { role: 'user', content: prompt },
-      ],
+      maxTokens: 4096,
     });
 
-    const content = response.content[0];
-    if (content.type !== 'text') {
-      return [];
-    }
-
     try {
-      const jsonMatch = content.text.match(/\[[\s\S]*\]/);
+      const jsonMatch = response.content.match(/\[[\s\S]*\]/);
       if (!jsonMatch) {
         return [];
       }

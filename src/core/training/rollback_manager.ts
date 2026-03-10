@@ -301,23 +301,24 @@ export class RollbackManager extends EventEmitter {
       return completedOperation;
 
     } catch (error) {
-      this.activeRollback.success = false;
-      this.activeRollback.duration = Date.now() - startTime;
-      this.activeRollback.error = error instanceof Error ? error.message : String(error);
+      if (this.activeRollback) {
+        this.activeRollback.success = false;
+        this.activeRollback.duration = Date.now() - startTime;
+        this.activeRollback.error = error instanceof Error ? error.message : String(error);
 
-      console.error(`[RollbackManager] Rollback failed:`, error);
-      this.emit('rollback:failed', { operation: this.activeRollback, error });
+        console.error(`[RollbackManager] Rollback failed:`, error);
+        this.emit('rollback:failed', { operation: this.activeRollback, error });
 
-      // Save failed rollback to history
-      await this.saveToHistory(this.activeRollback);
+        // Save failed rollback to history
+        await this.saveToHistory(this.activeRollback);
 
-      // Log failure to audit trail
-      if (this.config.auditLog.enabled) {
-        await this.logToAudit(this.activeRollback);
+        // Log failure to audit trail
+        if (this.config.auditLog.enabled) {
+          await this.logToAudit(this.activeRollback);
+        }
+
+        this.activeRollback = null;
       }
-
-      const failedOperation = { ...this.activeRollback };
-      this.activeRollback = null;
 
       throw error;
     }

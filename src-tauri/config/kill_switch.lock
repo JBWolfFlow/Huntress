@@ -1,0 +1,12 @@
+{
+  "active": true,
+  "last_event": {
+    "reason": {
+      "ScopeViolation": "test.com"
+    },
+    "timestamp": "2026-03-06T03:47:15.817692315Z",
+    "context": "Test context",
+    "triggered_by": null
+  },
+  "activation_count": 1
+}

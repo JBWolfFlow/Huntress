@@ -53,8 +53,9 @@ export const ApproveDenyModal: React.FC<ApproveDenyModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-gray-800 rounded-lg p-6 max-w-3xl w-full border border-gray-700 max-h-[90vh] overflow-y-auto">
+    <div>
+      <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.80)', zIndex: 9998 }} />
+      <div style={{ position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', width: '700px', maxWidth: '90vw', maxHeight: '85vh', zIndex: 9999, overflowY: 'auto', fontFamily: 'monospace' }} className="bg-gray-800 rounded-lg p-6 border border-gray-700">
         {/* Header */}
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-2xl font-bold text-white">APPROVAL REQUIRED</h2>
@@ -224,7 +225,7 @@ export const ApproveDenyModal: React.FC<ApproveDenyModalProps> = ({
         </div>
 
         {/* Timestamp */}
-        <div className="mt-4 text-xs text-gray-500 text-center">
+        <div className="mt-4 text-xs text-gray-400 text-center">
           Requested: {new Date(task.timestamp).toLocaleString()}
         </div>
       </div>
