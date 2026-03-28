@@ -25,6 +25,7 @@ import type {
   ReactFinding,
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import type { HttpClient } from '../core/http/request_engine';
 
 const SUBDOMAIN_TAKEOVER_SYSTEM_PROMPT = `You are an expert subdomain takeover security researcher with deep knowledge of DNS resolution, cloud provider hosting configurations, and the mechanics of dangling DNS records. You specialize in finding subdomain takeover vulnerabilities where a DNS record points to an external service that has been deprovisioned, allowing an attacker to claim the subdomain by registering the abandoned resource.
 
@@ -176,6 +177,7 @@ export class SubdomainTakeoverHunterAgent implements BaseAgent {
   private model?: string;
   private findings: AgentFinding[] = [];
   private status: AgentStatus;
+  private autoApproveSafe = false;
   private onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
 
@@ -194,9 +196,13 @@ export class SubdomainTakeoverHunterAgent implements BaseAgent {
   setCallbacks(callbacks: {
     onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
     onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+    autoApproveSafe?: boolean;
   }): void {
     this.onApprovalRequest = callbacks.onApprovalRequest;
     this.onExecuteCommand = callbacks.onExecuteCommand;
+    if (callbacks.autoApproveSafe !== undefined) {
+      this.autoApproveSafe = callbacks.autoApproveSafe;
+    }
   }
 
   async initialize(provider: ModelProvider, model: string): Promise<void> {
@@ -225,7 +231,7 @@ export class SubdomainTakeoverHunterAgent implements BaseAgent {
         maxIterations: 30,
         target: task.target,
         scope: task.scope,
-        autoApproveSafe: false,
+        autoApproveSafe: this.autoApproveSafe,
         onApprovalRequest: this.onApprovalRequest,
         onExecuteCommand: this.onExecuteCommand,
         onFinding: (finding) => {
@@ -236,6 +242,8 @@ export class SubdomainTakeoverHunterAgent implements BaseAgent {
           this.status.toolsExecuted = update.toolCallCount;
           this.status.lastUpdate = Date.now();
         },
+        httpClient: task.parameters.httpClient as HttpClient | undefined,
+        availableTools: task.parameters.availableTools as string[] | undefined,
       });
 
       const result = await loop.execute();

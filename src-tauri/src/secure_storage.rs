@@ -44,6 +44,9 @@ pub enum SecureStorageError {
 
     #[error("Encryption error: {0}")]
     Encryption(String),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 impl serde::Serialize for SecureStorageError {
@@ -119,7 +122,11 @@ impl hkdf::KeyType for MyLen {
     }
 }
 
-/// Build the machine-specific seed string (same inputs as the old XOR deriver).
+/// Build the machine-specific seed string with added entropy.
+///
+/// The seed incorporates hostname + username + a 32-byte random key that is generated
+/// once and persisted in a separate file. This prevents the vault from being
+/// decryptable by an attacker who knows only the hostname and username.
 fn machine_seed() -> String {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
@@ -127,7 +134,50 @@ fn machine_seed() -> String {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "default".to_string());
-    format!("huntress-vault-{}-{}", hostname, user)
+    let entropy = load_or_generate_entropy();
+    format!("huntress-vault-{}-{}-{}", hostname, user, entropy)
+}
+
+/// Load or generate a persistent random entropy string for key derivation.
+/// Stored alongside the vault in a separate file.
+fn load_or_generate_entropy() -> String {
+    let base = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("huntress");
+    std::fs::create_dir_all(&base).ok();
+    let entropy_path = base.join(".vault_entropy");
+
+    // Try to load existing entropy
+    if let Ok(existing) = std::fs::read_to_string(&entropy_path) {
+        let trimmed = existing.trim();
+        if trimmed.len() >= 32 {
+            return trimmed.to_string();
+        }
+    }
+
+    // Generate new random entropy (32 bytes as hex = 64 chars)
+    let rng = SystemRandom::new();
+    let mut entropy_bytes = [0u8; 32];
+    rng.fill(&mut entropy_bytes)
+        .unwrap_or_else(|_| {
+            // Fallback: use system time + PID if RNG fails (should never happen)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let pid = std::process::id() as u128;
+            let combined = now ^ (pid << 64);
+            entropy_bytes[..16].copy_from_slice(&combined.to_le_bytes());
+        });
+
+    let hex_str: String = entropy_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Persist the entropy (best-effort — vault still works without it, just less secure)
+    if let Err(e) = std::fs::write(&entropy_path, &hex_str) {
+        tracing::warn!("Failed to persist vault entropy: {}", e);
+    }
+
+    hex_str
 }
 
 // ── AES-256-GCM helpers ──────────────────────────────────────────────────────
@@ -301,7 +351,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
             })
             .collect();
 
-        if vals.iter().any(|&v| v == 255) {
+        if vals.contains(&255) {
             return Err("Invalid base64 character".to_string());
         }
 
@@ -378,12 +428,13 @@ fn save_vault(vault: &Vault) -> Result<(), SecureStorageError> {
 }
 
 /// Ensure the vault is loaded into the global mutex.
-fn ensure_vault() -> std::sync::MutexGuard<'static, Option<Vault>> {
-    let mut guard = VAULT.lock().expect("vault mutex poisoned");
+fn ensure_vault() -> Result<std::sync::MutexGuard<'static, Option<Vault>>, SecureStorageError> {
+    let mut guard = VAULT.lock()
+        .map_err(|e| SecureStorageError::Internal(format!("Vault lock error: {}", e)))?;
     if guard.is_none() {
         *guard = Some(load_vault());
     }
-    guard
+    Ok(guard)
 }
 
 // ── Tauri Commands ──────────────────────────────────────────────────────────
@@ -397,8 +448,9 @@ fn ensure_vault() -> std::sync::MutexGuard<'static, Option<Vault>> {
 #[tauri::command]
 pub async fn store_secret(key: String, value: String) -> Result<(), SecureStorageError> {
     let encrypted = encrypt_value(&value)?;
-    let mut guard = ensure_vault();
-    let vault = guard.as_mut().expect("vault initialized");
+    let mut guard = ensure_vault()?;
+    let vault = guard.as_mut()
+        .ok_or_else(|| SecureStorageError::Internal("Vault not initialized".to_string()))?;
     vault.version = 2;
     vault.entries.insert(key, encrypted);
     save_vault(vault)?;
@@ -413,12 +465,13 @@ pub async fn store_secret(key: String, value: String) -> Result<(), SecureStorag
 /// ```
 #[tauri::command]
 pub async fn get_secret(key: String) -> Result<String, SecureStorageError> {
-    let guard = ensure_vault();
-    let vault = guard.as_ref().expect("vault initialized");
+    let guard = ensure_vault()?;
+    let vault = guard.as_ref()
+        .ok_or_else(|| SecureStorageError::Internal("Vault not initialized".to_string()))?;
     let encrypted = vault
         .entries
         .get(&key)
-        .ok_or_else(|| SecureStorageError::KeyNotFound(key))?;
+        .ok_or(SecureStorageError::KeyNotFound(key))?;
 
     // Version-2 entries use AES-GCM.  If (after migration) we still have a
     // version-1 vault, fall back to XOR so the user can at least read their data.
@@ -437,8 +490,9 @@ pub async fn get_secret(key: String) -> Result<String, SecureStorageError> {
 /// ```
 #[tauri::command]
 pub async fn delete_secret(key: String) -> Result<(), SecureStorageError> {
-    let mut guard = ensure_vault();
-    let vault = guard.as_mut().expect("vault initialized");
+    let mut guard = ensure_vault()?;
+    let vault = guard.as_mut()
+        .ok_or_else(|| SecureStorageError::Internal("Vault not initialized".to_string()))?;
     vault.entries.remove(&key);
     save_vault(vault)?;
     Ok(())
@@ -452,8 +506,9 @@ pub async fn delete_secret(key: String) -> Result<(), SecureStorageError> {
 /// ```
 #[tauri::command]
 pub async fn list_secret_keys() -> Result<Vec<String>, SecureStorageError> {
-    let guard = ensure_vault();
-    let vault = guard.as_ref().expect("vault initialized");
+    let guard = ensure_vault()?;
+    let vault = guard.as_ref()
+        .ok_or_else(|| SecureStorageError::Internal("Vault not initialized".to_string()))?;
     Ok(vault.entries.keys().cloned().collect())
 }
 

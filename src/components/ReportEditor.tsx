@@ -66,8 +66,19 @@ function reportToMarkdown(report: H1Report): string {
 }
 
 /** Simple markdown-to-HTML renderer (headings, bold, lists, hr, code) */
+/** Escape HTML entities to prevent XSS in the preview pane */
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function renderMarkdown(md: string): string {
-  return md
+  // Escape HTML first to prevent XSS, then apply markdown formatting
+  return escapeHtml(md)
     .replace(/^### (.+)$/gm, '<h3 class="text-base font-semibold text-white mt-4 mb-2">$1</h3>')
     .replace(/^## (.+)$/gm, '<h2 class="text-lg font-bold text-white mt-5 mb-2">$1</h2>')
     .replace(/^# (.+)$/gm, '<h1 class="text-xl font-bold text-white mt-6 mb-3">$1</h1>')
@@ -103,7 +114,9 @@ export const ReportEditor: React.FC<ReportEditorProps> = ({
     setSubmitting(true);
     setSubmitResult(null);
     try {
-      await onSubmit(report, programHandle);
+      // Merge user-edited markdown into the report so edits are preserved
+      const editedReport = { ...report, description: markdown };
+      await onSubmit(editedReport, programHandle);
       setSubmitResult({ success: true, message: 'Report submitted successfully!' });
     } catch (err) {
       setSubmitResult({
@@ -113,7 +126,7 @@ export const ReportEditor: React.FC<ReportEditorProps> = ({
     } finally {
       setSubmitting(false);
     }
-  }, [onSubmit, report, programHandle]);
+  }, [onSubmit, report, programHandle, markdown]);
 
   return (
     <div className="flex flex-col h-full bg-gray-900">

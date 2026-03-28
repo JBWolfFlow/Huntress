@@ -31,6 +31,7 @@ import { registerAgent } from './agent_catalog';
 import { ReactLoop } from '../core/engine/react_loop';
 import type { ReactLoopConfig, CommandResult, ReactFinding } from '../core/engine/react_loop';
 import { RECON_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import type { HttpClient } from '../core/http/request_engine';
 
 const RECON_SYSTEM_PROMPT = `You are an expert reconnaissance agent for bug bounty hunting. Your mission is to comprehensively map the target's attack surface before specialized hunters begin testing.
 
@@ -89,7 +90,35 @@ const RECON_SYSTEM_PROMPT = `You are an expert reconnaissance agent for bug boun
   - Parameters reflecting input → request xss_hunter
   - API with IDs → request idor_hunter
 - Report findings with subdomain, host, url, or technology types
-- Stop when you've exhausted recon tools or reached iteration limit`;
+- Stop when you've exhausted recon tools or reached iteration limit
+
+## Example: Successful Recon Leading to Critical Findings
+
+### Target: [redacted].com
+
+**Step 1 — Subdomain enumeration:**
+Tool call: execute_command { command: "subfinder -d [redacted].com -json -silent", target: "[redacted].com", category: "recon" }
+Result: Found 47 subdomains including staging.*, api.*, admin.*, dev.*
+
+**Step 2 — HTTP probing:**
+Tool call: execute_command { command: "httpx -l subs.txt -json -td -sc -title -server -follow-redirects", target: "[redacted].com", category: "recon" }
+Result: 32 live hosts. Key findings:
+- staging.[redacted].com → 200, Express.js, no auth
+- api.[redacted].com → 200, nginx, GraphQL playground exposed
+- admin.[redacted].com → 403, CloudFlare WAF
+- dev.[redacted].com → 200, Django debug mode ON
+
+**Step 3 — WAF detection:**
+Tool call: execute_command { command: "wafw00f api.[redacted].com", target: "api.[redacted].com", category: "recon" }
+Result: No WAF detected on api subdomain (only admin has CloudFlare)
+
+**Step 4 — Tech fingerprint:**
+Tool call: execute_command { command: "whatweb -a 1 --log-json=- api.[redacted].com", target: "api.[redacted].com", category: "recon" }
+Result: Node.js, Express, GraphQL, Apollo Server
+
+**Step 5 — Dispatch specialists:**
+Tool call: request_specialist { agent_type: "graphql_hunter", target: "api.[redacted].com/graphql", context: "Apollo GraphQL with playground exposed, no WAF", priority: "high" }
+Tool call: request_specialist { agent_type: "idor_hunter", target: "staging.[redacted].com", context: "Staging env with no auth — likely has test data and relaxed access controls", priority: "high" }`;
 
 export class ReconAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {
@@ -104,6 +133,7 @@ export class ReconAgent implements BaseAgent {
   private model?: string;
   private findings: AgentFinding[] = [];
   private status: AgentStatus;
+  private autoApproveSafe = false;
   private onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
 
@@ -122,9 +152,13 @@ export class ReconAgent implements BaseAgent {
   setCallbacks(callbacks: {
     onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
     onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+    autoApproveSafe?: boolean;
   }): void {
     this.onApprovalRequest = callbacks.onApprovalRequest;
     this.onExecuteCommand = callbacks.onExecuteCommand;
+    if (callbacks.autoApproveSafe !== undefined) {
+      this.autoApproveSafe = callbacks.autoApproveSafe;
+    }
   }
 
   async initialize(provider: ModelProvider, model: string): Promise<void> {
@@ -153,7 +187,7 @@ export class ReconAgent implements BaseAgent {
         maxIterations: 60,
         target: task.target,
         scope: task.scope,
-        autoApproveSafe: false,
+        autoApproveSafe: this.autoApproveSafe,
         onApprovalRequest: this.onApprovalRequest,
         onExecuteCommand: this.onExecuteCommand,
         onFinding: (finding) => {
@@ -164,6 +198,8 @@ export class ReconAgent implements BaseAgent {
           this.status.toolsExecuted = update.toolCallCount;
           this.status.lastUpdate = Date.now();
         },
+        httpClient: task.parameters.httpClient as HttpClient | undefined,
+        availableTools: task.parameters.availableTools as string[] | undefined,
         onSpecialistRequest: (request) => {
           // Log the specialist request as a finding
           this.findings.push({
@@ -192,11 +228,37 @@ export class ReconAgent implements BaseAgent {
 
       this.updateStatus(result.success ? 'completed' : 'failed');
 
+      // Build observations for cross-agent sharing via the blackboard
+      const observations = this.findings
+        .filter(f => f.severity === 'info' || f.type === 'specialist_request')
+        .map(f => {
+          const relevantTo: string[] = [];
+          // Route recon findings to relevant specialist agents
+          if (f.type === 'specialist_request') {
+            const match = f.title.match(/Specialist requested: (\w+)/);
+            if (match) relevantTo.push(match[1]);
+          } else {
+            const desc = f.description.toLowerCase();
+            if (desc.includes('graphql')) relevantTo.push('graphql');
+            if (desc.includes('oauth') || desc.includes('login') || desc.includes('auth')) relevantTo.push('oauth');
+            if (desc.includes('redirect')) relevantTo.push('open_redirect', 'ssrf');
+            if (desc.includes('api') || desc.includes('endpoint')) relevantTo.push('idor', 'sqli', 'xss');
+            if (desc.includes('upload')) relevantTo.push('path_traversal', 'xss');
+            if (desc.includes('cname') || desc.includes('dangling')) relevantTo.push('subdomain_takeover');
+          }
+          return {
+            category: f.type,
+            detail: `${f.target}: ${f.description}`,
+            relevantTo: relevantTo.length > 0 ? relevantTo : undefined,
+          };
+        });
+
       return {
         taskId: task.id,
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        observations,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.stopReason === 'error' ? result.summary : undefined,
@@ -225,7 +287,7 @@ export class ReconAgent implements BaseAgent {
   }
 
   reportFindings(): AgentFinding[] {
-    return this.findings;
+    return [...this.findings];
   }
 
   async cleanup(): Promise<void> {

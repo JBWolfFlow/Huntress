@@ -9,7 +9,21 @@
  */
 
 import axios from 'axios';
+import { tauriFetch } from '../../core/tauri_bridge';
 import { OAuthEndpoint } from './discovery';
+
+function checkIsTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+async function proxyGet(url: string, config?: { headers?: Record<string, string>; maxRedirects?: number; timeout?: number; validateStatus?: () => boolean }): Promise<{ status: number; headers: Record<string, string>; data: string }> {
+  if (checkIsTauri()) {
+    const resp = await tauriFetch(url, { method: 'GET', headers: config?.headers, followRedirects: (config?.maxRedirects ?? 0) > 0, timeoutMs: config?.timeout ?? 10000 });
+    return { status: resp.status, headers: resp.headers, data: resp.body };
+  }
+  const resp = await axios.get(url, config);
+  return { status: resp.status, headers: resp.headers as Record<string, string>, data: typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data) };
+}
 
 export interface StateVulnerability {
   type: 'missing_state' | 'predictable_state' | 'state_fixation' | 'state_reuse';
@@ -62,7 +76,7 @@ export class StateValidator {
       const url = this.buildAuthUrl();
       url.searchParams.delete('state');
 
-      const response = await axios.get(url.toString(), {
+      const response = await proxyGet(url.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
@@ -96,7 +110,7 @@ export class StateValidator {
     for (let i = 0; i < numTests; i++) {
       try {
         const url = this.buildAuthUrl();
-        const response = await axios.get(url.toString(), {
+        const response = await proxyGet(url.toString(), {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,
@@ -150,7 +164,7 @@ export class StateValidator {
     try {
       // First request with attacker's state
       const url1 = this.buildAuthUrl(fixedState);
-      const response1 = await axios.get(url1.toString(), {
+      const response1 = await proxyGet(url1.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
@@ -158,7 +172,7 @@ export class StateValidator {
 
       // Second request with same state
       const url2 = this.buildAuthUrl(fixedState);
-      const response2 = await axios.get(url2.toString(), {
+      const response2 = await proxyGet(url2.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
@@ -198,14 +212,14 @@ export class StateValidator {
       const url = this.buildAuthUrl(testState);
       
       // First authorization request
-      const response1 = await axios.get(url.toString(), {
+      const response1 = await proxyGet(url.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
       });
 
       // Try to reuse the same state in another request
-      const response2 = await axios.get(url.toString(), {
+      const response2 = await proxyGet(url.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,

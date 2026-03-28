@@ -1,17 +1,34 @@
 /**
  * HackerOne API Integration (Phase 4)
- * 
+ *
  * One-Click Submission System:
  * - Submit reports to HackerOne
  * - Upload attachments (videos, screenshots, logs)
  * - Track submission status
  * - Update reports
  * - Error handling and retry logic
+ *
+ * NOTE: Runs inside Tauri WebView — no Node.js APIs (fs, path).
+ * File operations use Tauri invoke() commands.
  */
 
 import axios, { AxiosInstance, AxiosError } from 'axios';
-import * as fs from 'fs';
-import * as path from 'path';
+import { invoke } from '@tauri-apps/api/core';
+import type { DuplicateScore } from '../../utils/duplicate_checker';
+
+// ─── Browser-compatible path helpers (replaces Node.js 'path') ────────────
+
+/** Extract the filename from a path string (replaces path.basename) */
+function basename(filePath: string): string {
+  const parts = filePath.replace(/\\/g, '/').split('/');
+  return parts[parts.length - 1] || filePath;
+}
+
+/** Extract the file extension from a filename (replaces path.extname) */
+function extname(filename: string): string {
+  const dot = filename.lastIndexOf('.');
+  return dot > 0 ? filename.slice(dot) : '';
+}
 
 export interface H1Report {
   title: string;
@@ -25,7 +42,7 @@ export interface H1Report {
     screenshots?: string[];
     logs?: string[];
   };
-  duplicateCheck?: any;
+  duplicateCheck?: DuplicateScore;
   severityJustification?: string[];
   cvssScore?: number;
   weaknessId?: string;
@@ -120,7 +137,7 @@ export class HackerOneAPI {
     const { programHandle, report, attachments } = params;
 
     try {
-      console.log(`📤 Submitting report to ${programHandle}...`);
+      console.log(`Submitting report to ${programHandle}...`);
 
       // 1. Create the report
       const reportData = this.formatReportData(report, programHandle);
@@ -131,27 +148,27 @@ export class HackerOneAPI {
       const reportId = createResponse.data.data.id;
       const reportUrl = `https://hackerone.com/reports/${reportId}`;
 
-      console.log(`✓ Report created: ${reportId}`);
+      console.log(`Report created: ${reportId}`);
 
       // 2. Upload attachments if provided
       const attachmentIds: string[] = [];
       if (attachments && attachments.length > 0) {
-        console.log(`📎 Uploading ${attachments.length} attachments...`);
-        
+        console.log(`Uploading ${attachments.length} attachments...`);
+
         for (const attachment of attachments) {
           try {
             const attachmentId = await this.uploadAttachment(attachment);
             attachmentIds.push(attachmentId);
-            console.log(`✓ Uploaded: ${path.basename(attachment.path)}`);
+            console.log(`Uploaded: ${basename(attachment.path)}`);
           } catch (error) {
-            console.error(`✗ Failed to upload ${attachment.path}:`, error);
+            console.error(`Failed to upload ${attachment.path}:`, error);
           }
         }
 
         // 3. Attach files to report
         if (attachmentIds.length > 0) {
           await this.attachFilesToReport(reportId, attachmentIds);
-          console.log(`✓ Attached ${attachmentIds.length} files to report`);
+          console.log(`Attached ${attachmentIds.length} files to report`);
         }
       }
 
@@ -167,7 +184,7 @@ export class HackerOneAPI {
         attachmentIds,
       };
     } catch (error) {
-      console.error('✗ Report submission failed:', error);
+      console.error('Report submission failed:', error);
       return {
         success: false,
         error: this.extractErrorMessage(error),
@@ -177,33 +194,42 @@ export class HackerOneAPI {
   }
 
   /**
-   * Upload an attachment to HackerOne
+   * Upload an attachment to HackerOne.
+   *
+   * Reads the file via Tauri IPC (no Node.js fs), converts to a Blob,
+   * and uploads via the browser-native FormData API.
    */
   async uploadAttachment(attachment: Attachment): Promise<string> {
     try {
-      // Check if file exists
-      if (!fs.existsSync(attachment.path)) {
+      // Check if file exists via Tauri
+      const exists = await invoke<boolean>('file_exists', { path: attachment.path });
+      if (!exists) {
         throw new Error(`File not found: ${attachment.path}`);
       }
 
-      // Read file
-      const fileBuffer = fs.readFileSync(attachment.path);
-      const filename = attachment.filename || path.basename(attachment.path);
+      // Read file as base64-encoded binary via Tauri to avoid UTF-8 corruption
+      const base64Content = await invoke<string>('read_file_binary', { path: attachment.path });
+
+      const filename = attachment.filename || basename(attachment.path);
       const contentType = attachment.contentType || this.getContentType(filename);
 
-      // Create form data
-      const FormData = require('form-data');
+      // Decode base64 to binary Uint8Array for proper blob creation
+      const binaryStr = atob(base64Content);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: contentType });
+
+      // Use browser-native FormData
       const formData = new FormData();
-      formData.append('file', fileBuffer, {
-        filename,
-        contentType,
-      });
+      formData.append('file', blob, filename);
 
       // Upload to HackerOne
       const response = await this.retryRequest(() =>
         this.client.post('/attachments', formData, {
           headers: {
-            ...formData.getHeaders(),
+            'Content-Type': 'multipart/form-data',
           },
           maxBodyLength: Infinity,
           maxContentLength: Infinity,
@@ -275,23 +301,25 @@ export class HackerOneAPI {
    */
   async updateReport(reportId: string, updates: Partial<H1Report>): Promise<void> {
     try {
-      const updateData: any = {
+      const updateData: Record<string, unknown> = {
         data: {
           type: 'report',
           id: reportId,
-          attributes: {},
+          attributes: {} as Record<string, unknown>,
         },
       };
 
+      const attrs = (updateData.data as Record<string, unknown>).attributes as Record<string, unknown>;
+
       // Map updates to API format
       if (updates.title) {
-        updateData.data.attributes.title = updates.title;
+        attrs.title = updates.title;
       }
       if (updates.description) {
-        updateData.data.attributes.vulnerability_information = updates.description;
+        attrs.vulnerability_information = updates.description;
       }
       if (updates.severity) {
-        updateData.data.attributes.severity = {
+        attrs.severity = {
           rating: updates.severity,
         };
       }
@@ -300,7 +328,7 @@ export class HackerOneAPI {
         this.client.patch(`/reports/${reportId}`, updateData)
       );
 
-      console.log(`✓ Report ${reportId} updated successfully`);
+      console.log(`Report ${reportId} updated successfully`);
     } catch (error) {
       throw new Error(`Failed to update report: ${this.extractErrorMessage(error)}`);
     }
@@ -322,7 +350,7 @@ export class HackerOneAPI {
         })
       );
 
-      console.log(`✓ Comment added to report ${reportId}`);
+      console.log(`Comment added to report ${reportId}`);
     } catch (error) {
       throw new Error(`Failed to add comment: ${this.extractErrorMessage(error)}`);
     }
@@ -331,7 +359,7 @@ export class HackerOneAPI {
   /**
    * Get program details
    */
-  async getProgramDetails(programHandle: string): Promise<any> {
+  async getProgramDetails(programHandle: string): Promise<Record<string, unknown>> {
     try {
       const response = await this.retryRequest(() =>
         this.client.get(`/programs/${programHandle}`)
@@ -346,7 +374,7 @@ export class HackerOneAPI {
   /**
    * Format report data for HackerOne API
    */
-  private formatReportData(report: H1Report, programHandle: string): any {
+  private formatReportData(report: H1Report, programHandle: string): Record<string, unknown> {
     // Build vulnerability information markdown
     let vulnerabilityInfo = `# ${report.title}\n\n`;
     vulnerabilityInfo += `## Description\n${report.description}\n\n`;
@@ -411,7 +439,7 @@ export class HackerOneAPI {
     } catch (error) {
       if (retries > 0 && this.isRetryableError(error)) {
         const delay = this.retryDelay * (this.maxRetries - retries + 1);
-        console.log(`⏳ Retrying in ${delay}ms... (${retries} retries left)`);
+        console.log(`Retrying in ${delay}ms... (${retries} retries left)`);
         await this.sleep(delay);
         return this.retryRequest(requestFn, retries - 1);
       }
@@ -422,13 +450,14 @@ export class HackerOneAPI {
   /**
    * Check if error is retryable
    */
-  private isRetryableError(error: any): boolean {
-    if (!error.response) {
+  private isRetryableError(error: unknown): boolean {
+    const axiosErr = error as { response?: { status: number } };
+    if (!axiosErr.response) {
       // Network errors are retryable
       return true;
     }
 
-    const status = error.response.status;
+    const status = axiosErr.response.status;
     // Retry on 429 (rate limit), 500, 502, 503, 504
     return status === 429 || (status >= 500 && status <= 504);
   }
@@ -439,12 +468,12 @@ export class HackerOneAPI {
   private handleApiError(error: AxiosError): Promise<never> {
     if (error.response) {
       const status = error.response.status;
-      const data: any = error.response.data;
+      const data = error.response.data as Record<string, unknown> | undefined;
 
       let message = `HackerOne API error (${status})`;
-      
+
       if (data?.errors && Array.isArray(data.errors)) {
-        message += `: ${data.errors.map((e: any) => e.detail || e.title).join(', ')}`;
+        message += `: ${(data.errors as Array<{ detail?: string; title?: string }>).map(e => e.detail || e.title).join(', ')}`;
       } else if (data?.error) {
         message += `: ${data.error}`;
       }
@@ -462,20 +491,21 @@ export class HackerOneAPI {
   /**
    * Extract error message from error object
    */
-  private extractErrorMessage(error: any): string {
-    if (error.response?.data?.errors) {
-      return error.response.data.errors
-        .map((e: any) => e.detail || e.title)
+  private extractErrorMessage(error: unknown): string {
+    const axiosErr = error as { response?: { data?: { errors?: Array<{ detail?: string; title?: string }> } }; message?: string };
+    if (axiosErr.response?.data?.errors) {
+      return axiosErr.response.data.errors
+        .map(e => e.detail || e.title)
         .join(', ');
     }
-    return error.message || 'Unknown error';
+    return axiosErr.message || 'Unknown error';
   }
 
   /**
    * Get content type from filename
    */
   private getContentType(filename: string): string {
-    const ext = path.extname(filename).toLowerCase();
+    const ext = extname(filename).toLowerCase();
     const contentTypes: Record<string, string> = {
       '.mp4': 'video/mp4',
       '.webm': 'video/webm',
@@ -507,10 +537,10 @@ export class HackerOneAPI {
   async testConnection(): Promise<boolean> {
     try {
       await this.client.get('/me');
-      console.log('✓ HackerOne API connection successful');
+      console.log('HackerOne API connection successful');
       return true;
     } catch (error) {
-      console.error('✗ HackerOne API connection failed:', this.extractErrorMessage(error));
+      console.error('HackerOne API connection failed:', this.extractErrorMessage(error));
       return false;
     }
   }
@@ -518,7 +548,7 @@ export class HackerOneAPI {
   /**
    * Get user information
    */
-  async getUserInfo(): Promise<any> {
+  async getUserInfo(): Promise<Record<string, unknown>> {
     try {
       const response = await this.client.get('/me');
       return response.data.data;

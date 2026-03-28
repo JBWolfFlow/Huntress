@@ -77,9 +77,12 @@ export function useScope() {
     setLoading(true);
     setError(null);
     try {
-      const result = await invoke<ScopeEntry[]>('load_scope', { path });
-      setScope(result);
-      return result;
+      // Rust load_scope returns a summary String, not the entries themselves.
+      // We store the scope entries locally via addToScope / load_scope_entries.
+      const message = await invoke<string>('load_scope', { path });
+      // The scope entries are loaded into the Rust global scope validator.
+      // Return the message for UI feedback.
+      return message;
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       setError(errorMsg);
@@ -91,8 +94,14 @@ export function useScope() {
 
   const validateTarget = useCallback(async (target: string): Promise<ValidationResult> => {
     try {
-      const result = await invoke<ValidationResult>('validate_target', { target });
-      return result;
+      // Rust validate_target returns bool — wrap it in the ValidationResult shape
+      const isInScope = await invoke<boolean>('validate_target', { target });
+      return {
+        target,
+        isValid: isInScope,
+        inScope: isInScope,
+        reason: isInScope ? 'Target is in scope' : 'Target is not in scope',
+      };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       setError(errorMsg);

@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.anthropic.com https://api.openai.com https://generativelanguage.googleapis.com https://openrouter.ai http://localhost:* https://api.hackerone.com https://httpbin.org; img-src 'self' data: blob:; font-src 'self' data:;"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* wss://localhost:* https://api.anthropic.com https://api.openai.com https://generativelanguage.googleapis.com https://openrouter.ai http://localhost:* https://api.hackerone.com https://httpbin.org; img-src 'self' data: blob:; font-src 'self' data:;"
     }
   },
   "bundle": {

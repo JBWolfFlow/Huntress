@@ -26,6 +26,7 @@ import type {
   ReactFinding,
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import type { HttpClient } from '../core/http/request_engine';
 
 const IDOR_SYSTEM_PROMPT = `You are an elite access control and IDOR (Insecure Direct Object Reference) security researcher. Your mission is to systematically discover authorization vulnerabilities where one user can access or modify another user's resources by manipulating object identifiers. You approach each test methodically, carefully comparing authorized vs unauthorized responses, and you document every finding with precise reproduction steps.
 
@@ -122,7 +123,41 @@ Test directory traversal patterns that may bypass authorization middleware:
 - Object existence confirmation without data access: LOW
 - Requires unlikely preconditions or chained vulnerabilities: adjust accordingly
 
-Always validate findings with at least two separate requests to confirm reproducibility. Document the exact requests, responses, and the authorization context (which account made the request, which account owns the resource).`;
+Always validate findings with at least two separate requests to confirm reproducibility. Document the exact requests, responses, and the authorization context (which account made the request, which account owns the resource).
+
+## Examples of Successful IDOR Discoveries
+
+### Example 1: Sequential User ID in REST API
+**Step 1 — Recon:**
+Tool call: execute_command { command: "katana -u https://[redacted].com -jc -json -d 3 -rl 5", target: "[redacted].com", category: "recon" }
+Result: Found 23 endpoints including /api/v1/users/me, /api/v1/orders/{id}
+
+**Step 2 — Baseline:**
+Tool call: http_request { url: "https://[redacted].com/api/v1/users/me", method: "GET" }
+Response: 200 OK — {"id": 1337, "email": "test@example.com", "role": "user"}
+
+**Step 3 — Test ID manipulation:**
+Tool call: http_request { url: "https://[redacted].com/api/v1/users/1336", method: "GET" }
+Response: 200 OK — {"id": 1336, "email": "OTHER@company.com", "role": "admin"} — IDOR confirmed!
+
+**Step 4 — Validate with second ID:**
+Tool call: http_request { url: "https://[redacted].com/api/v1/users/1335", method: "GET" }
+Response: 200 OK — different user data — confirmed reproducible
+
+**Step 5 — Report:**
+Tool call: report_finding { title: "IDOR on /api/v1/users/:id allows reading any user profile including email and role", severity: "high", vulnerability_type: "idor", confidence: 95 }
+
+### Example 2: BOLA via Missing Ownership Filter on List Endpoint
+**Step 1 — Observe own order UUID:**
+Tool call: http_request { url: "https://[redacted].com/api/orders", method: "GET" }
+Response: 200 OK — returns list of orders including other users' data without authorization
+
+**Step 2 — Confirm by checking write access:**
+Tool call: http_request { url: "https://[redacted].com/api/orders/OTHER_UUID", method: "PATCH", body: "{\\"status\\":\\"cancelled\\"}" }
+Response: 200 OK — modified another user's order
+
+**Step 3 — Report:**
+Tool call: report_finding { title: "BOLA: /api/orders allows read+write to any user's orders", severity: "critical", vulnerability_type: "bola", confidence: 95 }`;
 
 /**
  * IDORHunterAgent discovers Insecure Direct Object Reference and access
@@ -144,6 +179,7 @@ export class IDORHunterAgent implements BaseAgent {
   private model?: string;
   private findings: AgentFinding[] = [];
   private status: AgentStatus;
+  private autoApproveSafe = false;
   private onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
 
@@ -162,9 +198,13 @@ export class IDORHunterAgent implements BaseAgent {
   setCallbacks(callbacks: {
     onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
     onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+    autoApproveSafe?: boolean;
   }): void {
     this.onApprovalRequest = callbacks.onApprovalRequest;
     this.onExecuteCommand = callbacks.onExecuteCommand;
+    if (callbacks.autoApproveSafe !== undefined) {
+      this.autoApproveSafe = callbacks.autoApproveSafe;
+    }
   }
 
   async initialize(provider: ModelProvider, model: string): Promise<void> {
@@ -193,7 +233,7 @@ export class IDORHunterAgent implements BaseAgent {
         maxIterations: 30,
         target: task.target,
         scope: task.scope,
-        autoApproveSafe: false,
+        autoApproveSafe: this.autoApproveSafe,
         onApprovalRequest: this.onApprovalRequest,
         onExecuteCommand: this.onExecuteCommand,
         onFinding: (finding) => {
@@ -204,6 +244,8 @@ export class IDORHunterAgent implements BaseAgent {
           this.status.toolsExecuted = update.toolCallCount;
           this.status.lastUpdate = Date.now();
         },
+        httpClient: task.parameters.httpClient as HttpClient | undefined,
+        availableTools: task.parameters.availableTools as string[] | undefined,
       });
 
       const result = await loop.execute();

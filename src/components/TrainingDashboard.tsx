@@ -93,8 +93,8 @@ async function fetchTrainingData(): Promise<DashboardData | null> {
     const trainingModule = await import('../core/training/integration');
     if (!trainingModule.createContinuousLearningSystem) return null;
 
-    // The full system requires Qdrant + filesystem; attempt to get status
-    // If the system hasn't been initialized, return null
+    // Training system requires Qdrant and is only available when backend is running
+    // Return null to show the "no data" empty state
     return null;
   } catch {
     // Training modules not available in this environment

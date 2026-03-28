@@ -52,6 +52,8 @@ import {
   findAgentsForVulnClass,
   initializeCatalog,
 } from '../../agents/agent_catalog';
+// Side-effect import: triggers all agent self-registration with the catalog
+import '../../agents/standardized_agents';
 import type { AgentResult, AgentFinding, AgentTask } from '../../agents/base_agent';
 import { ORCHESTRATOR_TOOL_SCHEMAS } from '../engine/tool_schemas';
 import { ModelAlloy, createAlloy } from '../engine/model_alloy';
@@ -64,6 +66,24 @@ import type { OOBCallback } from '../validation/oob_server';
 import { FeedbackLoop } from '../training/feedback_loop';
 import type { SubmittedReport, FeedbackStats } from '../training/feedback_loop';
 import { deduplicateFindings } from './finding_dedup';
+import { createSandboxedExecutor } from '../tools/sandbox_executor';
+import type { KnowledgeGraph, HuntResult } from '../knowledge/knowledge_graph';
+import { SASTAnalyzer } from '../sast/sast_analyzer';
+import type { SourceFile, SASTReport } from '../sast/sast_analyzer';
+import type { VulnDatabase } from '../knowledge/vuln_database';
+import type { RewardSystem, ShortcutCheckInput } from '../training/reward_system';
+import type { HttpClient } from '../http/request_engine';
+import type { SessionManager } from '../auth/session_manager';
+import type { HuntMemory } from '../memory/hunt_memory';
+import type { NucleiRunner } from '../discovery/nuclei_runner';
+import type { WAFDetector, WAFDetectionResult } from '../evasion/waf_detector';
+import type { ChainValidator } from './chain_validator';
+import type { RateController } from '../http/rate_controller';
+import type { StealthModule } from '../evasion/stealth';
+import type { TargetDeduplicator } from './target_dedup';
+import type { H1DuplicateChecker } from '../reporting/h1_duplicate_check';
+import type { ReportQualityScorer } from '../reporting/report_quality';
+import type { ContinuousMonitor } from '../discovery/continuous_monitor';
 
 // ─── Callback Types ───────────────────────────────────────────────────────────
 
@@ -105,6 +125,38 @@ export interface OrchestratorConfig {
   onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
   /** Optional alloy configuration for multi-model rotation */
   alloy?: AlloyConfiguration;
+  /** Pre-initialized KnowledgeGraph for persistent learning */
+  knowledgeGraph?: KnowledgeGraph;
+  /** Pre-initialized VulnDatabase for CVE/CWE context enrichment */
+  vulnDb?: VulnDatabase;
+  /** Pre-initialized RewardSystem for agent trust/model selection */
+  rewardSystem?: RewardSystem;
+  /** Pre-initialized HTTP client for direct agent requests (Phase 20A) */
+  httpClient?: HttpClient;
+  /** Pre-initialized session manager for authenticated testing (Phase 20C) */
+  sessionManager?: SessionManager;
+  /** Pre-initialized hunt memory for cross-session learning (Phase 20E) */
+  huntMemory?: HuntMemory;
+  /** Pre-initialized Nuclei template scanner (Phase 20F) */
+  nucleiRunner?: NucleiRunner;
+  /** Pre-initialized WAF detector (Phase 20G) */
+  wafDetector?: WAFDetector;
+  /** Pre-initialized chain validator (Phase 20I) */
+  chainValidator?: ChainValidator;
+  /** Pre-initialized adaptive rate controller (Phase 20J) */
+  rateController?: RateController;
+  /** Pre-initialized stealth module (Phase 20J) */
+  stealthModule?: StealthModule;
+  /** Pre-initialized target deduplicator (Phase 23B) */
+  targetDedup?: TargetDeduplicator;
+  /** Pre-initialized H1 duplicate checker (Phase 23C) */
+  h1DuplicateChecker?: H1DuplicateChecker;
+  /** Pre-initialized report quality scorer (Phase 23E) */
+  reportQuality?: ReportQualityScorer;
+  /** Pre-initialized continuous monitor (Phase 23G) */
+  continuousMonitor?: ContinuousMonitor;
+  /** List of available security tools on this system */
+  availableTools?: string[];
 }
 
 export interface ApprovalRequest {
@@ -176,6 +228,41 @@ export class OrchestratorEngine {
   /** Alloy configuration from settings */
   private alloyConfig?: AlloyConfiguration;
 
+  /** Persistent knowledge graph for cross-session learning */
+  private knowledgeGraph?: KnowledgeGraph;
+  /** Vulnerability database for CVE/CWE enrichment */
+  private vulnDb?: VulnDatabase;
+  /** Reward system for agent trust levels and model selection */
+  private rewardSystem?: RewardSystem;
+  /** Direct HTTP client for agent requests (Phase 20A) */
+  private httpClient?: HttpClient;
+  /** Session manager for authenticated testing (Phase 20C) */
+  private sessionManager?: SessionManager;
+  /** Hunt memory for cross-session TF-IDF vector learning (Phase 20E) */
+  private huntMemory?: HuntMemory;
+  /** Nuclei template scanner (Phase 20F) */
+  private nucleiRunner?: NucleiRunner;
+  /** WAF detector (Phase 20G) */
+  private wafDetector?: WAFDetector;
+  /** Cached WAF detection result for current target */
+  private wafDetectionResult?: WAFDetectionResult;
+  /** Chain validator for proving chains are exploitable (Phase 20I) */
+  private chainValidator?: ChainValidator;
+  /** Adaptive rate controller (Phase 20J) */
+  private rateController?: RateController;
+  /** Stealth module for UA rotation and jitter (Phase 20J) */
+  private stealthModule?: StealthModule;
+  /** Target deduplicator for reducing redundant testing (Phase 23B) */
+  private targetDedup?: TargetDeduplicator;
+  /** HackerOne duplicate checker for pre-submission validation (Phase 23C) */
+  private h1DuplicateChecker?: H1DuplicateChecker;
+  /** Report quality scorer for submission readiness (Phase 23E) */
+  private reportQuality?: ReportQualityScorer;
+  /** Continuous monitoring for new attack surface (Phase 23G) */
+  private continuousMonitor?: ContinuousMonitor;
+  /** Available security tools on this system */
+  private availableTools?: string[];
+
   /** Active hunt session state — only set during a hunt */
   private huntSession?: HuntSession;
 
@@ -231,6 +318,24 @@ export class OrchestratorEngine {
         }
       },
     });
+
+    // Wire knowledge systems (pre-initialized by HuntSessionContext)
+    this.knowledgeGraph = config.knowledgeGraph;
+    this.vulnDb = config.vulnDb;
+    this.rewardSystem = config.rewardSystem;
+    this.httpClient = config.httpClient;
+    this.sessionManager = config.sessionManager;
+    this.huntMemory = config.huntMemory;
+    this.nucleiRunner = config.nucleiRunner;
+    this.wafDetector = config.wafDetector;
+    this.chainValidator = config.chainValidator;
+    this.rateController = config.rateController;
+    this.stealthModule = config.stealthModule;
+    this.targetDedup = config.targetDedup;
+    this.h1DuplicateChecker = config.h1DuplicateChecker;
+    this.reportQuality = config.reportQuality;
+    this.continuousMonitor = config.continuousMonitor;
+    this.availableTools = config.availableTools;
 
     // Ensure agent catalog is initialized
     initializeCatalog();
@@ -405,11 +510,18 @@ export class OrchestratorEngine {
     let fullContent = '';
 
     try {
-      const stream = this.provider.streamMessage(contextMessages, {
+      const useTools = this.provider.supportsToolUse && this.huntSession?.running;
+      const options: SendMessageOptions = {
         model: this.model,
         maxTokens: 4096,
         systemPrompt: this.buildSystemPrompt(),
-      });
+      };
+      if (useTools) {
+        options.tools = ORCHESTRATOR_TOOL_SCHEMAS;
+        options.toolChoice = 'auto';
+      }
+
+      const stream = this.provider.streamMessage(contextMessages, options);
 
       for await (const chunk of stream) {
         if (chunk.type === 'content_delta' && chunk.content) {
@@ -461,6 +573,43 @@ export class OrchestratorEngine {
     }));
     const scoredTargets = rankTargets(targetMetadata);
 
+    // Enrich briefing with VulnDatabase knowledge if available
+    let vulnContextSection = '';
+    if (this.vulnDb) {
+      try {
+        const targets = guidelines.scope.inScope.slice(0, 5); // Top 5 targets
+        const contextParts: string[] = [];
+        for (const target of targets) {
+          const knowledge = await this.vulnDb.getRelevantKnowledge('recon', target);
+          if (knowledge.relevantCVEs.length > 0 || knowledge.kevEntries.length > 0) {
+            contextParts.push(
+              `${target}: ${knowledge.relevantCVEs.length} known CVEs` +
+              (knowledge.kevEntries.length > 0 ? `, ${knowledge.kevEntries.length} in CISA KEV` : '')
+            );
+          }
+        }
+        if (contextParts.length > 0) {
+          vulnContextSection = `\nKnown vulnerability context:\n${contextParts.map(p => `  ${p}`).join('\n')}\n`;
+        }
+      } catch {
+        // VulnDB enrichment is best-effort
+      }
+    }
+
+    // Enrich with historical knowledge graph patterns
+    let kgContextSection = '';
+    if (this.knowledgeGraph) {
+      try {
+        const stats = await this.knowledgeGraph.getOverallStats();
+        if (stats.totalHunts > 0) {
+          const topVulns = stats.topVulnTypes.slice(0, 3).map(v => `${v.vulnType}(${v.count})`).join(', ');
+          kgContextSection = `\nHistorical performance: ${stats.totalHunts} hunts, ${(stats.successRate * 100).toFixed(0)}% success rate, top vulns: ${topVulns}\n`;
+        }
+      } catch {
+        // KG enrichment is best-effort
+      }
+    }
+
     const prompt = `Analyze this bug bounty program and recommend attack strategies.
 
 Program: ${guidelines.programName}
@@ -471,7 +620,7 @@ Rules: ${guidelines.rules.join('; ')}
 
 Target priority scores:
 ${scoredTargets.map(s => `  ${s.target}: ${s.totalScore}/100 — ${s.recommendation}`).join('\n')}
-
+${vulnContextSection}${kgContextSection}
 Available specialized agents:
 ${getAllAgents().map(a => `  - ${a.metadata.id}: ${a.metadata.description}`).join('\n')}
 
@@ -542,8 +691,6 @@ Return ONLY the JSON, no other text.`;
    * Handle a strategy selection from the user.
    */
   async selectStrategy(strategy: StrategyOption): Promise<void> {
-    this.setPhase('hunting');
-
     const msg: ConversationMessage = {
       type: 'orchestrator',
       id: this.generateId(),
@@ -552,6 +699,11 @@ Return ONLY the JSON, no other text.`;
     };
     this.conversation.addMessage(msg);
     this.emitMessage(msg);
+
+    // Actually start the hunt with the loaded program
+    if (this.guidelines) {
+      await this.startHunt(this.guidelines);
+    }
   }
 
   // ─── Coordinator-Solver: Hunt Lifecycle ─────────────────────────────────────
@@ -584,6 +736,57 @@ Return ONLY the JSON, no other text.`;
       running: true,
       aborted: false,
     };
+
+    // ── Tool Availability Check ──
+    // Verify which external tools are installed before dispatching agents
+    if (this.onExecuteCommand) {
+      const toolChecks = [
+        { name: 'subfinder', cmd: 'subfinder -version', agents: ['recon'] },
+        { name: 'httpx', cmd: 'httpx -version', agents: ['recon'] },
+        { name: 'nuclei', cmd: 'nuclei -version', agents: ['recon'] },
+        { name: 'katana', cmd: 'katana -version', agents: ['recon'] },
+        { name: 'naabu', cmd: 'naabu -version', agents: ['recon'] },
+        { name: 'curl', cmd: 'curl --version', agents: ['*'] },
+      ];
+
+      const missing: string[] = [];
+      const installed: string[] = [];
+
+      for (const tool of toolChecks) {
+        try {
+          const result = await this.onExecuteCommand(tool.cmd, '');
+          if (result.success || result.exitCode === 0) {
+            installed.push(tool.name);
+          } else {
+            missing.push(tool.name);
+          }
+        } catch {
+          missing.push(tool.name);
+        }
+      }
+
+      if (missing.length > 0) {
+        this.emitSystemMessage(
+          `Missing tools: ${missing.join(', ')}. Some agents may have reduced capability. Install with: apt install ${missing.join(' ')}`,
+          'warning'
+        );
+      }
+
+      // Store available tools so agents can check them
+      postObservation(this.blackboard, 'orchestrator', 'tool_availability', {
+        installed,
+        missing,
+      }, getAllAgents().map(a => a.metadata.id));
+    }
+
+    // Start continuous monitor if available
+    if (this.continuousMonitor) {
+      const domains = program.scope.inScope.filter(s => !s.startsWith('*'));
+      for (const domain of domains) {
+        this.continuousMonitor.addDomain(domain);
+      }
+      this.continuousMonitor.start();
+    }
 
     // ── Step 1: Score and rank targets ──
     const targetMetadata: TargetMetadata[] = program.scope.inScope.map(target => ({
@@ -710,6 +913,14 @@ Return ONLY the JSON, no other text.`;
 
     this.huntSession.activeAgents++;
 
+    // Create a sandboxed executor for this agent (falls back to PTY if Docker unavailable)
+    const scope = this.guidelines?.scope.inScope ?? [task.target];
+    const sandboxedExec = await createSandboxedExecutor(scope, this.onExecuteCommand);
+
+    if (sandboxedExec.usingSandbox) {
+      this.emitSystemMessage(`Agent ${task.agentType}: using Docker sandbox`, 'info');
+    }
+
     try {
       // Look up the agent in the catalog
       const entry = getAgentEntry(task.agentType);
@@ -723,9 +934,20 @@ Return ONLY the JSON, no other text.`;
         const agent = matches[0].factory();
         const agentProvider = this.getAgentProvider();
         await agent.initialize(agentProvider, this.model);
-        const agentTask = this.huntTaskToAgentTask(task);
+
+        // Wire sandbox-backed command execution into the agent
+        if ('setCallbacks' in agent && typeof agent.setCallbacks === 'function') {
+          (agent as { setCallbacks: (cb: Record<string, unknown>) => void }).setCallbacks({
+            onExecuteCommand: sandboxedExec.executeCommand,
+            onApprovalRequest: this.onApprovalRequest,
+            autoApproveSafe: this.autoApproveSafe,
+          });
+        }
+
+        const agentTask = await this.huntTaskToAgentTask(task);
         const result = await agent.execute(agentTask);
         await agent.cleanup();
+        await sandboxedExec.cleanup();
         return this.handleAgentResult(task, result);
       }
 
@@ -733,12 +955,25 @@ Return ONLY the JSON, no other text.`;
       const agent = entry.factory();
       const agentProvider = this.getAgentProvider();
       await agent.initialize(agentProvider, this.model);
-      const agentTask = this.huntTaskToAgentTask(task);
+
+      // Wire sandbox-backed command execution into the agent
+      if ('setCallbacks' in agent && typeof agent.setCallbacks === 'function') {
+        (agent as { setCallbacks: (cb: Record<string, unknown>) => void }).setCallbacks({
+          onExecuteCommand: sandboxedExec.executeCommand,
+          onApprovalRequest: this.onApprovalRequest,
+          autoApproveSafe: this.autoApproveSafe,
+        });
+      }
+
+      const agentTask = await this.huntTaskToAgentTask(task);
       const result = await agent.execute(agentTask);
       await agent.cleanup();
+      await sandboxedExec.cleanup();
 
       return this.handleAgentResult(task, result);
     } catch (error) {
+      // Clean up sandbox even on error
+      await sandboxedExec.cleanup();
       const errMsg = error instanceof Error ? error.message : String(error);
       this.huntSession.taskQueue.fail(taskId, errMsg);
       this.huntSession.activeAgents--;
@@ -771,6 +1006,40 @@ Return ONLY the JSON, no other text.`;
     };
     this.conversation.addMessage(msg);
     this.emitMessage(msg);
+  }
+
+  /**
+   * Run SAST analysis on provided source files.
+   * Posts findings to the blackboard and emits them to the chat.
+   */
+  async runSAST(files: SourceFile[]): Promise<SASTReport> {
+    this.emitSystemMessage(`Running SAST analysis on ${files.length} file(s)...`, 'info');
+
+    const analyzer = new SASTAnalyzer(this.provider, this.model);
+    const report = await analyzer.analyzeRepository(files, {
+      targetUrl: this.guidelines?.scope.inScope[0],
+    });
+
+    // Emit findings to the chat
+    for (const finding of report.findings) {
+      this.addFinding({
+        title: `[SAST] ${finding.title}`,
+        severity: finding.severity as Severity,
+        description: `${finding.description}\n\nFile: ${finding.filePath}:${finding.line}\nCWE: ${finding.cweId ?? 'N/A'}\n\nVulnerable code:\n\`\`\`\n${finding.vulnerableCode}\n\`\`\`\n\nSuggested fix:\n${finding.suggestedFix}`,
+        target: finding.filePath,
+        agent: 'sast-analyzer',
+        evidence: [`${finding.filePath}:${finding.line}: ${finding.vulnerableCode}`],
+        isDuplicate: false,
+      });
+    }
+
+    this.emitSystemMessage(
+      `SAST complete: ${report.totalIssues} issue(s) found ` +
+      `(${report.criticalCount} critical, ${report.highCount} high, ${report.mediumCount} medium, ${report.lowCount} low)`,
+      report.criticalCount > 0 ? 'warning' : 'info'
+    );
+
+    return report;
   }
 
   /**
@@ -810,6 +1079,83 @@ Return ONLY the JSON, no other text.`;
     setValidatorOOBServer(undefined);
     shutdownValidationBrowser().catch(() => {});
     this.feedbackLoop.stopPolling();
+    this.continuousMonitor?.stop();
+  }
+
+  /** Persist session state for crash recovery */
+  checkpoint(): void {
+    if (!this.huntSession) return;
+
+    try {
+      const snapshot = {
+        version: 1,
+        timestamp: Date.now(),
+        program: this.huntSession.program,
+        findings: this.huntSession.allFindings.map(f => ({
+          ...f,
+          timestamp: f.timestamp instanceof Date ? f.timestamp.toISOString() : f.timestamp,
+        })),
+        chains: this.huntSession.chains,
+        targetScores: this.huntSession.targetScores,
+        completedDispatches: this.huntSession.completedDispatches,
+        phase: this.currentPhase,
+      };
+
+      localStorage.setItem('huntress_session_checkpoint', JSON.stringify(snapshot));
+    } catch {
+      // Best-effort — storage may be unavailable
+    }
+  }
+
+  /** Restore a previously checkpointed session. Returns true if restoration succeeded. */
+  restore(): boolean {
+    try {
+      const raw = localStorage.getItem('huntress_session_checkpoint');
+      if (!raw) return false;
+
+      const snapshot = JSON.parse(raw);
+      if (!snapshot.program || snapshot.version !== 1) return false;
+
+      // Rebuild a minimal hunt session from the checkpoint
+      const taskQueue = new TaskQueue();
+      this.huntSession = {
+        program: snapshot.program,
+        taskQueue,
+        allFindings: (snapshot.findings ?? []).map((f: Record<string, unknown>) => ({
+          ...f,
+          timestamp: new Date(f.timestamp as string),
+        })),
+        chains: snapshot.chains ?? [],
+        targetScores: snapshot.targetScores ?? [],
+        activeAgents: 0,
+        completedDispatches: snapshot.completedDispatches ?? 0,
+        running: false,
+        aborted: false,
+      };
+
+      this.loadGuidelines(snapshot.program);
+      this.setPhase(snapshot.phase ?? 'idle');
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Clear any persisted checkpoint */
+  clearCheckpoint(): void {
+    try {
+      localStorage.removeItem('huntress_session_checkpoint');
+    } catch { /* best-effort */ }
+  }
+
+  /** Check if a checkpoint exists for resumption */
+  static hasCheckpoint(): boolean {
+    try {
+      return localStorage.getItem('huntress_session_checkpoint') !== null;
+    } catch {
+      return false;
+    }
   }
 
   // ─── Coordinator-Solver: Dispatch Loop ──────────────────────────────────────
@@ -868,6 +1214,20 @@ Return ONLY the JSON, no other text.`;
         const freshChains = newChains.filter(c => !previousChainIds.has(c.id));
 
         if (freshChains.length > 0) {
+          // Validate chains with ChainValidator if available
+          if (this.chainValidator) {
+            for (const chain of freshChains) {
+              try {
+                const validation = await this.chainValidator.validateChain(chain);
+                if (validation.isExploitable) {
+                  chain.confidenceBoost = Math.round((validation.confidence ?? 0) * 100);
+                }
+              } catch {
+                // Chain validation is best-effort
+              }
+            }
+          }
+
           this.huntSession.chains.push(...freshChains);
           for (const chain of freshChains) {
             this.emitOrchestratorMessage(
@@ -888,11 +1248,15 @@ Return ONLY the JSON, no other text.`;
         `Chains: ${this.huntSession.chains.length}`,
         'info'
       );
+
+      // Checkpoint session state after each batch for crash recovery
+      this.checkpoint();
     }
 
-    // Hunt complete — stop services
+    // Hunt complete — stop services and clear checkpoint
     this.huntSession.running = false;
     this.stopHuntServices();
+    this.clearCheckpoint();
     this.setPhase('reporting');
 
     const finalStats = taskQueue.getStats();
@@ -1064,8 +1428,7 @@ What is your next action?`;
 
         // Validate the target is in scope
         const inScope = this.huntSession.program.scope.inScope.some(s =>
-          args.target.includes(s) || s.includes(args.target) ||
-          args.target.endsWith(s) || this.matchesWildcard(args.target, s)
+          this.isTargetInScope(args.target, s)
         );
 
         if (!inScope) {
@@ -1074,6 +1437,22 @@ What is your next action?`;
             'warning'
           );
           return;
+        }
+
+        // Check for duplicate target+agent combinations before queuing
+        if (this.huntSession) {
+          const dedupKey = `${args.agent_type}:${args.target}`;
+          const existingTasks = this.huntSession.taskQueue.getAllTasks();
+          const alreadyQueued = existingTasks.some(
+            t => t.agentType === args.agent_type && t.target === args.target
+          );
+          if (alreadyQueued) {
+            this.emitSystemMessage(
+              `Skipping duplicate: ${args.agent_type} already queued for ${args.target}`,
+              'info'
+            );
+            return;
+          }
         }
 
         // Enqueue the task
@@ -1181,6 +1560,30 @@ What is your next action?`;
       const newFindings = deduped.filter(f => !existingIds.has(f.id));
       this.huntSession.allFindings = deduped;
 
+      // Check H1 duplicate risk for new findings (async, non-blocking display)
+      if (this.h1DuplicateChecker && newFindings.length > 0 && this.huntSession.program) {
+        const programHandle = this.huntSession.program.programName;
+        for (const finding of newFindings) {
+          // Build a minimal H1Report from the finding for duplicate checking
+          const minimalReport: import('../reporting/h1_api').H1Report = {
+            title: finding.title,
+            description: finding.description,
+            severity: (finding.severity as 'critical' | 'high' | 'medium' | 'low') ?? 'medium',
+            impact: finding.description,
+            steps: finding.evidence ?? [],
+            proof: { screenshots: [], logs: [] },
+            suggestedBounty: { min: 0, max: 0 },
+          };
+          this.h1DuplicateChecker.checkDuplicate(minimalReport, programHandle).then(dupScore => {
+            if (dupScore && dupScore.recommendation === 'skip') {
+              this.emitOrchestratorMessage(
+                `Finding "${finding.title}" has high duplicate risk on H1 (score: ${dupScore.overall}%). Review before submitting.`
+              );
+            }
+          }).catch(() => {});
+        }
+      }
+
       // Emit each NEW finding to the chat and post to blackboard
       for (const finding of newFindings) {
         this.addFinding({
@@ -1204,6 +1607,92 @@ What is your next action?`;
 
       // Reprioritize the queue based on new findings
       this.huntSession.taskQueue.reprioritize(result.findings);
+
+      // Record to KnowledgeGraph (async, non-blocking)
+      if (this.knowledgeGraph) {
+        for (const finding of newFindings) {
+          const huntResult: HuntResult = {
+            sessionId: this.huntSession.program.programName,
+            target: finding.target,
+            agentId: finding.agentId,
+            vulnType: finding.type ?? 'unknown',
+            findingTitle: finding.title,
+            severity: (finding.severity as HuntResult['severity']) ?? 'info',
+            success: true,
+            bountyAmount: 0,
+            techniquesUsed: [],
+            durationMs: result.duration,
+            modelUsed: this.model,
+            tokensUsed: 0,
+            costUsd: 0,
+          };
+          this.knowledgeGraph.recordHuntResult(huntResult).catch(() => {});
+        }
+      }
+
+      // Record to HuntMemory vector store (async, non-blocking, Phase 20E)
+      if (this.huntMemory) {
+        for (const finding of newFindings) {
+          this.huntMemory.recordFinding({
+            title: finding.title,
+            vulnerabilityType: finding.type ?? 'unknown',
+            severity: finding.severity ?? 'info',
+            target: finding.target,
+            description: finding.description,
+            evidence: finding.evidence,
+            confidence: 50,
+          }, this.huntSession.program.programName).catch(() => {});
+        }
+      }
+
+      // Record reward events (async, non-blocking)
+      if (this.rewardSystem) {
+        for (const finding of newFindings) {
+          this.rewardSystem.recordEvent({
+            sessionId: this.huntSession.program.programName,
+            agentId: finding.agentId,
+            eventType: 'FINDING_REPORTED',
+            reason: `Found ${finding.title} on ${finding.target}`,
+          }).catch(() => {});
+
+          // Extra reward for high/critical severity
+          if (finding.severity === 'critical') {
+            this.rewardSystem.recordEvent({
+              sessionId: this.huntSession.program.programName,
+              agentId: finding.agentId,
+              eventType: 'SEVERITY_CRITICAL',
+              reason: `Critical finding: ${finding.title}`,
+            }).catch(() => {});
+          } else if (finding.severity === 'high') {
+            this.rewardSystem.recordEvent({
+              sessionId: this.huntSession.program.programName,
+              agentId: finding.agentId,
+              eventType: 'SEVERITY_HIGH',
+              reason: `High finding: ${finding.title}`,
+            }).catch(() => {});
+          }
+        }
+
+        // Run shortcut detection on new findings
+        const shortcutInputs: ShortcutCheckInput[] = newFindings.map(f => ({
+          findingTitle: f.title,
+          severity: f.severity,
+          iterations: result.toolsExecuted,
+          reproSteps: f.evidence.join('\n'),
+          agentId: f.agentId,
+        }));
+        this.rewardSystem.detectShortcuts(shortcutInputs).then(shortcuts => {
+          for (const s of shortcuts) {
+            this.rewardSystem!.recordEvent({
+              sessionId: this.huntSession?.program.programName ?? '',
+              agentId: s.agentId,
+              eventType: 'SHORTCUT_DETECTED',
+              reason: s.explanation,
+            }).catch(() => {});
+            this.emitSystemMessage(`Shortcut detected (${s.agentId}): ${s.explanation}`, 'warning');
+          }
+        }).catch(() => {});
+      }
     }
 
     // Post agent observations to blackboard for cross-agent knowledge sharing
@@ -1370,7 +1859,41 @@ What is your next action?`;
   }
 
   /** Convert a HuntTask to the AgentTask interface expected by BaseAgent.execute() */
-  private huntTaskToAgentTask(task: HuntTask): AgentTask {
+  private async huntTaskToAgentTask(task: HuntTask): Promise<AgentTask> {
+    // Gather knowledge-system context (best-effort, non-blocking)
+    let kgPatterns: unknown = undefined;
+    let vulnContext: unknown = undefined;
+    let agentTrustLevel: string | undefined;
+
+    if (this.knowledgeGraph) {
+      try {
+        const patterns = await this.knowledgeGraph.queryRelevantPatterns(task.target, task.agentType);
+        const bestTechniques = await this.knowledgeGraph.getBestTechniquesFor(task.agentType);
+        if (patterns.length > 0 || bestTechniques.length > 0) {
+          kgPatterns = { patterns, bestTechniques };
+        }
+      } catch { /* best-effort */ }
+    }
+
+    if (this.vulnDb) {
+      try {
+        const knowledge = await this.vulnDb.getRelevantKnowledge(task.agentType, task.target);
+        if (knowledge.relevantCVEs.length > 0 || knowledge.attackPatterns.length > 0) {
+          vulnContext = {
+            cweInfo: knowledge.cweInfo.map(c => ({ id: c.cweId, name: c.name })),
+            attackPatterns: knowledge.attackPatterns.map(a => ({ id: a.capecId, name: a.name })),
+            recentCVEs: knowledge.relevantCVEs.slice(0, 5).map(c => ({ id: c.cveId, desc: c.description.slice(0, 200) })),
+          };
+        }
+      } catch { /* best-effort */ }
+    }
+
+    if (this.rewardSystem) {
+      try {
+        agentTrustLevel = await this.rewardSystem.getTrustLevel(task.agentType);
+      } catch { /* best-effort */ }
+    }
+
     return {
       id: task.id,
       target: task.target,
@@ -1384,6 +1907,24 @@ What is your next action?`;
         blackboardContext: this.blackboard.readFor(task.agentType),
         // OOB server base URL for blind vuln testing
         oobBaseUrl: this.oobServer?.getSummary(),
+        // Knowledge graph patterns for this target/agent
+        kgPatterns,
+        // Vulnerability database context (CWEs, CVEs, attack patterns)
+        vulnContext,
+        // Agent trust level from reward system
+        agentTrustLevel,
+        // Direct HTTP client for agent requests (Phase 20A)
+        httpClient: this.httpClient,
+        // Session manager for authenticated testing (Phase 20C)
+        sessionManager: this.sessionManager,
+        // Hunt memory for cross-session learning (Phase 20E)
+        huntMemory: this.huntMemory,
+        // WAF detection result for bypass strategies (Phase 20G)
+        wafInfo: this.wafDetectionResult,
+        // Adaptive rate controller for per-domain throttling (Phase 20J)
+        rateController: this.rateController,
+        // Available security tools on this system
+        availableTools: this.availableTools,
       },
     };
   }
@@ -1400,11 +1941,22 @@ What is your next action?`;
       .join(' ');
   }
 
-  /** Check if a target matches a wildcard scope entry (e.g., *.example.com) */
-  private matchesWildcard(target: string, scopeEntry: string): boolean {
-    if (!scopeEntry.startsWith('*.')) return false;
-    const baseDomain = scopeEntry.slice(2);
-    return target.endsWith(baseDomain) || target === baseDomain;
+  /** Check if a target is within a scope entry using proper domain boundary matching */
+  private isTargetInScope(target: string, scopeEntry: string): boolean {
+    try {
+      const targetHost = new URL(
+        target.startsWith('http') ? target : `https://${target}`
+      ).hostname;
+      const scopeHost = scopeEntry.replace(/^\*\./, '');
+
+      if (scopeEntry.startsWith('*.')) {
+        // Wildcard: must match exact subdomain boundary (.example.com)
+        return targetHost === scopeHost || targetHost.endsWith('.' + scopeHost);
+      }
+      return targetHost === scopeHost;
+    } catch {
+      return false;
+    }
   }
 
   private setPhase(phase: SessionPhase): void {
@@ -1478,14 +2030,49 @@ What is your next action?`;
 
   /** Parse AI response for structured content */
   private parseResponse(content: string): ConversationMessage[] {
-    // For now, return as a single orchestrator message
-    // Future: parse for JSON blocks, finding cards, strategy suggestions, etc.
-    return [{
-      type: 'orchestrator',
-      id: this.generateId(),
-      content,
-      timestamp: Date.now(),
-    }];
+    const messages: ConversationMessage[] = [];
+    let remaining = content;
+
+    // Extract JSON finding blocks from the response
+    const findingPattern = /```json\n(\{[\s\S]*?"type"\s*:\s*"finding"[\s\S]*?\})\n```/g;
+    let match: RegExpExecArray | null;
+    while ((match = findingPattern.exec(remaining)) !== null) {
+      try {
+        const finding = JSON.parse(match[1]);
+        messages.push({
+          type: 'finding_card',
+          id: this.generateId(),
+          timestamp: Date.now(),
+          ...finding,
+        });
+        remaining = remaining.replace(match[0], '');
+      } catch {
+        // Not valid JSON — leave as text
+      }
+    }
+
+    // Whatever text remains becomes an orchestrator message
+    const trimmed = remaining.trim();
+    if (trimmed) {
+      messages.push({
+        type: 'orchestrator',
+        id: this.generateId(),
+        content: trimmed,
+        timestamp: Date.now(),
+      });
+    }
+
+    // Fallback: if nothing was parsed, return the original content
+    if (messages.length === 0) {
+      messages.push({
+        type: 'orchestrator',
+        id: this.generateId(),
+        content,
+        timestamp: Date.now(),
+      });
+    }
+
+    return messages;
   }
 
   private buildSystemPrompt(): string {

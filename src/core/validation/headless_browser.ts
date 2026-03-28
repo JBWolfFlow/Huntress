@@ -115,9 +115,14 @@ const SYSTEM_CHROME_PATHS = [
 ];
 
 async function findSystemChrome(): Promise<string | undefined> {
-  const { existsSync } = await import('fs');
+  const { fs: bridgeFs } = await import('../tauri_bridge');
   for (const p of SYSTEM_CHROME_PATHS) {
-    if (existsSync(p)) return p;
+    try {
+      await bridgeFs.access(p);
+      return p;
+    } catch {
+      // Path not accessible — try next
+    }
   }
   return undefined;
 }

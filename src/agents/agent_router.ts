@@ -21,6 +21,11 @@ import './standardized_agents';
 import './xxe_hunter';
 import './command_injection_hunter';
 import './path_traversal_hunter';
+import './ssrf_hunter';
+import './xss_hunter';
+import './sqli_hunter';
+import './cors_hunter';
+import './subdomain_takeover_hunter';
 
 export interface RouterConfig {
   provider: ModelProvider;

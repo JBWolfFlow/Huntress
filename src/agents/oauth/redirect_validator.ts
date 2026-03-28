@@ -14,7 +14,21 @@
  */
 
 import axios from 'axios';
+import { tauriFetch } from '../../core/tauri_bridge';
 import { OAuthEndpoint } from './discovery';
+
+function checkIsTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+async function proxyGet(url: string, config?: { headers?: Record<string, string>; maxRedirects?: number; timeout?: number; validateStatus?: () => boolean }): Promise<{ status: number; headers: Record<string, string>; data: string }> {
+  if (checkIsTauri()) {
+    const resp = await tauriFetch(url, { method: 'GET', headers: config?.headers, followRedirects: (config?.maxRedirects ?? 0) > 0, timeoutMs: config?.timeout ?? 10000 });
+    return { status: resp.status, headers: resp.headers, data: resp.body };
+  }
+  const resp = await axios.get(url, config);
+  return { status: resp.status, headers: resp.headers as Record<string, string>, data: typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data) };
+}
 
 export interface RedirectVulnerability {
   type: 'open_redirect' | 'token_theft' | 'xss' | 'path_traversal';
@@ -100,10 +114,10 @@ export class RedirectValidator {
     for (const payload of payloads) {
       try {
         const testUrl = this.buildAuthUrl(payload);
-        const response = await axios.get(testUrl, {
+        const response = await proxyGet(testUrl, {
           timeout: this.config.timeout,
           maxRedirects: 0,
-          validateStatus: (status) => status >= 200 && status < 400,
+          validateStatus: () => true,
         });
 
         // Check if redirect points to our payload
@@ -162,7 +176,7 @@ export class RedirectValidator {
         const testUrl = this.buildAuthUrl(payload, 'token'); // Use implicit flow
         
         // Make request (don't follow redirects)
-        const response = await axios.get(testUrl, {
+        const response = await proxyGet(testUrl, {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,
@@ -217,7 +231,7 @@ export class RedirectValidator {
     for (const payload of payloads) {
       try {
         const testUrl = this.buildAuthUrl(payload);
-        const response = await axios.get(testUrl, {
+        const response = await proxyGet(testUrl, {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,
@@ -267,7 +281,7 @@ export class RedirectValidator {
     for (const payload of payloads) {
       try {
         const testUrl = this.buildAuthUrl(payload);
-        const response = await axios.get(testUrl, {
+        const response = await proxyGet(testUrl, {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,

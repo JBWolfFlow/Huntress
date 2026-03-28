@@ -25,6 +25,7 @@ import type {
   ReactFinding,
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import type { HttpClient } from '../core/http/request_engine';
 
 const GRAPHQL_SYSTEM_PROMPT = `You are an expert GraphQL security researcher with deep knowledge of the GraphQL specification, common server implementations (Apollo, Hasura, graphql-yoga, graphql-ruby, Graphene, Juniper), and their associated vulnerability patterns. You specialize in finding information disclosure, denial of service, authorization bypass, and data exfiltration vulnerabilities in GraphQL APIs.
 
@@ -110,7 +111,32 @@ IMPORTANT RULES:
 - Never attempt to exfiltrate real user data — document the vulnerability and stop
 - Do not execute destructive mutations (DELETE, DROP) — only prove the authorization bypass exists
 - Document every finding with the exact GraphQL query and full HTTP request/response
-- Always note whether introspection was the source or if field suggestion enumeration was required`;
+- Always note whether introspection was the source or if field suggestion enumeration was required
+
+## Examples of Successful GraphQL Discoveries
+
+### Example 1: Introspection Enabled + Authorization Bypass
+**Step 1 — Test introspection:**
+Tool call: http_request { url: "https://[redacted].com/graphql", method: "POST", body: "{\\"query\\":\\"{ __schema { types { name fields { name } } } }\\"}", headers: {"Content-Type": "application/json"} }
+Response: 200 OK — full schema returned with User, AdminSettings, InternalConfig types
+
+**Step 2 — Query sensitive type:**
+Tool call: http_request { url: "https://[redacted].com/graphql", method: "POST", body: "{\\"query\\":\\"{ adminSettings { featureFlags secretKey apiTokens } }\\"}", headers: {"Content-Type": "application/json"} }
+Response: 200 OK — returned admin settings including API tokens — no auth required!
+
+**Step 3 — Report introspection:**
+Tool call: report_finding { title: "GraphQL introspection enabled — exposes 47 types including AdminSettings and InternalConfig", severity: "medium", vulnerability_type: "graphql_introspection", confidence: 100 }
+
+**Step 4 — Report auth bypass:**
+Tool call: report_finding { title: "GraphQL authorization bypass — unauthenticated access to adminSettings query returns API tokens", severity: "critical", vulnerability_type: "idor", confidence: 95 }
+
+### Example 2: Nested Query DoS
+**Step 1 — Test query depth:**
+Tool call: http_request { url: "https://[redacted].com/graphql", method: "POST", body: "{\\"query\\":\\"{ users { posts { comments { author { posts { comments { author { email } } } } } } } }\\"}", headers: {"Content-Type": "application/json"} }
+Response: 200 OK after 8.5 seconds (normally 200ms) — no depth limiting
+
+**Step 2 — Report:**
+Tool call: report_finding { title: "GraphQL nested query DoS — no depth limit, 7-level nesting causes 8.5s response", severity: "medium", vulnerability_type: "graphql_batching", confidence: 85 }`;
 
 export class GraphQLHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {
@@ -126,6 +152,7 @@ export class GraphQLHunterAgent implements BaseAgent {
   private model?: string;
   private findings: AgentFinding[] = [];
   private status: AgentStatus;
+  private autoApproveSafe = false;
   private onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
 
@@ -144,9 +171,13 @@ export class GraphQLHunterAgent implements BaseAgent {
   setCallbacks(callbacks: {
     onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
     onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+    autoApproveSafe?: boolean;
   }): void {
     this.onApprovalRequest = callbacks.onApprovalRequest;
     this.onExecuteCommand = callbacks.onExecuteCommand;
+    if (callbacks.autoApproveSafe !== undefined) {
+      this.autoApproveSafe = callbacks.autoApproveSafe;
+    }
   }
 
   async initialize(provider: ModelProvider, model: string): Promise<void> {
@@ -175,7 +206,7 @@ export class GraphQLHunterAgent implements BaseAgent {
         maxIterations: 30,
         target: task.target,
         scope: task.scope,
-        autoApproveSafe: false,
+        autoApproveSafe: this.autoApproveSafe,
         onApprovalRequest: this.onApprovalRequest,
         onExecuteCommand: this.onExecuteCommand,
         onFinding: (finding) => {
@@ -186,6 +217,8 @@ export class GraphQLHunterAgent implements BaseAgent {
           this.status.toolsExecuted = update.toolCallCount;
           this.status.lastUpdate = Date.now();
         },
+        httpClient: task.parameters.httpClient as HttpClient | undefined,
+        availableTools: task.parameters.availableTools as string[] | undefined,
       });
 
       const result = await loop.execute();

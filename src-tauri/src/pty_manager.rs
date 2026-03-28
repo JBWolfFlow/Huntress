@@ -242,57 +242,59 @@ impl PtySession {
     /// - Redacts full URLs to show only domain + path (no query params with tokens)
     /// - Prevents data leaks if screenshots are shared
     fn redact_sensitive_data(data: &str) -> String {
+        use std::sync::LazyLock;
+
+        // Compile all redaction regexes once as statics
+        static TOKEN_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| vec![
+            (regex::Regex::new(r"access_token=[^&\s]+").expect("valid regex"), "access_token=[REDACTED]"),
+            (regex::Regex::new(r"token=[^&\s]+").expect("valid regex"), "token=[REDACTED]"),
+            (regex::Regex::new(r"api_key=[^&\s]+").expect("valid regex"), "api_key=[REDACTED]"),
+            (regex::Regex::new(r"apikey=[^&\s]+").expect("valid regex"), "apikey=[REDACTED]"),
+            (regex::Regex::new(r"key=[^&\s]+").expect("valid regex"), "key=[REDACTED]"),
+            (regex::Regex::new(r"secret=[^&\s]+").expect("valid regex"), "secret=[REDACTED]"),
+            (regex::Regex::new(r"password=[^&\s]+").expect("valid regex"), "password=[REDACTED]"),
+            (regex::Regex::new(r"passwd=[^&\s]+").expect("valid regex"), "passwd=[REDACTED]"),
+            (regex::Regex::new(r"pwd=[^&\s]+").expect("valid regex"), "pwd=[REDACTED]"),
+        ]);
+
+        static BEARER_PATTERN: LazyLock<regex::Regex> = LazyLock::new(||
+            regex::Regex::new(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*").expect("valid regex")
+        );
+        static AUTH_PATTERN: LazyLock<regex::Regex> = LazyLock::new(||
+            regex::Regex::new(r"Authorization:\s*[^\r\n]+").expect("valid regex")
+        );
+        static COOKIE_PATTERN: LazyLock<regex::Regex> = LazyLock::new(||
+            regex::Regex::new(r"Cookie:\s*[^\r\n]+").expect("valid regex")
+        );
+        static SETCOOKIE_PATTERN: LazyLock<regex::Regex> = LazyLock::new(||
+            regex::Regex::new(r"Set-Cookie:\s*[^\r\n]+").expect("valid regex")
+        );
+        static JWT_PATTERN: LazyLock<regex::Regex> = LazyLock::new(||
+            regex::Regex::new(r"eyJ[A-Za-z0-9\-._~+/]+=*\.eyJ[A-Za-z0-9\-._~+/]+=*\.[A-Za-z0-9\-._~+/]+=*").expect("valid regex")
+        );
+        static APIKEY_PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| vec![
+            regex::Regex::new(r"sk-[A-Za-z0-9]{32,}").expect("valid regex"),   // OpenAI style
+            regex::Regex::new(r"ghp_[A-Za-z0-9]{36,}").expect("valid regex"),  // GitHub
+            regex::Regex::new(r"gho_[A-Za-z0-9]{36,}").expect("valid regex"),  // GitHub OAuth
+            regex::Regex::new(r"AKIA[A-Z0-9]{16}").expect("valid regex"),      // AWS
+        ]);
+
         let mut redacted = data.to_string();
-        
-        // Redact access_token in URLs
-        let token_patterns = [
-            (regex::Regex::new(r"access_token=[^&\s]+").unwrap(), "access_token=[REDACTED]"),
-            (regex::Regex::new(r"token=[^&\s]+").unwrap(), "token=[REDACTED]"),
-            (regex::Regex::new(r"api_key=[^&\s]+").unwrap(), "api_key=[REDACTED]"),
-            (regex::Regex::new(r"apikey=[^&\s]+").unwrap(), "apikey=[REDACTED]"),
-            (regex::Regex::new(r"key=[^&\s]+").unwrap(), "key=[REDACTED]"),
-            (regex::Regex::new(r"secret=[^&\s]+").unwrap(), "secret=[REDACTED]"),
-            (regex::Regex::new(r"password=[^&\s]+").unwrap(), "password=[REDACTED]"),
-            (regex::Regex::new(r"passwd=[^&\s]+").unwrap(), "passwd=[REDACTED]"),
-            (regex::Regex::new(r"pwd=[^&\s]+").unwrap(), "pwd=[REDACTED]"),
-        ];
-        
-        for (pattern, replacement) in &token_patterns {
+
+        for (pattern, replacement) in TOKEN_PATTERNS.iter() {
             redacted = pattern.replace_all(&redacted, *replacement).to_string();
         }
-        
-        // Redact Bearer tokens
-        let bearer_pattern = regex::Regex::new(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*").unwrap();
-        redacted = bearer_pattern.replace_all(&redacted, "Bearer [REDACTED]").to_string();
-        
-        // Redact Authorization headers
-        let auth_pattern = regex::Regex::new(r"Authorization:\s*[^\r\n]+").unwrap();
-        redacted = auth_pattern.replace_all(&redacted, "Authorization: [REDACTED]").to_string();
-        
-        // Redact Cookie headers
-        let cookie_pattern = regex::Regex::new(r"Cookie:\s*[^\r\n]+").unwrap();
-        redacted = cookie_pattern.replace_all(&redacted, "Cookie: [REDACTED]").to_string();
-        
-        // Redact Set-Cookie headers
-        let setcookie_pattern = regex::Regex::new(r"Set-Cookie:\s*[^\r\n]+").unwrap();
-        redacted = setcookie_pattern.replace_all(&redacted, "Set-Cookie: [REDACTED]").to_string();
-        
-        // Redact JWT tokens (eyJ pattern)
-        let jwt_pattern = regex::Regex::new(r"eyJ[A-Za-z0-9\-._~+/]+=*\.eyJ[A-Za-z0-9\-._~+/]+=*\.[A-Za-z0-9\-._~+/]+=*").unwrap();
-        redacted = jwt_pattern.replace_all(&redacted, "[REDACTED_JWT]").to_string();
-        
-        // Redact API keys (common patterns)
-        let apikey_patterns = [
-            regex::Regex::new(r"sk-[A-Za-z0-9]{32,}").unwrap(), // OpenAI style
-            regex::Regex::new(r"ghp_[A-Za-z0-9]{36,}").unwrap(), // GitHub
-            regex::Regex::new(r"gho_[A-Za-z0-9]{36,}").unwrap(), // GitHub OAuth
-            regex::Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(), // AWS
-        ];
-        
-        for pattern in &apikey_patterns {
+
+        redacted = BEARER_PATTERN.replace_all(&redacted, "Bearer [REDACTED]").to_string();
+        redacted = AUTH_PATTERN.replace_all(&redacted, "Authorization: [REDACTED]").to_string();
+        redacted = COOKIE_PATTERN.replace_all(&redacted, "Cookie: [REDACTED]").to_string();
+        redacted = SETCOOKIE_PATTERN.replace_all(&redacted, "Set-Cookie: [REDACTED]").to_string();
+        redacted = JWT_PATTERN.replace_all(&redacted, "[REDACTED_JWT]").to_string();
+
+        for pattern in APIKEY_PATTERNS.iter() {
             redacted = pattern.replace_all(&redacted, "[REDACTED_API_KEY]").to_string();
         }
-        
+
         redacted
     }
 
@@ -535,7 +537,7 @@ impl Clone for PtySession {
 
 // Global PTY manager instance
 use std::sync::LazyLock;
-static GLOBAL_PTY_MANAGER: LazyLock<PtyManager> = LazyLock::new(|| PtyManager::new());
+static GLOBAL_PTY_MANAGER: LazyLock<PtyManager> = LazyLock::new(PtyManager::new);
 
 /// Tauri command: Spawn PTY session
 #[tauri::command]

@@ -9,13 +9,44 @@
  */
 
 import axios from 'axios';
+import { tauriFetch } from '../../core/tauri_bridge';
 
-// Note: exec operations should be moved to Tauri backend commands
-// For now, these are stubbed to allow frontend compilation
-const execAsync = async (command: string, options?: any): Promise<{ stdout: string; stderr: string }> => {
-  console.warn('[OAuth Discovery] exec operations should be handled by Tauri backend');
-  return { stdout: '', stderr: '' };
-};
+function checkIsTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+async function proxyGet(url: string, config?: { headers?: Record<string, string>; maxRedirects?: number; timeout?: number; validateStatus?: () => boolean }): Promise<{ status: number; headers: Record<string, string>; data: string }> {
+  if (checkIsTauri()) {
+    const resp = await tauriFetch(url, { method: 'GET', headers: config?.headers, followRedirects: (config?.maxRedirects ?? 0) > 0, timeoutMs: config?.timeout ?? 10000 });
+    return { status: resp.status, headers: resp.headers, data: resp.body };
+  }
+  const resp = await axios.get(url, config);
+  return { status: resp.status, headers: resp.headers as Record<string, string>, data: typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data) };
+}
+
+async function proxyHead(url: string, config?: { headers?: Record<string, string>; maxRedirects?: number; timeout?: number; validateStatus?: (status: number) => boolean }): Promise<{ status: number; headers: Record<string, string>; data: string }> {
+  if (checkIsTauri()) {
+    // Tauri backend does not have a dedicated HEAD; use GET and ignore body
+    const resp = await tauriFetch(url, { method: 'GET', headers: config?.headers, followRedirects: (config?.maxRedirects ?? 0) > 0, timeoutMs: config?.timeout ?? 10000 });
+    return { status: resp.status, headers: resp.headers, data: resp.body };
+  }
+  const resp = await axios.head(url, config);
+  return { status: resp.status, headers: resp.headers as Record<string, string>, data: '' };
+}
+
+/** Result of executing a shell command via Tauri PTY backend */
+export interface CommandExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+/** Callback type for executing commands via the Tauri PTY backend */
+export type CommandExecutor = (
+  command: string,
+  args: string[],
+  timeoutMs: number,
+) => Promise<CommandExecResult>;
 
 export interface OAuthEndpoint {
   url: string;
@@ -31,6 +62,8 @@ export interface DiscoveryConfig {
   maxEndpoints: number;
   useWayback: boolean;
   useNuclei: boolean;
+  /** Optional command executor for running external tools (waybackurls, nuclei) via PTY */
+  commandExecutor?: CommandExecutor;
 }
 
 export class OAuthDiscovery {
@@ -87,14 +120,16 @@ export class OAuthDiscovery {
     for (const path of wellKnownPaths) {
       try {
         const url = `https://${this.config.target}${path}`;
-        const response = await axios.get(url, {
+        const response = await proxyGet(url, {
           timeout: this.config.timeout,
-          validateStatus: (status) => status === 200,
+          validateStatus: () => true,
         });
+
+        if (response.status !== 200) continue;
 
         if (response.data) {
           // Parse OpenID Connect discovery document
-          const config = response.data;
+          const config = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
           
           if (config.authorization_endpoint) {
             endpoints.push({
@@ -181,9 +216,9 @@ export class OAuthDiscovery {
     const checkPromises = commonPaths.map(async (path) => {
       try {
         const url = `https://${this.config.target}${path}`;
-        const response = await axios.head(url, {
+        const response = await proxyHead(url, {
           timeout: this.config.timeout,
-          validateStatus: (status) => status < 500, // Accept redirects and client errors
+          validateStatus: (status: number) => status < 500, // Accept redirects and client errors
           maxRedirects: 0,
         });
 
@@ -211,18 +246,61 @@ export class OAuthDiscovery {
   }
 
   /**
-   * Discover OAuth endpoints from Wayback Machine
+   * Discover OAuth endpoints from Wayback Machine via waybackurls tool
    */
   private async discoverFromWayback(): Promise<OAuthEndpoint[]> {
     const endpoints: OAuthEndpoint[] = [];
 
+    if (!this.config.commandExecutor) {
+      console.log('[OAuth Discovery] Wayback discovery skipped (no command executor available)');
+      return endpoints;
+    }
+
     try {
-      console.log('[OAuth Discovery] Wayback discovery disabled (requires Tauri backend implementation)');
-      // TODO: Implement via Tauri command that calls waybackurls on the backend
-      // const { stdout } = await execAsync(
-      //   `echo "${this.config.target}" | waybackurls | grep -iE "(oauth|authorize|token|connect)" | sort -u | head -n 100`,
-      //   { timeout: this.config.timeout }
-      // );
+      console.log(`[OAuth Discovery] Running waybackurls for ${this.config.target}`);
+
+      // Step 1: Run waybackurls to get historical URLs — explicit argv, no shell interpolation
+      const waybackResult = await this.config.commandExecutor(
+        'waybackurls',
+        [this.config.target],
+        this.config.timeout,
+      );
+
+      if (waybackResult.exitCode !== 0 || !waybackResult.stdout.trim()) {
+        console.warn('[OAuth Discovery] waybackurls returned no results or failed');
+        return endpoints;
+      }
+
+      // Step 2: Filter for OAuth-related URLs
+      const oauthPattern = /oauth|authorize|token|connect|callback|redirect_uri|client_id|openid/i;
+      const urls = waybackResult.stdout
+        .split('\n')
+        .filter(line => line.trim().length > 0)
+        .filter(line => oauthPattern.test(line))
+        .slice(0, 100); // Limit to 100 unique results
+
+      // Deduplicate by removing query strings for uniqueness check
+      const seen = new Set<string>();
+      for (const rawUrl of urls) {
+        try {
+          const parsed = new URL(rawUrl.trim());
+          const baseUrl = `${parsed.origin}${parsed.pathname}`;
+          if (seen.has(baseUrl)) continue;
+          seen.add(baseUrl);
+
+          endpoints.push({
+            url: rawUrl.trim(),
+            type: this.inferEndpointType(rawUrl),
+            discoveryMethod: 'wayback',
+            confidence: 60,
+            metadata: { source: 'wayback-machine' },
+          });
+        } catch {
+          // Skip malformed URLs from wayback data
+        }
+      }
+
+      console.log(`[OAuth Discovery] Found ${endpoints.length} OAuth endpoints from Wayback Machine`);
     } catch (error) {
       console.warn('[OAuth Discovery] Waybackurls failed:', error);
     }
@@ -231,18 +309,66 @@ export class OAuthDiscovery {
   }
 
   /**
-   * Discover OAuth endpoints using Nuclei
+   * Discover OAuth endpoints using Nuclei templates
    */
   private async discoverWithNuclei(): Promise<OAuthEndpoint[]> {
     const endpoints: OAuthEndpoint[] = [];
 
+    if (!this.config.commandExecutor) {
+      console.log('[OAuth Discovery] Nuclei discovery skipped (no command executor available)');
+      return endpoints;
+    }
+
     try {
-      console.log('[OAuth Discovery] Nuclei discovery disabled (requires Tauri backend implementation)');
-      // TODO: Implement via Tauri command that calls nuclei on the backend
-      // const { stdout } = await execAsync(
-      //   `echo "https://${this.config.target}" | nuclei -t ~/nuclei-templates/http/misconfiguration/oauth/ -silent -json`,
-      //   { timeout: this.config.timeout }
-      // );
+      console.log(`[OAuth Discovery] Running nuclei OAuth templates against ${this.config.target}`);
+
+      // Run nuclei with OAuth misconfiguration templates — explicit argv, no shell interpolation
+      const nucleiResult = await this.config.commandExecutor(
+        'nuclei',
+        [
+          '-u', `https://${this.config.target}`,
+          '-t', 'http/misconfiguration/oauth/',
+          '-silent',
+          '-jsonl',
+          '-no-color',
+        ],
+        this.config.timeout,
+      );
+
+      if (nucleiResult.exitCode !== 0 && !nucleiResult.stdout.trim()) {
+        console.warn('[OAuth Discovery] nuclei returned no results or failed');
+        return endpoints;
+      }
+
+      // Parse JSON Lines output from nuclei
+      const lines = nucleiResult.stdout
+        .split('\n')
+        .filter(line => line.trim().length > 0);
+
+      for (const line of lines) {
+        try {
+          const finding = JSON.parse(line);
+          const matchedUrl = finding['matched-at'] || finding.host || '';
+          if (!matchedUrl) continue;
+
+          endpoints.push({
+            url: matchedUrl,
+            type: this.inferEndpointType(matchedUrl),
+            discoveryMethod: 'nuclei',
+            confidence: 85,
+            metadata: {
+              templateId: finding['template-id'] || 'unknown',
+              templateName: finding.info?.name || 'unknown',
+              severity: finding.info?.severity || 'info',
+              matcherName: finding['matcher-name'] || '',
+            },
+          });
+        } catch {
+          // Skip malformed JSON lines
+        }
+      }
+
+      console.log(`[OAuth Discovery] Found ${endpoints.length} OAuth endpoints via Nuclei`);
     } catch (error) {
       console.warn('[OAuth Discovery] Nuclei failed:', error);
     }
@@ -258,7 +384,7 @@ export class OAuthDiscovery {
 
     try {
       // Fetch main page to find JS files
-      const response = await axios.get(`https://${this.config.target}`, {
+      const response = await proxyGet(`https://${this.config.target}`, {
         timeout: this.config.timeout,
       });
 
@@ -284,7 +410,7 @@ export class OAuthDiscovery {
       
       for (const jsUrl of jsFiles.slice(0, 10)) { // Limit to first 10 JS files
         try {
-          const jsResponse = await axios.get(jsUrl, {
+          const jsResponse = await proxyGet(jsUrl, {
             timeout: this.config.timeout,
           });
 

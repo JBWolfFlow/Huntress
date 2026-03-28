@@ -14,8 +14,7 @@ import { QdrantClient } from '../memory/qdrant_client';
 import { TrainingPipelineManager, TrainingJobConfig } from './training_manager';
 import { ModelVersionManager } from './model_manager';
 import { TrainingDataStorage, QualityFilter } from './data_collector';
-import * as fs from 'fs/promises';
-import * as path from 'path';
+import { fs, path } from '../tauri_bridge';
 
 /**
  * Learning loop state

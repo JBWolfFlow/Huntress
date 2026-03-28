@@ -11,6 +11,7 @@
 
 import { EventEmitter } from 'events';
 import { LearningLoopOrchestrator } from './learning_loop';
+import { getSystemInfo } from '../tauri_bridge';
 
 /**
  * Schedule configuration
@@ -472,28 +473,22 @@ export class LearningLoopScheduler extends EventEmitter {
    */
   private async checkGPU(): Promise<ResourceAvailability['gpu']> {
     try {
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-
-      const { stdout } = await execAsync(
-        'nvidia-smi --query-gpu=utilization.gpu,memory.free --format=csv,noheader,nounits'
-      );
-
-      const [utilization, memoryFree] = stdout.trim().split(',').map((v: string) => parseFloat(v.trim()));
+      const sysInfo = await getSystemInfo();
+      if (!sysInfo.gpu.available) {
+        return { available: false, utilization: 1.0, memoryFree: 0 };
+      }
+      const totalMb = sysInfo.gpu.memoryTotalMb ?? 0;
+      const usedMb = sysInfo.gpu.memoryUsedMb ?? 0;
+      const utilization = totalMb > 0 ? usedMb / totalMb : 1.0;
+      const memoryFree = totalMb - usedMb;
 
       return {
-        available: utilization / 100 <= this.config.resourceThresholds.maxGpuUtilization,
-        utilization: utilization / 100,
+        available: utilization <= this.config.resourceThresholds.maxGpuUtilization,
+        utilization,
         memoryFree,
       };
-    } catch (error) {
-      // GPU not available or nvidia-smi not installed
-      return {
-        available: false,
-        utilization: 1.0,
-        memoryFree: 0,
-      };
+    } catch {
+      return { available: false, utilization: 1.0, memoryFree: 0 };
     }
   }
 
@@ -502,31 +497,15 @@ export class LearningLoopScheduler extends EventEmitter {
    */
   private async checkCPU(): Promise<ResourceAvailability['cpu']> {
     try {
-      const os = require('os');
-      const cpus = os.cpus();
-      
-      // Calculate average CPU usage
-      let totalIdle = 0;
-      let totalTick = 0;
-      
-      for (const cpu of cpus) {
-        for (const type in cpu.times) {
-          totalTick += cpu.times[type];
-        }
-        totalIdle += cpu.times.idle;
-      }
-      
-      const utilization = 1 - (totalIdle / totalTick);
+      const sysInfo = await getSystemInfo();
+      const utilization = sysInfo.cpu.usagePercent / 100;
 
       return {
         available: utilization <= this.config.resourceThresholds.maxCpuUtilization,
         utilization,
       };
-    } catch (error) {
-      return {
-        available: false,
-        utilization: 1.0,
-      };
+    } catch {
+      return { available: false, utilization: 1.0 };
     }
   }
 
@@ -535,22 +514,19 @@ export class LearningLoopScheduler extends EventEmitter {
    */
   private async checkMemory(): Promise<ResourceAvailability['memory']> {
     try {
-      const os = require('os');
-      const totalMem = os.totalmem();
-      const freeMem = os.freemem();
-      const utilization = 1 - (freeMem / totalMem);
+      const sysInfo = await getSystemInfo();
+      const totalGb = sysInfo.memory.totalGb;
+      const usedGb = sysInfo.memory.usedGb;
+      const freeGb = sysInfo.memory.availableGb;
+      const utilization = totalGb > 0 ? usedGb / totalGb : 1.0;
 
       return {
         available: utilization <= this.config.resourceThresholds.maxMemoryUtilization,
         utilization,
-        freeGB: freeMem / (1024 * 1024 * 1024),
+        freeGB: freeGb,
       };
-    } catch (error) {
-      return {
-        available: false,
-        utilization: 1.0,
-        freeGB: 0,
-      };
+    } catch {
+      return { available: false, utilization: 1.0, freeGB: 0 };
     }
   }
 
@@ -559,28 +535,18 @@ export class LearningLoopScheduler extends EventEmitter {
    */
   private async checkDisk(): Promise<ResourceAvailability['disk']> {
     try {
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-
-      const { stdout } = await execAsync('df -BG . | tail -1');
-      const parts = stdout.trim().split(/\s+/);
-      const totalGB = parseInt(parts[1].replace('G', ''));
-      const usedGB = parseInt(parts[2].replace('G', ''));
-      const freeGB = parseInt(parts[3].replace('G', ''));
-      const utilization = usedGB / totalGB;
+      const sysInfo = await getSystemInfo();
+      const totalGB = sysInfo.disk.totalGb;
+      const availableGB = sysInfo.disk.availableGb;
+      const utilization = totalGB > 0 ? (totalGB - availableGB) / totalGB : 1.0;
 
       return {
-        available: freeGB >= this.config.resourceThresholds.minAvailableDiskGB,
+        available: availableGB >= this.config.resourceThresholds.minAvailableDiskGB,
         utilization,
-        freeGB,
+        freeGB: availableGB,
       };
-    } catch (error) {
-      return {
-        available: false,
-        utilization: 1.0,
-        freeGB: 0,
-      };
+    } catch {
+      return { available: false, utilization: 1.0, freeGB: 0 };
     }
   }
 

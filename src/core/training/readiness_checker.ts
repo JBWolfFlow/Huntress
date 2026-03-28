@@ -13,12 +13,7 @@ import { EventEmitter } from 'events';
 import { ModelVersionManager, ModelVersion } from './model_manager';
 import { PerformanceMonitor, PerformanceMetrics } from './performance_monitor';
 import { QdrantClient } from '../memory/qdrant_client';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
+import { fs, path, executeCommand, getSystemInfo } from '../tauri_bridge';
 
 /**
  * Quality gate configuration
@@ -485,18 +480,18 @@ export class ProductionReadinessChecker extends EventEmitter {
 
     // Check Node.js version
     try {
-      const { stdout } = await execAsync('node --version');
-      const version = stdout.trim();
+      const nodeResult = await executeCommand('node', ['--version']);
+      const version = nodeResult.stdout.trim();
       checks.push({
         name: 'Node.js',
         category: 'system',
-        passed: true,
+        passed: nodeResult.success,
         critical: false,
         value: version,
-        message: `Node.js ${version} available`,
+        message: nodeResult.success ? `Node.js ${version} available` : 'Node.js not found',
         timestamp: new Date(),
       });
-    } catch (error) {
+    } catch {
       checks.push({
         name: 'Node.js',
         category: 'system',
@@ -509,18 +504,18 @@ export class ProductionReadinessChecker extends EventEmitter {
 
     // Check Python version
     try {
-      const { stdout } = await execAsync('python3 --version');
-      const version = stdout.trim();
+      const pyResult = await executeCommand('python3', ['--version']);
+      const version = pyResult.stdout.trim();
       checks.push({
         name: 'Python',
         category: 'system',
-        passed: true,
+        passed: pyResult.success,
         critical: false,
         value: version,
-        message: `${version} available`,
+        message: pyResult.success ? `${version} available` : 'Python 3 not found',
         timestamp: new Date(),
       });
-    } catch (error) {
+    } catch {
       checks.push({
         name: 'Python',
         category: 'system',
@@ -534,16 +529,16 @@ export class ProductionReadinessChecker extends EventEmitter {
     // Check CUDA availability (if GPU check enabled)
     if (this.config.systemHealth.checkGPU) {
       try {
-        const { stdout } = await execAsync('nvidia-smi --version');
+        const sysInfo = await getSystemInfo();
         checks.push({
           name: 'CUDA/nvidia-smi',
           category: 'system',
-          passed: true,
+          passed: sysInfo.gpu.available,
           critical: false,
-          message: 'NVIDIA drivers available',
+          message: sysInfo.gpu.available ? 'NVIDIA drivers available' : 'NVIDIA drivers not found (GPU acceleration unavailable)',
           timestamp: new Date(),
         });
-      } catch (error) {
+      } catch {
         checks.push({
           name: 'CUDA/nvidia-smi',
           category: 'system',
@@ -781,53 +776,33 @@ export class ProductionReadinessChecker extends EventEmitter {
     };
 
     try {
-      // Get disk space
-      const { stdout: dfOutput } = await execAsync('df -B1 .');
-      const lines = dfOutput.trim().split('\n');
-      if (lines.length > 1) {
-        const parts = lines[1].split(/\s+/);
-        resources.diskSpace = {
-          total: parseInt(parts[1]),
-          used: parseInt(parts[2]),
-          available: parseInt(parts[3]),
-        };
-      }
-    } catch (error) {
-      console.warn('[ReadinessChecker] Failed to get disk space:', error);
-    }
+      const sysInfo = await getSystemInfo();
 
-    try {
-      // Get memory
-      const { stdout: memOutput } = await execAsync('free -b');
-      const lines = memOutput.trim().split('\n');
-      if (lines.length > 1) {
-        const parts = lines[1].split(/\s+/);
-        resources.memory = {
-          total: parseInt(parts[1]),
-          used: parseInt(parts[2]),
-          available: parseInt(parts[6] || parts[3]),
-        };
-      }
-    } catch (error) {
-      console.warn('[ReadinessChecker] Failed to get memory:', error);
-    }
+      // Disk space (convert GB to bytes for backward compatibility)
+      resources.diskSpace = {
+        total: sysInfo.disk.totalGb * 1024 * 1024 * 1024,
+        used: (sysInfo.disk.totalGb - sysInfo.disk.availableGb) * 1024 * 1024 * 1024,
+        available: sysInfo.disk.availableGb * 1024 * 1024 * 1024,
+      };
 
-    try {
-      // Get GPU info
-      const { stdout: gpuOutput } = await execAsync(
-        'nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits'
-      );
-      const parts = gpuOutput.trim().split(',');
-      if (parts.length >= 4) {
+      // Memory (convert GB to bytes)
+      resources.memory = {
+        total: sysInfo.memory.totalGb * 1024 * 1024 * 1024,
+        used: sysInfo.memory.usedGb * 1024 * 1024 * 1024,
+        available: sysInfo.memory.availableGb * 1024 * 1024 * 1024,
+      };
+
+      // GPU info
+      if (sysInfo.gpu.available) {
         resources.gpu = {
-          name: parts[0].trim(),
-          memoryTotal: parseFloat(parts[1]) * 1024 * 1024, // MB to bytes
-          memoryUsed: parseFloat(parts[2]) * 1024 * 1024,
-          utilization: parseFloat(parts[3]),
+          name: sysInfo.gpu.name ?? 'GPU',
+          memoryTotal: (sysInfo.gpu.memoryTotalMb ?? 0) * 1024 * 1024,
+          memoryUsed: (sysInfo.gpu.memoryUsedMb ?? 0) * 1024 * 1024,
+          utilization: sysInfo.gpu.utilizationPercent ?? 0,
         };
       }
     } catch (error) {
-      // GPU not available
+      console.warn('[ReadinessChecker] Failed to get system info:', error);
     }
 
     return resources;

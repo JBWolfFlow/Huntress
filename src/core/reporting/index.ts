@@ -34,3 +34,10 @@ export {
   getSeverityBadgeClass,
   getConfidenceBadgeClass,
 } from './severity_integration';
+export {
+  ReportQualityScorer,
+  type ReportQualityConfig,
+  type ReportQualityScore,
+  type QualityIssue,
+  type QualityCategory,
+} from './report_quality';

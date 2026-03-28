@@ -9,8 +9,7 @@
  */
 
 import { QdrantClient, VectorPoint } from '../memory/qdrant_client';
-import * as fs from 'fs/promises';
-import * as path from 'path';
+import { fs, path } from '../tauri_bridge';
 
 /**
  * Training example with full execution trace

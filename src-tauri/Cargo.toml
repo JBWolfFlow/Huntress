@@ -25,7 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 portable-pty = "0.8"
-reqwest = { version = "0.11", features = ["json", "blocking"] }
+reqwest = { version = "0.11", features = ["json", "blocking", "socks"] }
 regex = "1.10"
 url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
@@ -34,11 +34,14 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
-dotenv = "0.15"
+dotenvy = "0.15"
+base64 = "0.22"
 ctrlc = "3.4"
 hostname = "0.4"
 dirs = "5"
 ring = "0.17"
 bollard = { version = "0.18", features = ["ssl"] }
 futures-util = "0.3"
+sysinfo = "0.33"
+rusqlite = { version = "0.32", features = ["bundled"] }
 

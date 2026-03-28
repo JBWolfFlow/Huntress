@@ -22,6 +22,7 @@ export interface VulnerabilityChain {
 }
 
 interface ChainRule {
+  id: string;
   name: string;
   /** Finding types that can trigger this chain (order matters) */
   requires: string[][];
@@ -37,6 +38,7 @@ interface ChainRule {
 
 const CHAIN_RULES: ChainRule[] = [
   {
+    id: 'redirect_ssrf',
     name: 'Open Redirect → SSRF',
     requires: [
       ['open_redirect', 'redirect'],
@@ -48,6 +50,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: false,
   },
   {
+    id: 'ssrf_cloud_metadata',
     name: 'SSRF → Cloud Metadata',
     requires: [
       ['ssrf', 'ssrf_blind'],
@@ -59,6 +62,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: true,
   },
   {
+    id: 'xss_csrf_ato',
     name: 'XSS → CSRF → Account Takeover',
     requires: [
       ['xss_reflected', 'xss_stored', 'xss_dom'],
@@ -70,6 +74,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: true,
   },
   {
+    id: 'idor_data_exfil',
     name: 'IDOR → Data Exfiltration',
     requires: [
       ['idor', 'bola'],
@@ -81,6 +86,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: true,
   },
   {
+    id: 'sqli_file_read',
     name: 'SQLi → File Read',
     requires: [
       ['sqli_error', 'sqli_blind_time', 'sqli_blind_boolean'],
@@ -92,6 +98,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: true,
   },
   {
+    id: 'ssti_rce',
     name: 'SSTI → RCE',
     requires: [
       ['ssti'],
@@ -103,6 +110,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: true,
   },
   {
+    id: 'oauth_redirect_token',
     name: 'OAuth Redirect → Token Theft',
     requires: [
       ['oauth_redirect_uri', 'open_redirect'],
@@ -114,6 +122,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: false,
   },
   {
+    id: 'subdomain_cookie_theft',
     name: 'Subdomain Takeover → Cookie Theft',
     requires: [
       ['subdomain_takeover'],
@@ -125,6 +134,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: false,
   },
   {
+    id: 'xss_cookie_theft',
     name: 'XSS → Cookie Theft',
     requires: [
       ['xss_reflected', 'xss_stored', 'xss_dom'],
@@ -136,6 +146,7 @@ const CHAIN_RULES: ChainRule[] = [
     sameTarget: true,
   },
   {
+    id: 'cors_data_theft',
     name: 'CORS → Data Theft',
     requires: [
       ['cors_misconfiguration'],
@@ -144,6 +155,103 @@ const CHAIN_RULES: ChainRule[] = [
     combinedSeverity: 'high',
     description: 'CORS misconfiguration enabling cross-origin data theft',
     impact: 'Cross-origin theft of sensitive API data',
+    sameTarget: true,
+  },
+  // ── Phase 20I: Additional Chain Rules ──────────────────────────────────────
+  {
+    id: 'sqli_data_exfil_ato',
+    name: 'SQLi → Data Exfiltration → Account Takeover',
+    requires: [
+      ['sqli_error', 'sqli_blind_time', 'sqli_blind_boolean'],
+      ['information_disclosure', 'pii_exposure'],
+    ],
+    combinedSeverity: 'critical',
+    description: 'SQL injection used to dump credentials leading to account takeover',
+    impact: 'Full database access and account compromise',
+    sameTarget: true,
+  },
+  {
+    id: 'path_traversal_source_secrets',
+    name: 'Path Traversal → Source Code → Hardcoded Secrets',
+    requires: [
+      ['path_traversal', 'lfi', 'file_read'],
+      ['information_disclosure', 'secret_exposure'],
+    ],
+    combinedSeverity: 'critical',
+    description: 'Path traversal to read source code containing hardcoded API keys or credentials',
+    impact: 'Source code disclosure leading to further exploitation',
+    sameTarget: true,
+  },
+  {
+    id: 'cors_misconfig_data_theft',
+    name: 'CORS Misconfiguration → Data Theft',
+    requires: [
+      ['cors_misconfiguration'],
+      ['information_disclosure', 'pii_exposure', 'api_data_exposure'],
+    ],
+    combinedSeverity: 'high',
+    description: 'CORS misconfiguration allowing cross-origin data theft of sensitive endpoints',
+    impact: 'Cross-origin access to authenticated API data',
+    sameTarget: true,
+  },
+  {
+    id: 'host_header_cache_poison',
+    name: 'Host Header Injection → Cache Poisoning',
+    requires: [
+      ['host_header_injection'],
+      ['cache_poisoning'],
+    ],
+    combinedSeverity: 'high',
+    description: 'Host header injection to poison web cache with malicious content',
+    impact: 'Serve malicious content to all users via poisoned cache',
+    sameTarget: true,
+  },
+  {
+    id: 'xxe_ssrf_internal',
+    name: 'XXE → SSRF → Internal Access',
+    requires: [
+      ['xxe'],
+      ['ssrf', 'ssrf_blind'],
+    ],
+    combinedSeverity: 'critical',
+    description: 'XML external entity injection used for SSRF to access internal services',
+    impact: 'Internal network access via XXE-based SSRF',
+    sameTarget: true,
+  },
+  {
+    id: 'proto_pollution_xss',
+    name: 'Prototype Pollution → XSS',
+    requires: [
+      ['prototype_pollution'],
+      ['xss_dom', 'xss_reflected'],
+    ],
+    combinedSeverity: 'high',
+    description: 'Prototype pollution used to trigger DOM-based XSS',
+    impact: 'Client-side code execution via prototype chain manipulation',
+    sameTarget: true,
+  },
+  {
+    id: 'redirect_oauth_token',
+    name: 'Open Redirect → OAuth Token Theft',
+    requires: [
+      ['open_redirect', 'redirect'],
+      ['oauth_misconfiguration', 'oauth_redirect_uri'],
+    ],
+    combinedSeverity: 'critical',
+    description: 'Open redirect on OAuth redirect_uri to steal authorization codes/tokens',
+    impact: 'Full account takeover via stolen OAuth tokens',
+    sameTarget: false,
+  },
+  {
+    id: 'cmdi_rce_exfil',
+    name: 'Command Injection → RCE → Data Exfiltration',
+    requires: [
+      ['command_injection', 'rce'],
+      ['information_disclosure'],
+    ],
+    combinedSeverity: 'critical',
+    description: 'Command injection escalated to full remote code execution with data theft',
+    impact: 'Full server compromise and data exfiltration',
     sameTarget: true,
   },
 ];
@@ -161,7 +269,7 @@ export function detectChains(findings: AgentFinding[]): VulnerabilityChain[] {
     const matchedFindings = matchRule(rule, findings);
     if (matchedFindings.length >= rule.requires.length) {
       chains.push({
-        id: `chain_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        id: `chain_${rule.id}_${matchedFindings.map(f => f.id ?? f.title).sort().join('_')}`,
         name: rule.name,
         findings: matchedFindings,
         combinedSeverity: rule.combinedSeverity,

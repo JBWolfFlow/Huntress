@@ -269,11 +269,10 @@ impl ProxyPool {
                 let mut oldest_time = Utc::now();
 
                 for (i, entry) in proxies.iter().enumerate() {
-                    if entry.config.health_status != HealthStatus::Failed {
-                        if entry.config.last_used < oldest_time || oldest_idx.is_none() {
-                            oldest_idx = Some(i);
-                            oldest_time = entry.config.last_used;
-                        }
+                    if entry.config.health_status != HealthStatus::Failed
+                        && (entry.config.last_used < oldest_time || oldest_idx.is_none()) {
+                        oldest_idx = Some(i);
+                        oldest_time = entry.config.last_used;
                     }
                 }
 
@@ -561,6 +560,19 @@ pub async fn get_next_proxy() -> Result<String, String> {
     pool.next_proxy()
         .map(|p| p.url)
         .ok_or_else(|| "No healthy proxies available".to_string())
+}
+
+/// Tauri command: Mark a proxy as failed
+#[tauri::command]
+pub async fn mark_proxy_failed(proxy_url: String) -> Result<(), String> {
+    info!("Tauri command: mark_proxy_failed - proxy: {}", proxy_url);
+
+    let pool = GLOBAL_POOL
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+
+    pool.mark_failed(&proxy_url)
+        .map_err(|e| format!("Failed to mark proxy failed: {}", e))
 }
 
 /// Tauri command: Get proxy pool stats

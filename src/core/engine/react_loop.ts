@@ -26,7 +26,11 @@ import type {
 import { getMessageText } from '../providers/types';
 import { AGENT_TOOL_SCHEMAS } from './tool_schemas';
 import { checkSafetyPolicies } from './safety_policies';
+import { parseToolOutput, extractFindings, extractTargets } from './output_parsers';
 import { ModelAlloy } from './model_alloy';
+import type { HttpClient, HttpRequestOptions } from '../http/request_engine';
+import { ParamFuzzer } from '../fuzzer/param_fuzzer';
+import type { VulnType } from '../fuzzer/payload_db';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -62,6 +66,10 @@ export interface ReactLoopConfig {
   priorContext?: string;
   /** Auto-approve safe/passive commands */
   autoApproveSafe?: boolean;
+  /** HTTP client for direct requests (Phase 20A — optional, graceful degradation) */
+  httpClient?: HttpClient;
+  /** List of available security tools on this system (from tool health check) */
+  availableTools?: string[];
 }
 
 /** A command execution result */
@@ -123,7 +131,7 @@ export interface StatusUpdate {
 export interface IterationLog {
   iteration: number;
   timestamp: number;
-  toolCall?: ToolUseBlock;
+  toolCalls?: ToolUseBlock[];
   toolResult?: string;
   thinking?: string;
   finding?: ReactFinding;
@@ -168,6 +176,18 @@ export interface ReactLoopResult {
   continuationHandoff?: ContinuationHandoff;
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Simple string hash for response comparison (FNV-1a 32-bit) */
+function hashString(str: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = (hash * 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
 // ─── ReAct Loop Engine ───────────────────────────────────────────────────────
 
 export class ReactLoop {
@@ -181,7 +201,12 @@ export class ReactLoop {
   private toolCallCount = 0;
   private totalTokens = { input: 0, output: 0 };
   private killed = false;
+  /** Set when the agent calls stop_hunting — distinct from killed (emergency stop) */
+  private stopped = false;
   private maxIterations: number;
+
+  /** Maximum conversation messages before pruning older entries */
+  private static readonly MAX_CONTEXT_MESSAGES = 40;
 
   constructor(config: ReactLoopConfig) {
     this.config = {
@@ -223,6 +248,9 @@ export class ReactLoop {
       }
 
       this.emitStatus('iteration', `Iteration ${iteration + 1}/${this.maxIterations}`, iteration);
+
+      // Prune context window to prevent exceeding model limits
+      this.manageContextWindow();
 
       const logEntry: IterationLog = {
         iteration,
@@ -302,7 +330,8 @@ export class ReactLoop {
         const toolResults: ToolResultBlock[] = [];
 
         for (const toolCall of response.toolCalls) {
-          logEntry.toolCall = toolCall;
+          if (!logEntry.toolCalls) logEntry.toolCalls = [];
+          logEntry.toolCalls.push(toolCall);
           this.toolCallCount++;
 
           const result = await this.processToolCall(toolCall, iteration);
@@ -325,12 +354,12 @@ export class ReactLoop {
             });
             this.iterationLog.push(logEntry);
             // Signal we're exiting the loop after processing
-            this.killed = true;
+            this.stopped = true;
             break;
           }
         }
 
-        if (this.killed) break;
+        if (this.killed || this.stopped) break;
 
         // Send tool results back to the model
         this.conversationHistory.push({
@@ -351,14 +380,17 @@ export class ReactLoop {
           content: `Error occurred: ${errMsg}. Please adjust your approach and continue.`,
         });
 
+        // Push logEntry BEFORE checking recent errors so it's included in the count
+        this.iterationLog.push(logEntry);
+
         // If we get 3 consecutive errors, stop
         const recentErrors = this.iterationLog.slice(-3).filter(l => l.error);
         if (recentErrors.length >= 3) {
           stopReason = 'error';
           summary = `Stopped after 3 consecutive errors. Last error: ${errMsg}`;
-          this.iterationLog.push(logEntry);
           break;
         }
+        continue; // Skip the push at the end of the loop
       }
 
       this.iterationLog.push(logEntry);
@@ -442,6 +474,36 @@ export class ReactLoop {
           analysis_type: string;
           looking_for: string;
         });
+
+      case 'http_request':
+        return this.handleHttpRequest(id, input as {
+          url: string;
+          method: string;
+          headers?: Record<string, string>;
+          body?: string;
+          follow_redirects?: boolean;
+          timeout_ms?: number;
+        }, iteration);
+
+      case 'fuzz_parameter':
+        return this.handleFuzzParameter(id, input as {
+          url: string;
+          method: string;
+          parameter_name: string;
+          parameter_location?: string;
+          vuln_type: string;
+          content_type?: string;
+          max_payloads?: number;
+        }, iteration);
+
+      case 'race_test':
+        return this.handleRaceTest(id, input as {
+          url: string;
+          method: string;
+          headers?: Record<string, string>;
+          body?: string;
+          concurrency: number;
+        }, iteration);
 
       case 'stop_hunting':
         return {
@@ -527,7 +589,23 @@ export class ReactLoop {
       };
     }
 
-    const result = await this.config.onExecuteCommand(commandToExecute, input.target);
+    const timeoutMs = (input.timeout_seconds ?? 30) * 1000;
+    let result: Awaited<ReturnType<NonNullable<typeof this.config.onExecuteCommand>>>;
+    try {
+      result = await Promise.race([
+        this.config.onExecuteCommand(commandToExecute, input.target),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`Command timed out after ${input.timeout_seconds ?? 30}s`)), timeoutMs)
+        ),
+      ]);
+    } catch (error) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Command execution failed: ${error instanceof Error ? error.message : String(error)}`,
+        is_error: true,
+      };
+    }
 
     if (result.blocked) {
       return {
@@ -538,30 +616,100 @@ export class ReactLoop {
       };
     }
 
-    // ── OBSERVE: Return output to model ──
-    let output = '';
-    if (result.stdout) {
-      output += result.stdout;
-    }
-    if (result.stderr && !result.success) {
-      output += `\n\nSTDERR:\n${result.stderr}`;
+    // ── OBSERVE: Parse structured output and return to model ──
+    const rawOutput = result.stdout || '';
+    const rawStderr = result.stderr || '';
+
+    // Detect tool name from command (first argv element, strip path prefix)
+    const toolBinary = commandToExecute.split(/\s+/)[0].split('/').pop() || '';
+
+    // Parse structured output via registered parsers
+    const parsed = parseToolOutput(toolBinary, rawOutput, rawStderr);
+    const parsedFindings = extractFindings(parsed);
+    const discoveredTargets = extractTargets(parsed);
+
+    // Build structured summary for the model (saves tokens vs raw output)
+    const summaryParts: string[] = [];
+    summaryParts.push(`Exit code: ${result.exitCode}`);
+    summaryParts.push(`Execution time: ${result.executionTimeMs}ms`);
+
+    if (safetyCheck.warnings.length > 0) {
+      summaryParts.push(`Safety warnings: ${safetyCheck.warnings.join(', ')}`);
     }
 
-    // Truncate very long output to avoid context overflow
-    const MAX_OUTPUT_LENGTH = 15000;
-    if (output.length > MAX_OUTPUT_LENGTH) {
-      const truncatedLines = output.substring(0, MAX_OUTPUT_LENGTH);
-      output = `${truncatedLines}\n\n[OUTPUT TRUNCATED - ${output.length} total characters, showing first ${MAX_OUTPUT_LENGTH}]`;
+    // Structured summary from parser
+    if (parsed.entries.length > 0) {
+      const entryCounts = new Map<string, number>();
+      for (const entry of parsed.entries) {
+        entryCounts.set(entry.type, (entryCounts.get(entry.type) || 0) + 1);
+      }
+      const countSummary = Array.from(entryCounts.entries())
+        .map(([type, count]) => `${count} ${type}${count > 1 ? 's' : ''}`)
+        .join(', ');
+      summaryParts.push(`\n## Parsed Results (${parsed.toolName})\nFound: ${countSummary}`);
     }
 
-    const warnings = safetyCheck.warnings.length > 0
-      ? `\nSafety warnings: ${safetyCheck.warnings.join(', ')}`
-      : '';
+    // Findings summary
+    if (parsedFindings.length > 0) {
+      summaryParts.push(`\n## Findings (${parsedFindings.length})`);
+      for (const f of parsedFindings) {
+        summaryParts.push(`- [${f.severity.toUpperCase()}] ${f.title} — ${f.target}`);
+      }
+
+      // Auto-report medium+ findings via onFinding callback
+      for (const f of parsedFindings) {
+        if (f.severity === 'medium' || f.severity === 'high' || f.severity === 'critical') {
+          const autoFinding: ReactFinding = {
+            id: `finding_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+            title: f.title,
+            vulnerabilityType: f.severity === 'critical' ? 'rce' : 'other',
+            severity: f.severity,
+            target: f.target,
+            description: f.description,
+            evidence: [f.evidence],
+            reproductionSteps: [`Run: ${commandToExecute}`, `Observe: ${f.title}`],
+            impact: f.description,
+            confidence: f.severity === 'critical' ? 70 : 50,
+            discoveredAtIteration: iteration,
+            agentId: 'react_loop_auto',
+          };
+          this.findings.push(autoFinding);
+          this.emitStatus('finding', `[AUTO] [${f.severity.toUpperCase()}] ${f.title}`, iteration);
+          if (this.config.onFinding) {
+            this.config.onFinding(autoFinding);
+          }
+        }
+      }
+    }
+
+    // Discovered targets for chaining
+    if (discoveredTargets.length > 0) {
+      const displayTargets = discoveredTargets.slice(0, 50);
+      summaryParts.push(`\n## Discovered Targets (${discoveredTargets.length})`);
+      summaryParts.push(displayTargets.join('\n'));
+      if (discoveredTargets.length > 50) {
+        summaryParts.push(`... and ${discoveredTargets.length - 50} more`);
+      }
+    }
+
+    // Append truncated raw output for context the parser may have missed
+    let rawSection = '';
+    if (rawOutput) {
+      const MAX_RAW_LENGTH = 8000;
+      if (rawOutput.length > MAX_RAW_LENGTH) {
+        rawSection = `\n\n## Raw Output (truncated)\n${rawOutput.substring(0, MAX_RAW_LENGTH)}\n[TRUNCATED - ${rawOutput.length} total chars]`;
+      } else {
+        rawSection = `\n\n## Raw Output\n${rawOutput}`;
+      }
+    }
+    if (rawStderr && !result.success) {
+      rawSection += `\n\nSTDERR:\n${rawStderr.substring(0, 2000)}`;
+    }
 
     return {
       type: 'tool_result',
       tool_use_id: toolUseId,
-      content: `Exit code: ${result.exitCode}\nExecution time: ${result.executionTimeMs}ms${warnings}\n\n${output || '(no output)'}`,
+      content: summaryParts.join('\n') + rawSection,
     };
   }
 
@@ -692,15 +840,26 @@ export class ReactLoop {
     }
 
     if (this.config.onExecuteCommand) {
-      // Write script to temp file and execute it to avoid argument escaping issues
+      // Write script to temp file via Tauri IPC (avoids shell heredoc injection)
       const ext = input.language === 'python' ? 'py' : input.language === 'bash' ? 'sh' : 'js';
-      const scriptPath = `/tmp/huntress_script_${Date.now()}.${ext}`;
+      const randomSuffix = Array.from(crypto.getRandomValues(new Uint8Array(8)))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+      const scriptPath = `/tmp/huntress_script_${randomSuffix}.${ext}`;
 
-      // Write file then execute
-      const writeResult = await this.config.onExecuteCommand(
-        `tee ${scriptPath} <<'HUNTRESS_SCRIPT_EOF'\n${input.code}\nHUNTRESS_SCRIPT_EOF`,
-        input.target
-      );
+      // Write file safely via Tauri command, then execute
+      let writeResult: CommandResult;
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('write_file_text', { path: scriptPath, contents: input.code });
+        writeResult = { success: true, stdout: '', stderr: '', exitCode: 0, executionTimeMs: 0 };
+      } catch (writeErr) {
+        // Fallback: execute via printf to avoid heredoc injection
+        const escaped = input.code.replace(/'/g, "'\\''");
+        writeResult = await this.config.onExecuteCommand(
+          `printf '%s' '${escaped}' > ${scriptPath}`,
+          input.target
+        );
+      }
 
       if (!writeResult.success) {
         return {
@@ -752,6 +911,365 @@ export class ReactLoop {
     };
   }
 
+  /**
+   * Prune conversation history to prevent context window overflow.
+   * Keeps the first message (goal) and the most recent messages,
+   * summarizing discarded middle messages.
+   */
+  private manageContextWindow(): void {
+    if (this.conversationHistory.length <= ReactLoop.MAX_CONTEXT_MESSAGES) return;
+
+    // Keep the first message (goal/task definition) and recent messages
+    const firstMessage = this.conversationHistory[0];
+    const recentMessages = this.conversationHistory.slice(-ReactLoop.MAX_CONTEXT_MESSAGES + 2);
+
+    // Summarize what was pruned
+    const prunedCount = this.conversationHistory.length - recentMessages.length - 1;
+    const summaryMessage: ChatMessage = {
+      role: 'user',
+      content: `[Context pruned: ${prunedCount} earlier messages removed to stay within context limits. Key findings so far: ${this.findings.length} findings discovered. Continue with the task.]`,
+    };
+
+    this.conversationHistory = [firstMessage, summaryMessage, ...recentMessages];
+  }
+
+  /** Check if a URL's hostname is within the configured scope */
+  private isUrlInScope(url: string): { inScope: boolean; hostname: string } {
+    let hostname: string;
+    try {
+      const parsed = new URL(url);
+      hostname = parsed.hostname;
+    } catch {
+      return { inScope: false, hostname: url };
+    }
+
+    // Check against scope entries
+    for (const scopeEntry of this.config.scope) {
+      // Exact match
+      if (hostname === scopeEntry) return { inScope: true, hostname };
+      // Wildcard match: *.example.com should match sub.example.com
+      if (scopeEntry.startsWith('*.')) {
+        const baseDomain = scopeEntry.slice(2);
+        if (hostname === baseDomain || hostname.endsWith(`.${baseDomain}`)) {
+          return { inScope: true, hostname };
+        }
+      }
+    }
+
+    return { inScope: false, hostname };
+  }
+
+  /** Handle http_request tool call — direct HTTP via HttpClient */
+  private async handleHttpRequest(
+    toolUseId: string,
+    input: {
+      url: string;
+      method: string;
+      headers?: Record<string, string>;
+      body?: string;
+      follow_redirects?: boolean;
+      timeout_ms?: number;
+    },
+    iteration: number
+  ): Promise<ToolResultBlock> {
+    if (!this.config.httpClient) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'HTTP client not configured. Use execute_command with curl instead.',
+        is_error: true,
+      };
+    }
+
+    // Scope validation — Block 7
+    const scopeCheck = this.isUrlInScope(input.url);
+    if (!scopeCheck.inScope) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Blocked: ${scopeCheck.hostname} is not in scope. Only targets within the defined scope can be accessed.`,
+        is_error: true,
+      };
+    }
+
+    this.emitStatus(
+      'executing',
+      `HTTP ${input.method} ${input.url.substring(0, 80)}...`,
+      iteration
+    );
+
+    try {
+      const options: HttpRequestOptions = {
+        url: input.url,
+        method: input.method.toUpperCase() as HttpRequestOptions['method'],
+        headers: input.headers,
+        body: input.body,
+        followRedirects: input.follow_redirects,
+        timeoutMs: input.timeout_ms,
+      };
+
+      const response = await this.config.httpClient.request(options);
+
+      // Truncate large response bodies for the model context
+      const MAX_BODY_FOR_MODEL = 15000;
+      let bodyForModel = response.body;
+      if (bodyForModel.length > MAX_BODY_FOR_MODEL) {
+        bodyForModel = bodyForModel.substring(0, MAX_BODY_FOR_MODEL) +
+          `\n\n[BODY TRUNCATED — ${response.size} bytes total]`;
+      }
+
+      const headerLines = Object.entries(response.headers)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\n');
+
+      const redirectInfo = response.redirectChain.length > 0
+        ? `\nRedirect chain:\n${response.redirectChain.map(r => `  ${r.status} → ${r.url}`).join('\n')}\n`
+        : '';
+
+      const cookieInfo = response.cookies.length > 0
+        ? `\nCookies: ${response.cookies.map(c => `${c.name}=${c.value.substring(0, 50)}`).join('; ')}\n`
+        : '';
+
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `HTTP ${response.status} ${response.statusText} (${response.timing.totalMs}ms, ${response.size} bytes)${redirectInfo}${cookieInfo}\nHeaders:\n${headerLines}\n\nBody:\n${bodyForModel}`,
+      };
+    } catch (error) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `HTTP request failed: ${error instanceof Error ? error.message : String(error)}`,
+        is_error: true,
+      };
+    }
+  }
+
+  /** Handle fuzz_parameter tool call — systematic parameter fuzzing */
+  private async handleFuzzParameter(
+    toolUseId: string,
+    input: {
+      url: string;
+      method: string;
+      parameter_name: string;
+      parameter_location?: string;
+      vuln_type: string;
+      content_type?: string;
+      max_payloads?: number;
+    },
+    iteration: number
+  ): Promise<ToolResultBlock> {
+    if (!this.config.httpClient) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'HTTP client not configured. Cannot run fuzzer without direct HTTP access.',
+        is_error: true,
+      };
+    }
+
+    // Scope validation — Block 7
+    const scopeCheck = this.isUrlInScope(input.url);
+    if (!scopeCheck.inScope) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Blocked: ${scopeCheck.hostname} is not in scope. Only targets within the defined scope can be fuzzed.`,
+        is_error: true,
+      };
+    }
+
+    this.emitStatus(
+      'executing',
+      `Fuzzing ${input.parameter_name} for ${input.vuln_type} on ${input.url.substring(0, 60)}...`,
+      iteration
+    );
+
+    try {
+      const fuzzer = new ParamFuzzer();
+      const result = await fuzzer.fuzz({
+        url: input.url,
+        method: input.method,
+        parameterName: input.parameter_name,
+        parameterLocation: (input.parameter_location ?? 'query') as 'query' | 'body' | 'header' | 'cookie' | 'path',
+        vulnType: input.vuln_type as VulnType,
+        contentType: input.content_type as 'form' | 'json' | 'xml' | 'multipart' | undefined,
+        maxPayloads: input.max_payloads,
+        httpClient: this.config.httpClient,
+      });
+
+      const hitSummary = result.hits.length > 0
+        ? result.hits.map(h =>
+            `  [${(h.confidence * 100).toFixed(0)}%] ${h.vulnType}: ${h.evidence} (payload: ${h.payload.substring(0, 80)})`
+          ).join('\n')
+        : '  No confirmed hits';
+
+      const errorSummary = result.errors.length > 0
+        ? `\nErrors (${result.errors.length}):\n${result.errors.slice(0, 5).map(e => `  - ${e}`).join('\n')}`
+        : '';
+
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Fuzz results for ${input.parameter_name} (${input.vuln_type}):\n` +
+          `Payloads tested: ${result.totalPayloadsTested}\n` +
+          `Requests made: ${result.totalRequestsMade}\n` +
+          `Duration: ${result.durationMs}ms\n` +
+          `Hits: ${result.hits.length}\n\n` +
+          `${hitSummary}${errorSummary}`,
+      };
+    } catch (error) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Fuzzer error: ${error instanceof Error ? error.message : String(error)}`,
+        is_error: true,
+      };
+    }
+  }
+
+  /** Handle race_test tool call — send N identical requests simultaneously */
+  private async handleRaceTest(
+    toolUseId: string,
+    input: {
+      url: string;
+      method: string;
+      headers?: Record<string, string>;
+      body?: string;
+      concurrency: number;
+    },
+    iteration: number
+  ): Promise<ToolResultBlock> {
+    if (!this.config.httpClient) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'HTTP client not configured. Cannot run race test without direct HTTP access.',
+        is_error: true,
+      };
+    }
+
+    // Scope validation — Block 7
+    const scopeCheck = this.isUrlInScope(input.url);
+    if (!scopeCheck.inScope) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Blocked: ${scopeCheck.hostname} is not in scope. Only targets within the defined scope can be race-tested.`,
+        is_error: true,
+      };
+    }
+
+    // Clamp concurrency to safe range
+    const concurrency = Math.max(2, Math.min(50, input.concurrency));
+
+    this.emitStatus(
+      'executing',
+      `Race test: ${concurrency}x ${input.method} ${input.url.substring(0, 60)}...`,
+      iteration
+    );
+
+    try {
+      const requestOptions: HttpRequestOptions = {
+        url: input.url,
+        method: input.method.toUpperCase() as HttpRequestOptions['method'],
+        headers: input.headers,
+        body: input.body,
+        followRedirects: false,
+        timeoutMs: 30000,
+      };
+
+      // Fire all requests simultaneously
+      const startMs = performance.now();
+      const promises = Array.from({ length: concurrency }, () =>
+        this.config.httpClient!.request(requestOptions).catch((err: Error) => ({
+          status: 0,
+          statusText: `Error: ${err.message}`,
+          headers: {} as Record<string, string>,
+          body: '',
+          size: 0,
+          timing: { dnsMs: 0, connectMs: 0, tlsMs: 0, ttfbMs: 0, downloadMs: 0, totalMs: 0 },
+          redirectChain: [] as Array<{ url: string; status: number }>,
+          cookies: [] as Array<{ name: string; value: string; domain?: string; path?: string }>,
+        }))
+      );
+
+      const responses = await Promise.all(promises);
+      const totalMs = performance.now() - startMs;
+
+      // Analyze responses for race condition indicators
+      const statusCodes = responses.map(r => r.status);
+      const bodySizes = responses.map(r => r.size);
+      const statusGroups: Record<number, number> = {};
+      for (const code of statusCodes) {
+        statusGroups[code] = (statusGroups[code] ?? 0) + 1;
+      }
+
+      // Check for differential responses (key indicator of race condition)
+      const uniqueStatuses = new Set(statusCodes).size;
+      const uniqueBodies = new Set(responses.map(r => r.body.substring(0, 500))).size;
+
+      // Extract key fields from JSON response bodies for comparison
+      const jsonFields: string[] = [];
+      for (const r of responses) {
+        try {
+          const parsed = JSON.parse(r.body);
+          // Look for common fields that change during races
+          const interesting = ['id', 'balance', 'amount', 'count', 'quantity', 'status', 'message'];
+          for (const field of interesting) {
+            if (field in parsed) {
+              jsonFields.push(`${field}=${JSON.stringify(parsed[field])}`);
+            }
+          }
+        } catch { /* not JSON */ }
+      }
+      const uniqueJsonFields = new Set(jsonFields);
+
+      // Build summary
+      const statusSummary = Object.entries(statusGroups)
+        .map(([code, count]) => `${code}: ${count}x`)
+        .join(', ');
+
+      const sizeSummary = `min=${Math.min(...bodySizes)}, max=${Math.max(...bodySizes)}, unique=${new Set(bodySizes).size}`;
+
+      let raceIndicator = 'NONE';
+      if (uniqueStatuses > 1) {
+        raceIndicator = 'STATUS_DIVERGENCE';
+      } else if (uniqueBodies > 1) {
+        raceIndicator = 'BODY_DIVERGENCE';
+      } else if (uniqueJsonFields.size > responses.length) {
+        raceIndicator = 'FIELD_DIVERGENCE';
+      }
+
+      // Build detailed response table (first 10 responses)
+      const responseTable = responses.slice(0, 10).map((r, i) =>
+        `  [${i + 1}] ${r.status} ${r.statusText} (${r.size}b, ${r.timing.totalMs.toFixed(0)}ms) body_hash=${hashString(r.body.substring(0, 500))}`
+      ).join('\n');
+
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content:
+          `Race test: ${concurrency}x ${input.method} ${input.url}\n` +
+          `Total time: ${totalMs.toFixed(0)}ms\n\n` +
+          `Status codes: ${statusSummary}\n` +
+          `Body sizes: ${sizeSummary}\n` +
+          `Unique status codes: ${uniqueStatuses}\n` +
+          `Unique response bodies: ${uniqueBodies}\n` +
+          `Race indicator: ${raceIndicator}\n\n` +
+          `Responses:\n${responseTable}` +
+          (jsonFields.length > 0 ? `\n\nJSON field values: ${[...uniqueJsonFields].join(', ')}` : ''),
+      };
+    } catch (error) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Race test error: ${error instanceof Error ? error.message : String(error)}`,
+        is_error: true,
+      };
+    }
+  }
+
   /** Build the system prompt with agent context */
   private buildSystemPrompt(): string {
     return `${this.config.systemPrompt}
@@ -776,7 +1294,11 @@ You have ${this.maxIterations} iterations maximum. Use them wisely:
 - Iterations 71-80: Wrap up, validate findings, generate final report
 
 Current findings: ${this.findings.length}
-Current tool calls: ${this.toolCallCount}`;
+Current tool calls: ${this.toolCallCount}${this.config.availableTools?.length ? `
+
+## Available Security Tools
+The following tools are installed and available on this system: ${this.config.availableTools.join(', ')}
+Do NOT attempt to use tools that are not in this list — they will fail with "command not found".` : ''}`;
   }
 
   /** Build the structured ContinuationHandoff from iteration history */
@@ -794,10 +1316,12 @@ Current tool calls: ${this.toolCallCount}`;
     const findingTargets = new Set(this.findings.map(f => f.target));
 
     for (const log of this.iterationLog) {
-      if (log.toolCall?.name === 'execute_command') {
-        const target = (log.toolCall.input as { target?: string }).target;
-        if (target && !findingTargets.has(target) && !testedPaths.includes(target)) {
-          testedPaths.push(target);
+      for (const tc of log.toolCalls ?? []) {
+        if (tc.name === 'execute_command') {
+          const target = (tc.input as { target?: string }).target;
+          if (target && !findingTargets.has(target) && !testedPaths.includes(target)) {
+            testedPaths.push(target);
+          }
         }
       }
     }

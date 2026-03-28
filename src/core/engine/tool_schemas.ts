@@ -86,6 +86,12 @@ export const REPORT_FINDING_SCHEMA: ToolDefinition = {
           'xxe', 'xxe_blind',
           'command_injection', 'command_injection_blind',
           'lfi',
+          'race_condition', 'toctou', 'double_spend',
+          'http_smuggling', 'cache_poisoning', 'cache_deception',
+          'jwt_alg_confusion', 'jwt_none', 'jwt_kid_injection',
+          'nosql_injection', 'deserialization', 'saml_attack',
+          'mfa_bypass', 'websocket', 'crlf_injection',
+          'prompt_injection', 'business_logic',
           'other',
         ],
       },
@@ -141,6 +147,11 @@ export const REQUEST_SPECIALIST_SCHEMA: ToolDefinition = {
           'prototype_pollution_hunter', 'subdomain_takeover_hunter',
           'api_hunter',
           'xxe_hunter', 'command_injection_hunter', 'path_traversal_hunter',
+          'race_condition_hunter', 'http_smuggling_hunter',
+          'cache_hunter', 'jwt_hunter', 'business_logic_hunter',
+          'nosql_hunter', 'deserialization_hunter', 'saml_hunter',
+          'mfa_bypass_hunter', 'websocket_hunter', 'crlf_hunter',
+          'prompt_injection_hunter',
         ],
       },
       target: {
@@ -246,6 +257,117 @@ export const STOP_HUNTING_SCHEMA: ToolDefinition = {
   },
 };
 
+export const HTTP_REQUEST_SCHEMA: ToolDefinition = {
+  name: 'http_request',
+  description: `Make an HTTP request to an in-scope target. Returns the full response including status code, headers, body, and timing. Use this instead of curl for faster, more reliable HTTP requests.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      url: {
+        type: 'string',
+        description: 'Target URL — must be in-scope',
+      },
+      method: {
+        type: 'string',
+        enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
+        description: 'HTTP method',
+      },
+      headers: {
+        type: 'object',
+        description: 'Optional request headers as key-value pairs',
+      },
+      body: {
+        type: 'string',
+        description: 'Optional request body (for POST/PUT/PATCH)',
+      },
+      follow_redirects: {
+        type: 'boolean',
+        description: 'Follow redirects (default: true, max 10)',
+      },
+      timeout_ms: {
+        type: 'number',
+        description: 'Request timeout in milliseconds (default: 30000)',
+      },
+    },
+    required: ['url', 'method'],
+  },
+};
+
+export const FUZZ_PARAMETER_SCHEMA: ToolDefinition = {
+  name: 'fuzz_parameter',
+  description: `Systematically test a parameter with vulnerability-specific payloads. Returns confirmed hits with evidence. Much faster than manual testing — sends 50+ requests without additional LLM calls.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      url: {
+        type: 'string',
+        description: 'Target endpoint URL (must be in-scope)',
+      },
+      method: {
+        type: 'string',
+        enum: ['GET', 'POST', 'PUT', 'PATCH'],
+        description: 'HTTP method',
+      },
+      parameter_name: {
+        type: 'string',
+        description: 'Name of parameter to fuzz',
+      },
+      parameter_location: {
+        type: 'string',
+        enum: ['query', 'body', 'header', 'cookie', 'path'],
+        description: 'Where the parameter appears in the request',
+      },
+      vuln_type: {
+        type: 'string',
+        enum: ['xss', 'sqli', 'ssrf', 'path_traversal', 'command_injection', 'ssti', 'xxe', 'crlf'],
+        description: 'Type of vulnerability to test for',
+      },
+      content_type: {
+        type: 'string',
+        enum: ['form', 'json', 'xml', 'multipart'],
+        description: 'Request body content type (default: form)',
+      },
+      max_payloads: {
+        type: 'number',
+        description: 'Maximum number of payloads to test (default: 50)',
+      },
+    },
+    required: ['url', 'method', 'parameter_name', 'vuln_type'],
+  },
+};
+
+export const RACE_TEST_SCHEMA: ToolDefinition = {
+  name: 'race_test',
+  description: `Send N identical HTTP requests simultaneously to test for race conditions. Uses Promise.all to fire all requests at once, then returns all responses for differential analysis. Use this to detect TOCTOU bugs, double-spend, duplicate coupon application, and other time-of-check/time-of-use vulnerabilities.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      url: {
+        type: 'string',
+        description: 'Target URL — must be in-scope',
+      },
+      method: {
+        type: 'string',
+        enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+        description: 'HTTP method',
+      },
+      headers: {
+        type: 'object',
+        description: 'Optional request headers as key-value pairs',
+      },
+      body: {
+        type: 'string',
+        description: 'Optional request body (for POST/PUT/PATCH)',
+      },
+      concurrency: {
+        type: 'number',
+        description: 'Number of simultaneous requests to send (2-50, default: 10)',
+      },
+    },
+    required: ['url', 'method', 'concurrency'],
+  },
+};
+
 // ─── Schema Collections ──────────────────────────────────────────────────────
 
 /** All tool schemas available to hunting agents */
@@ -256,6 +378,9 @@ export const AGENT_TOOL_SCHEMAS: ToolDefinition[] = [
   WRITE_SCRIPT_SCHEMA,
   ANALYZE_RESPONSE_SCHEMA,
   STOP_HUNTING_SCHEMA,
+  HTTP_REQUEST_SCHEMA,
+  FUZZ_PARAMETER_SCHEMA,
+  RACE_TEST_SCHEMA,
 ];
 
 /** Minimal schemas for recon-only agents */

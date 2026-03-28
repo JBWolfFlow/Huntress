@@ -1,9 +1,11 @@
 /**
  * Standardized Agent Wrappers
  *
- * Wraps all existing specialized hunters behind the BaseAgent interface.
- * Each wrapper preserves the internal logic of the original hunter while
- * providing the standard lifecycle methods.
+ * Imports all agent modules to ensure they register with the catalog.
+ * Agents that implement BaseAgent directly and self-register are imported
+ * here to trigger their registration side effects.
+ *
+ * Re-exports agent classes for backward compatibility.
  */
 
 import type { ModelProvider } from '../core/providers/types';
@@ -19,14 +21,42 @@ import type {
 import { generateFindingId } from './base_agent';
 import { registerAgent } from './agent_catalog';
 import { OAuthHunter as OAuthHunterImpl } from './oauth';
+
 // These agents implement BaseAgent directly and self-register in their own files.
-// Re-exported here for backward compatibility.
+// Importing them triggers catalog registration.
 import { GraphQLHunterAgent } from './graphql_hunter';
 import { IDORHunterAgent } from './idor_hunter';
 import { SSTIHunterAgent } from './ssti_hunter';
-import { OpenRedirectHunter as OpenRedirectImpl } from './open_redirect';
-import { HostHeaderHunter as HostHeaderImpl } from './host_header';
-import { PrototypePollutionHunter as PPImpl } from './prototype_pollution';
+import { OpenRedirectHunterAgent } from './open_redirect';
+import { HostHeaderHunterAgent } from './host_header';
+import { PrototypePollutionHunterAgent } from './prototype_pollution';
+
+// Core agents — self-registering imports
+import { ReconAgent } from './recon_agent';
+import { XssHunterAgent } from './xss_hunter';
+import { SSRFHunterAgent } from './ssrf_hunter';
+import { SqliHunterAgent } from './sqli_hunter';
+import { CORSHunterAgent } from './cors_hunter';
+import { XxeHunterAgent } from './xxe_hunter';
+import { PathTraversalHunterAgent } from './path_traversal_hunter';
+import { SubdomainTakeoverHunterAgent } from './subdomain_takeover_hunter';
+import { CommandInjectionHunterAgent } from './command_injection_hunter';
+
+// Phase 21 agents — self-registering imports
+import { RaceConditionHunterAgent } from './race_condition_hunter';
+import { HttpSmugglingHunterAgent } from './http_smuggling_hunter';
+import { CacheHunterAgent } from './cache_hunter';
+import { JWTHunterAgent } from './jwt_hunter';
+import { BusinessLogicHunterAgent } from './business_logic_hunter';
+
+// Phase 22 agents — self-registering imports
+import { NoSQLHunterAgent } from './nosql_hunter';
+import { DeserializationHunterAgent } from './deserialization_hunter';
+import { SAMLHunterAgent } from './saml_hunter';
+import { MFABypassHunterAgent } from './mfa_bypass_hunter';
+import { WebSocketHunterAgent } from './websocket_hunter';
+import { CRLFHunterAgent } from './crlf_hunter';
+import { PromptInjectionHunterAgent } from './prompt_injection_hunter';
 
 // ----- Helper -----
 
@@ -42,6 +72,8 @@ function createAgentStatus(meta: AgentMetadata): AgentStatus {
 }
 
 // ----- OAuth Hunter Agent -----
+// OAuth still uses a wrapper because the underlying OAuthHunter has custom hunt() logic
+// that doesn't follow the ReactLoop pattern.
 
 class OAuthHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {
@@ -129,206 +161,18 @@ class OAuthHunterAgent implements BaseAgent {
   getStatus(): AgentStatus { return { ...this.status, lastUpdate: Date.now() }; }
 }
 
-// GraphQLHunterAgent, IDORHunterAgent, and SSTIHunterAgent implement BaseAgent
-// directly in their own files and self-register with the catalog.
-// They are imported above and re-exported below for backward compatibility.
-
-// ----- Open Redirect Agent -----
-
-class OpenRedirectAgent implements BaseAgent {
-  readonly metadata: AgentMetadata = {
-    id: 'open_redirect',
-    name: 'Open Redirect Hunter',
-    description: 'Tests for open redirect vulnerabilities via URL parameters and headers.',
-    vulnerabilityClasses: ['open-redirect', 'redirect', 'phishing'],
-    assetTypes: ['web-application', 'domain'],
-  };
-
-  private provider?: ModelProvider;
-  private model?: string;
-  private findings: AgentFinding[] = [];
-  private status: AgentStatus;
-
-  constructor() { this.status = createAgentStatus(this.metadata); }
-
-  async initialize(provider: ModelProvider, model: string): Promise<void> {
-    this.provider = provider;
-    this.model = model;
-  }
-
-  async execute(task: AgentTask): Promise<AgentResult> {
-    const startTime = Date.now();
-    this.findings = [];
-    this.status.status = 'running';
-
-    try {
-      const hunter = new OpenRedirectImpl(task.target);
-      const url = task.target.startsWith('http') ? task.target : `https://${task.target}`;
-      const results = await hunter.testUrl(url);
-
-      this.findings = results.filter(r => r.vulnerable).map(r => ({
-        id: generateFindingId(),
-        agentId: this.metadata.id,
-        type: 'open_redirect',
-        title: `Open redirect via ${r.payload.parameter}`,
-        severity: r.severity as FindingSeverity,
-        description: r.evidence,
-        target: r.url,
-        evidence: [r.evidence],
-        reproduction: [`Navigate to: ${r.url}`],
-        timestamp: new Date(),
-      }));
-
-      this.status.status = 'completed';
-      this.status.findingsCount = this.findings.length;
-      this.status.toolsExecuted++;
-
-      return { taskId: task.id, agentId: this.metadata.id, success: true, findings: this.findings, toolsExecuted: this.status.toolsExecuted, duration: Date.now() - startTime };
-    } catch (error) {
-      this.status.status = 'failed';
-      return { taskId: task.id, agentId: this.metadata.id, success: false, findings: [], toolsExecuted: 0, duration: Date.now() - startTime, error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  validate(target: string): boolean { return true; }
-  reportFindings(): AgentFinding[] { return this.findings; }
-  async cleanup(): Promise<void> { this.findings = []; this.status.status = 'idle'; }
-  getStatus(): AgentStatus { return { ...this.status, lastUpdate: Date.now() }; }
-}
-
-// ----- Host Header Agent -----
-
-class HostHeaderAgent implements BaseAgent {
-  readonly metadata: AgentMetadata = {
-    id: 'host_header',
-    name: 'Host Header Hunter',
-    description: 'Tests for Host header injection, password reset poisoning, and cache poisoning.',
-    vulnerabilityClasses: ['host-header', 'cache-poisoning', 'password-reset-poisoning'],
-    assetTypes: ['web-application', 'domain'],
-  };
-
-  private provider?: ModelProvider;
-  private model?: string;
-  private findings: AgentFinding[] = [];
-  private status: AgentStatus;
-
-  constructor() { this.status = createAgentStatus(this.metadata); }
-
-  async initialize(provider: ModelProvider, model: string): Promise<void> {
-    this.provider = provider;
-    this.model = model;
-  }
-
-  async execute(task: AgentTask): Promise<AgentResult> {
-    const startTime = Date.now();
-    this.findings = [];
-    this.status.status = 'running';
-
-    try {
-      const hunter = new HostHeaderImpl(task.target);
-      const url = task.target.startsWith('http') ? task.target : `https://${task.target}`;
-      const results = await hunter.testEndpoint({ url, method: 'GET' });
-
-      this.findings = results.map(v => ({
-        id: generateFindingId(),
-        agentId: this.metadata.id,
-        type: v.type,
-        title: `Host header ${v.type.replace(/_/g, ' ')}`,
-        severity: v.severity as FindingSeverity,
-        description: v.description,
-        target: task.target,
-        evidence: [v.evidence],
-        reproduction: [`Inject Host: ${v.injectedHost}`],
-        timestamp: new Date(),
-      }));
-
-      this.status.status = 'completed';
-      this.status.findingsCount = this.findings.length;
-      this.status.toolsExecuted++;
-
-      return { taskId: task.id, agentId: this.metadata.id, success: true, findings: this.findings, toolsExecuted: this.status.toolsExecuted, duration: Date.now() - startTime };
-    } catch (error) {
-      this.status.status = 'failed';
-      return { taskId: task.id, agentId: this.metadata.id, success: false, findings: [], toolsExecuted: 0, duration: Date.now() - startTime, error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  validate(target: string): boolean { return true; }
-  reportFindings(): AgentFinding[] { return this.findings; }
-  async cleanup(): Promise<void> { this.findings = []; this.status.status = 'idle'; }
-  getStatus(): AgentStatus { return { ...this.status, lastUpdate: Date.now() }; }
-}
-
-// ----- Prototype Pollution Agent -----
-
-class PrototypePollutionAgent implements BaseAgent {
-  readonly metadata: AgentMetadata = {
-    id: 'prototype_pollution',
-    name: 'Prototype Pollution Hunter',
-    description: 'Tests for JavaScript prototype pollution via unsafe object merging.',
-    vulnerabilityClasses: ['prototype-pollution', 'injection', 'javascript'],
-    assetTypes: ['web-application', 'api'],
-  };
-
-  private provider?: ModelProvider;
-  private model?: string;
-  private findings: AgentFinding[] = [];
-  private status: AgentStatus;
-
-  constructor() { this.status = createAgentStatus(this.metadata); }
-
-  async initialize(provider: ModelProvider, model: string): Promise<void> {
-    this.provider = provider;
-    this.model = model;
-  }
-
-  async execute(task: AgentTask): Promise<AgentResult> {
-    const startTime = Date.now();
-    this.findings = [];
-    this.status.status = 'running';
-
-    try {
-      const hunter = new PPImpl(task.target);
-      const endpoint = task.parameters.endpoint as string ?? '/';
-      const results = await hunter.testEndpoint(endpoint);
-
-      this.findings = results.map(v => ({
-        id: generateFindingId(),
-        agentId: this.metadata.id,
-        type: 'prototype_pollution',
-        title: `Prototype pollution at ${v.endpoint}`,
-        severity: v.severity as FindingSeverity,
-        description: v.description,
-        target: task.target,
-        evidence: [v.evidence],
-        reproduction: [`Send payload to ${v.endpoint}`],
-        timestamp: new Date(),
-      }));
-
-      this.status.status = 'completed';
-      this.status.findingsCount = this.findings.length;
-      this.status.toolsExecuted++;
-
-      return { taskId: task.id, agentId: this.metadata.id, success: true, findings: this.findings, toolsExecuted: this.status.toolsExecuted, duration: Date.now() - startTime };
-    } catch (error) {
-      this.status.status = 'failed';
-      return { taskId: task.id, agentId: this.metadata.id, success: false, findings: [], toolsExecuted: 0, duration: Date.now() - startTime, error: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  validate(target: string): boolean { return true; }
-  reportFindings(): AgentFinding[] { return this.findings; }
-  async cleanup(): Promise<void> { this.findings = []; this.status.status = 'idle'; }
-  getStatus(): AgentStatus { return { ...this.status, lastUpdate: Date.now() }; }
-}
-
-// ----- Register all agents in the catalog -----
+// ----- Register OAuth agent (others self-register) -----
 
 registerAgent({ metadata: new OAuthHunterAgent().metadata, factory: () => new OAuthHunterAgent() });
-// GraphQLHunterAgent, IDORHunterAgent, SSTIHunterAgent self-register in their own files
-registerAgent({ metadata: new OpenRedirectAgent().metadata, factory: () => new OpenRedirectAgent() });
-registerAgent({ metadata: new HostHeaderAgent().metadata, factory: () => new HostHeaderAgent() });
-registerAgent({ metadata: new PrototypePollutionAgent().metadata, factory: () => new PrototypePollutionAgent() });
+
+// ----- Legacy aliases for backward compatibility -----
+
+/** @deprecated Use OpenRedirectHunterAgent directly */
+const OpenRedirectAgent = OpenRedirectHunterAgent;
+/** @deprecated Use HostHeaderHunterAgent directly */
+const HostHeaderAgent = HostHeaderHunterAgent;
+/** @deprecated Use PrototypePollutionHunterAgent directly */
+const PrototypePollutionAgent = PrototypePollutionHunterAgent;
 
 export {
   OAuthHunterAgent,
@@ -338,4 +182,28 @@ export {
   OpenRedirectAgent,
   HostHeaderAgent,
   PrototypePollutionAgent,
+  OpenRedirectHunterAgent,
+  HostHeaderHunterAgent,
+  PrototypePollutionHunterAgent,
+  ReconAgent,
+  XssHunterAgent,
+  SSRFHunterAgent,
+  SqliHunterAgent,
+  CORSHunterAgent,
+  XxeHunterAgent,
+  PathTraversalHunterAgent,
+  SubdomainTakeoverHunterAgent,
+  CommandInjectionHunterAgent,
+  RaceConditionHunterAgent,
+  HttpSmugglingHunterAgent,
+  CacheHunterAgent,
+  JWTHunterAgent,
+  BusinessLogicHunterAgent,
+  NoSQLHunterAgent,
+  DeserializationHunterAgent,
+  SAMLHunterAgent,
+  MFABypassHunterAgent,
+  WebSocketHunterAgent,
+  CRLFHunterAgent,
+  PromptInjectionHunterAgent,
 };

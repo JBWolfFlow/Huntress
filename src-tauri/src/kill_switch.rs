@@ -131,17 +131,28 @@ impl KillSwitch {
         }
     }
 
-    /// Load persisted state from disk
+    /// Load persisted state from disk.
+    /// On any parse error, defaults to ACTIVE (fail-safe: assume kill switch was engaged).
     fn load_state(path: &PathBuf) -> Result<(bool, Option<KillEvent>, u64), KillSwitchError> {
         if !path.exists() {
             return Ok((false, None, 0));
         }
 
-        let content = fs::read_to_string(path)?;
-        let state: KillSwitchState = serde_json::from_str(&content)
-            .map_err(|e| KillSwitchError::PersistError(e.to_string()))?;
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Kill switch state file unreadable (defaulting to ACTIVE): {}", e);
+                return Ok((true, None, 0)); // Fail-safe: default to active
+            }
+        };
 
-        Ok((state.active, state.last_event, state.activation_count))
+        match serde_json::from_str::<KillSwitchState>(&content) {
+            Ok(state) => Ok((state.active, state.last_event, state.activation_count)),
+            Err(e) => {
+                tracing::warn!("Kill switch state file corrupted (defaulting to ACTIVE): {}", e);
+                Ok((true, None, 0)) // Fail-safe: default to active
+            }
+        }
     }
 
     /// Persist state to disk
@@ -167,7 +178,15 @@ impl KillSwitch {
         let json = serde_json::to_string_pretty(&state)
             .map_err(|e| KillSwitchError::PersistError(e.to_string()))?;
 
-        fs::write(&self.state_file, json)?;
+        // Atomic write: write to temp file, fsync, then rename
+        let tmp_path = self.state_file.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?; // Ensure data is flushed to disk before rename
+        }
+        fs::rename(&tmp_path, &self.state_file)?;
 
         Ok(())
     }
@@ -412,19 +431,16 @@ pub fn setup_signal_handlers(kill_switch: Arc<Mutex<KillSwitch>>) {
         // Run in a blocking tokio context since we're in a signal handler
         if let Ok(rt) = tokio::runtime::Runtime::new() {
             rt.block_on(async {
-                match crate::sandbox::SandboxManager::new().await {
-                    Ok(mgr) => {
-                        match mgr.destroy_all().await {
-                            Ok(count) => {
-                                if count > 0 {
-                                    error!("Emergency: destroyed {} sandbox containers", count);
-                                }
+                if let Ok(mgr) = crate::sandbox::SandboxManager::new().await {
+                    match mgr.destroy_all().await {
+                        Ok(count) => {
+                            if count > 0 {
+                                error!("Emergency: destroyed {} sandbox containers", count);
                             }
-                            Err(e) => error!("Failed to destroy sandboxes on signal: {}", e),
                         }
+                        Err(e) => error!("Failed to destroy sandboxes on signal: {}", e),
                     }
-                    Err(_) => {} // Docker/Podman not available, nothing to clean up
-                }
+                } // else: Docker/Podman not available, nothing to clean up
             });
         }
 

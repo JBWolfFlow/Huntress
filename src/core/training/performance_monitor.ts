@@ -12,8 +12,7 @@
 import { EventEmitter } from 'events';
 import { QdrantClient } from '../memory/qdrant_client';
 import { TrainingExample } from './data_collector';
-import * as fs from 'fs/promises';
-import * as path from 'path';
+import { fs, path } from '../tauri_bridge';
 
 /**
  * Performance metrics snapshot

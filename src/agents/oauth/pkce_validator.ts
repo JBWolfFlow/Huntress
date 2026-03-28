@@ -11,7 +11,30 @@
 
 import axios from 'axios';
 import crypto from 'crypto';
+import { tauriFetch } from '../../core/tauri_bridge';
 import { OAuthEndpoint } from './discovery';
+
+function checkIsTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+async function proxyGet(url: string, config?: { headers?: Record<string, string>; maxRedirects?: number; timeout?: number; validateStatus?: () => boolean }): Promise<{ status: number; headers: Record<string, string>; data: string }> {
+  if (checkIsTauri()) {
+    const resp = await tauriFetch(url, { method: 'GET', headers: config?.headers, followRedirects: (config?.maxRedirects ?? 0) > 0, timeoutMs: config?.timeout ?? 10000 });
+    return { status: resp.status, headers: resp.headers, data: resp.body };
+  }
+  const resp = await axios.get(url, config);
+  return { status: resp.status, headers: resp.headers as Record<string, string>, data: typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data) };
+}
+
+async function proxyPost(url: string, body: string | Record<string, unknown>, config?: { headers?: Record<string, string>; timeout?: number; validateStatus?: () => boolean }): Promise<{ status: number; headers: Record<string, string>; data: string }> {
+  if (checkIsTauri()) {
+    const resp = await tauriFetch(url, { method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body), headers: config?.headers, followRedirects: false, timeoutMs: config?.timeout ?? 10000 });
+    return { status: resp.status, headers: resp.headers, data: resp.body };
+  }
+  const resp = await axios.post(url, body, config);
+  return { status: resp.status, headers: resp.headers as Record<string, string>, data: typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data) };
+}
 
 export interface PKCEVulnerability {
   type: 'missing_pkce' | 'weak_verifier' | 'downgrade_attack' | 'challenge_manipulation';
@@ -63,7 +86,7 @@ export class PKCEValidator {
     try {
       // Test 1: Authorization request without PKCE parameters
       const url = this.buildAuthUrl();
-      const response = await axios.get(url.toString(), {
+      const response = await proxyGet(url.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
@@ -112,7 +135,7 @@ export class PKCEValidator {
         params.set('client_id', this.config.clientId);
       }
 
-      const response = await axios.post(tokenUrl, params.toString(), {
+      const response = await proxyPost(tokenUrl, params.toString(), {
         timeout: this.config.timeout,
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -121,7 +144,8 @@ export class PKCEValidator {
       });
 
       // If token exchange works without code_verifier, PKCE is not enforced
-      if (response.status === 200 || response.data?.access_token) {
+      const parsedData = (() => { try { return JSON.parse(response.data); } catch { return null; } })();
+      if (response.status === 200 || parsedData?.access_token) {
         this.vulnerabilities.push({
           type: 'missing_pkce',
           severity: 'critical',
@@ -164,7 +188,7 @@ export class PKCEValidator {
         const challenge = this.generateCodeChallenge(verifier, 'S256');
         const url = this.buildAuthUrl(challenge, 'S256');
         
-        const response = await axios.get(url.toString(), {
+        const response = await proxyGet(url.toString(), {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,
@@ -203,7 +227,7 @@ export class PKCEValidator {
       
       // First request with PKCE
       const urlWithPKCE = this.buildAuthUrl(challenge, 'S256');
-      const response1 = await axios.get(urlWithPKCE.toString(), {
+      const response1 = await proxyGet(urlWithPKCE.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
@@ -211,13 +235,13 @@ export class PKCEValidator {
 
       // Second request without PKCE (same session if possible)
       const urlWithoutPKCE = this.buildAuthUrl();
-      const response2 = await axios.get(urlWithoutPKCE.toString(), {
+      const cookieHeader = response1.headers['set-cookie'];
+      const extraHeaders: Record<string, string> = cookieHeader ? { 'Cookie': cookieHeader } : {};
+      const response2 = await proxyGet(urlWithoutPKCE.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
-        headers: response1.headers['set-cookie'] ? {
-          'Cookie': response1.headers['set-cookie'].join('; ')
-        } : {},
+        headers: extraHeaders,
       });
 
       // If both succeed, downgrade is possible
@@ -250,7 +274,7 @@ export class PKCEValidator {
       const challengeS256 = this.generateCodeChallenge(verifier, 'S256');
       const urlS256 = this.buildAuthUrl(challengeS256, 'S256');
       
-      const response1 = await axios.get(urlS256.toString(), {
+      const response1 = await proxyGet(urlS256.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
@@ -258,7 +282,7 @@ export class PKCEValidator {
 
       // Try to use plain method with same verifier
       const urlPlain = this.buildAuthUrl(verifier, 'plain');
-      const response2 = await axios.get(urlPlain.toString(), {
+      const response2 = await proxyGet(urlPlain.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,
@@ -314,7 +338,7 @@ export class PKCEValidator {
     for (const { challenge, method, desc } of manipulations) {
       try {
         const url = this.buildAuthUrl(challenge, method);
-        const response = await axios.get(url.toString(), {
+        const response = await proxyGet(url.toString(), {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,

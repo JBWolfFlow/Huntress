@@ -10,7 +10,21 @@
  */
 
 import axios from 'axios';
+import { tauriFetch } from '../../core/tauri_bridge';
 import { OAuthEndpoint } from './discovery';
+
+function checkIsTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+async function proxyGet(url: string, config?: { headers?: Record<string, string>; maxRedirects?: number; timeout?: number; validateStatus?: () => boolean }): Promise<{ status: number; headers: Record<string, string>; data: string }> {
+  if (checkIsTauri()) {
+    const resp = await tauriFetch(url, { method: 'GET', headers: config?.headers, followRedirects: (config?.maxRedirects ?? 0) > 0, timeoutMs: config?.timeout ?? 10000 });
+    return { status: resp.status, headers: resp.headers, data: resp.body };
+  }
+  const resp = await axios.get(url, config);
+  return { status: resp.status, headers: resp.headers as Record<string, string>, data: typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data) };
+}
 
 export interface ScopeVulnerability {
   type: 'scope_escalation' | 'scope_confusion' | 'missing_validation' | 'scope_boundary';
@@ -105,7 +119,7 @@ export class ScopeValidator {
     for (const scope of elevatedScopes) {
       try {
         const url = this.buildAuthUrl(scope);
-        const response = await axios.get(url.toString(), {
+        const response = await proxyGet(url.toString(), {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,
@@ -180,7 +194,7 @@ export class ScopeValidator {
     for (const { scope, desc } of confusionPayloads) {
       try {
         const url = this.buildAuthUrl(scope);
-        const response = await axios.get(url.toString(), {
+        const response = await proxyGet(url.toString(), {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,
@@ -242,7 +256,7 @@ export class ScopeValidator {
     for (const { scope, desc } of testCases) {
       try {
         const url = this.buildAuthUrl(scope);
-        const response = await axios.get(url.toString(), {
+        const response = await proxyGet(url.toString(), {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,
@@ -292,7 +306,7 @@ export class ScopeValidator {
     for (const scope of excessiveScopes) {
       try {
         const url = this.buildAuthUrl(scope);
-        const response = await axios.get(url.toString(), {
+        const response = await proxyGet(url.toString(), {
           timeout: this.config.timeout,
           maxRedirects: 0,
           validateStatus: () => true,
@@ -337,7 +351,7 @@ export class ScopeValidator {
     
     try {
       const url = this.buildAuthUrl(allScopes);
-      const response = await axios.get(url.toString(), {
+      const response = await proxyGet(url.toString(), {
         timeout: this.config.timeout,
         maxRedirects: 0,
         validateStatus: () => true,

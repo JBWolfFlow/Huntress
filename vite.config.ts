@@ -8,6 +8,16 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // Exclude Node.js-only dependencies from the browser bundle
+  optimizeDeps: {
+    exclude: ['playwright-core', 'chromium-bidi'],
+  },
+  build: {
+    rollupOptions: {
+      external: ['playwright-core', 'chromium-bidi'],
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

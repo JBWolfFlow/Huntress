@@ -11,9 +11,8 @@
 
 import { QdrantClient } from '../memory/qdrant_client';
 import { TrainingDataStorage, QualityFilter, TrainingExample } from './data_collector';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-import { spawn, ChildProcess } from 'child_process';
+import { fs, path, executeCommand, getSystemInfo } from '../tauri_bridge';
+import type { CommandResult } from '../tauri_bridge';
 import { EventEmitter } from 'events';
 
 /**
@@ -88,7 +87,7 @@ export class TrainingPipelineManager extends EventEmitter {
   private storage: TrainingDataStorage;
   private qualityFilter: QualityFilter;
   private activeJob: TrainingJobStatus | null = null;
-  private trainingProcess: ChildProcess | null = null;
+  private trainingProcessActive = false;
   private metricsHistory: TrainingMetrics[] = [];
 
   constructor(qdrant: QdrantClient) {
@@ -377,29 +376,20 @@ Your goal is to identify and exploit vulnerabilities to gain access. Provide a s
     memoryFree: number;
   }> {
     try {
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-
-      const { stdout } = await execAsync(
-        'nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv,noheader,nounits'
-      );
-
-      const [total, used, free] = stdout.trim().split(',').map((v: string) => parseInt(v.trim()));
-
+      const sysInfo = await getSystemInfo();
+      if (!sysInfo.gpu.available) {
+        return { available: false, memoryTotal: 0, memoryUsed: 0, memoryFree: 0 };
+      }
+      const total = sysInfo.gpu.memoryTotalMb ?? 0;
+      const used = sysInfo.gpu.memoryUsedMb ?? 0;
       return {
         available: true,
         memoryTotal: total,
         memoryUsed: used,
-        memoryFree: free,
+        memoryFree: total - used,
       };
-    } catch (error) {
-      return {
-        available: false,
-        memoryTotal: 0,
-        memoryUsed: 0,
-        memoryFree: 0,
-      };
+    } catch {
+      return { available: false, memoryTotal: 0, memoryUsed: 0, memoryFree: 0 };
     }
   }
 
@@ -408,15 +398,11 @@ Your goal is to identify and exploit vulnerabilities to gain access. Provide a s
    */
   private async getDiskSpace(): Promise<{ total: number; available: number }> {
     try {
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-
-      const { stdout } = await execAsync('df -BG . | tail -1');
-      const parts = stdout.trim().split(/\s+/);
-      const available = parseInt(parts[3].replace('G', ''));
-
-      return { total: 0, available };
+      const sysInfo = await getSystemInfo();
+      return {
+        total: sysInfo.disk.totalGb,
+        available: sysInfo.disk.availableGb,
+      };
     } catch (error) {
       return { total: 0, available: 0 };
     }
@@ -431,41 +417,42 @@ Your goal is to identify and exploit vulnerabilities to gain access. Provide a s
 
     console.log('[Training] Submitting training job to Axolotl...');
 
-    // Activate virtual environment and run Axolotl
+    // Run Axolotl training via Tauri subprocess bridge
     const venvPath = path.join('venv', 'axolotl', 'bin', 'activate');
-    const axolotlCmd = `source ${venvPath} && accelerate launch -m axolotl.cli.train ${config.configPath}`;
+    this.trainingProcessActive = true;
 
-    this.trainingProcess = spawn('bash', ['-c', axolotlCmd], {
-      cwd: process.cwd(),
-      env: { ...process.env },
-    });
+    try {
+      const result = await executeCommand('bash', [
+        '-c',
+        `source ${venvPath} && accelerate launch -m axolotl.cli.train ${config.configPath}`,
+      ]);
 
-    // Capture stdout
-    this.trainingProcess.stdout?.on('data', (data: Buffer) => {
-      const output = data.toString();
-      this.parseTrainingOutput(output);
-      console.log(`[Axolotl] ${output}`);
-    });
+      this.trainingProcessActive = false;
 
-    // Capture stderr
-    this.trainingProcess.stderr?.on('data', (data: Buffer) => {
-      const output = data.toString();
-      console.error(`[Axolotl Error] ${output}`);
-    });
+      // Parse any training output
+      if (result.stdout) {
+        for (const line of result.stdout.split('\n')) {
+          this.parseTrainingOutput(line);
+        }
+      }
 
-    // Handle process exit
-    this.trainingProcess.on('exit', (code: number | null) => {
-      if (code === 0) {
+      if (result.success) {
         this.activeJob!.status = 'completed';
         this.activeJob!.endTime = new Date();
         this.emit('job:completed', { jobId: this.activeJob!.jobId });
       } else {
         this.activeJob!.status = 'failed';
-        this.activeJob!.error = `Training process exited with code ${code}`;
+        this.activeJob!.error = `Training process exited with code ${result.exitCode}: ${result.stderr}`;
         this.activeJob!.endTime = new Date();
         this.emit('job:failed', { jobId: this.activeJob!.jobId, error: this.activeJob!.error });
       }
-    });
+    } catch (err) {
+      this.trainingProcessActive = false;
+      this.activeJob!.status = 'failed';
+      this.activeJob!.error = `Training process error: ${err}`;
+      this.activeJob!.endTime = new Date();
+      this.emit('job:failed', { jobId: this.activeJob!.jobId, error: this.activeJob!.error });
+    }
   }
 
   /**
@@ -534,16 +521,11 @@ Your goal is to identify and exploit vulnerabilities to gain access. Provide a s
       throw new Error('No active training job to cancel');
     }
 
-    if (this.trainingProcess) {
-      this.trainingProcess.kill('SIGTERM');
-      
-      // Wait for graceful shutdown
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      
-      // Force kill if still running
-      if (this.trainingProcess.killed === false) {
-        this.trainingProcess.kill('SIGKILL');
-      }
+    if (this.trainingProcessActive) {
+      // Signal cancellation — the executeCommand call will complete/fail on its own
+      // since we can't kill a Tauri subprocess directly from the frontend.
+      // The training process detects SIGTERM via its own signal handlers.
+      this.trainingProcessActive = false;
     }
 
     this.activeJob.status = 'cancelled';

@@ -19,6 +19,21 @@ services:
       retries: 3
       start_period: 40s
 
+  juice-shop:
+    image: bkimminich/juice-shop
+    container_name: huntress-juice-shop
+    ports:
+      - "3001:3000"
+    profiles:
+      - testing
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
 volumes:
   qdrant_storage:
     driver: local

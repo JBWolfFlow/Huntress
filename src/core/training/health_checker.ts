@@ -16,12 +16,7 @@ import { ModelVersionManager } from './model_manager';
 import { PerformanceMonitor } from './performance_monitor';
 import { LearningLoopOrchestrator } from './learning_loop';
 import { ModelDeploymentManager } from './deployment_manager';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
+import { fs, path, getSystemInfo } from '../tauri_bridge';
 
 /**
  * Health status for a component
@@ -431,41 +426,33 @@ export class HealthCheckSystem extends EventEmitter {
   private async checkDiskSpace(): Promise<ComponentHealth> {
     const startTime = Date.now();
     const issues: string[] = [];
-    
+
     try {
-      const { stdout } = await execAsync('df -B1 .');
-      const lines = stdout.trim().split('\n');
-      
-      if (lines.length > 1) {
-        const parts = lines[1].split(/\s+/);
-        const total = parseInt(parts[1]);
-        const used = parseInt(parts[2]);
-        const available = parseInt(parts[3]);
-        const availableGB = available / (1024 ** 3);
-        
-        let status: HealthStatus = 'healthy';
-        if (availableGB < this.config.thresholds.diskSpaceGB) {
-          status = availableGB < this.config.thresholds.diskSpaceGB / 2 ? 'unhealthy' : 'degraded';
-          issues.push(`Low disk space: ${availableGB.toFixed(1)} GB available`);
-        }
-        
-        return {
-          component: 'Disk Space',
-          status,
-          lastCheck: new Date(),
-          responseTime: Date.now() - startTime,
-          message: `${availableGB.toFixed(1)} GB available`,
-          metrics: {
-            totalGB: total / (1024 ** 3),
-            usedGB: used / (1024 ** 3),
-            availableGB,
-            usedPercent: (used / total) * 100,
-          },
-          issues,
-        };
+      const sysInfo = await getSystemInfo();
+      const availableGB = sysInfo.disk.availableGb;
+      const totalGB = sysInfo.disk.totalGb;
+      const usedGB = totalGB - availableGB;
+
+      let status: HealthStatus = 'healthy';
+      if (availableGB < this.config.thresholds.diskSpaceGB) {
+        status = availableGB < this.config.thresholds.diskSpaceGB / 2 ? 'unhealthy' : 'degraded';
+        issues.push(`Low disk space: ${availableGB.toFixed(1)} GB available`);
       }
-      
-      throw new Error('Failed to parse df output');
+
+      return {
+        component: 'Disk Space',
+        status,
+        lastCheck: new Date(),
+        responseTime: Date.now() - startTime,
+        message: `${availableGB.toFixed(1)} GB available`,
+        metrics: {
+          totalGB,
+          usedGB,
+          availableGB,
+          usedPercent: totalGB > 0 ? (usedGB / totalGB) * 100 : 0,
+        },
+        issues,
+      };
     } catch (error) {
       return {
         component: 'Disk Space',
@@ -484,41 +471,33 @@ export class HealthCheckSystem extends EventEmitter {
   private async checkMemory(): Promise<ComponentHealth> {
     const startTime = Date.now();
     const issues: string[] = [];
-    
+
     try {
-      const { stdout } = await execAsync('free -b');
-      const lines = stdout.trim().split('\n');
-      
-      if (lines.length > 1) {
-        const parts = lines[1].split(/\s+/);
-        const total = parseInt(parts[1]);
-        const used = parseInt(parts[2]);
-        const available = parseInt(parts[6] || parts[3]);
-        const availableGB = available / (1024 ** 3);
-        
-        let status: HealthStatus = 'healthy';
-        if (availableGB < this.config.thresholds.memoryGB) {
-          status = availableGB < this.config.thresholds.memoryGB / 2 ? 'unhealthy' : 'degraded';
-          issues.push(`Low memory: ${availableGB.toFixed(1)} GB available`);
-        }
-        
-        return {
-          component: 'Memory',
-          status,
-          lastCheck: new Date(),
-          responseTime: Date.now() - startTime,
-          message: `${availableGB.toFixed(1)} GB available`,
-          metrics: {
-            totalGB: total / (1024 ** 3),
-            usedGB: used / (1024 ** 3),
-            availableGB,
-            usedPercent: (used / total) * 100,
-          },
-          issues,
-        };
+      const sysInfo = await getSystemInfo();
+      const availableGB = sysInfo.memory.availableGb;
+      const totalGB = sysInfo.memory.totalGb;
+      const usedGB = sysInfo.memory.usedGb;
+
+      let status: HealthStatus = 'healthy';
+      if (availableGB < this.config.thresholds.memoryGB) {
+        status = availableGB < this.config.thresholds.memoryGB / 2 ? 'unhealthy' : 'degraded';
+        issues.push(`Low memory: ${availableGB.toFixed(1)} GB available`);
       }
-      
-      throw new Error('Failed to parse free output');
+
+      return {
+        component: 'Memory',
+        status,
+        lastCheck: new Date(),
+        responseTime: Date.now() - startTime,
+        message: `${availableGB.toFixed(1)} GB available`,
+        metrics: {
+          totalGB,
+          usedGB,
+          availableGB,
+          usedPercent: totalGB > 0 ? (usedGB / totalGB) * 100 : 0,
+        },
+        issues,
+      };
     } catch (error) {
       return {
         component: 'Memory',
@@ -537,52 +516,47 @@ export class HealthCheckSystem extends EventEmitter {
   private async checkGPU(): Promise<ComponentHealth> {
     const startTime = Date.now();
     const issues: string[] = [];
-    
+
     try {
-      const { stdout } = await execAsync(
-        'nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu --format=csv,noheader,nounits'
-      );
-      
-      const parts = stdout.trim().split(',').map(p => p.trim());
-      if (parts.length >= 6) {
-        const name = parts[0];
-        const memoryTotal = parseFloat(parts[1]);
-        const memoryUsed = parseFloat(parts[2]);
-        const memoryPercent = (memoryUsed / memoryTotal) * 100;
-        const utilization = parseFloat(parts[4]);
-        const temperature = parseFloat(parts[5]);
-        
-        let status: HealthStatus = 'healthy';
-        
-        if (memoryPercent > this.config.thresholds.gpuMemoryPercent) {
-          status = 'degraded';
-          issues.push(`High GPU memory usage: ${memoryPercent.toFixed(1)}%`);
-        }
-        
-        if (temperature > 85) {
-          status = 'degraded';
-          issues.push(`High GPU temperature: ${temperature}°C`);
-        }
-        
+      const sysInfo = await getSystemInfo();
+      if (!sysInfo.gpu.available) {
         return {
           component: 'GPU',
-          status,
+          status: 'unknown',
           lastCheck: new Date(),
           responseTime: Date.now() - startTime,
-          message: `${name} - ${memoryPercent.toFixed(1)}% memory used`,
-          metrics: {
-            memoryTotalMB: memoryTotal,
-            memoryUsedMB: memoryUsed,
-            memoryPercent,
-            utilization,
-            temperature,
-          },
-          details: { name },
-          issues,
+          message: 'GPU not available',
+          issues: ['GPU unavailable'],
         };
       }
-      
-      throw new Error('Failed to parse nvidia-smi output');
+
+      const memoryTotal = sysInfo.gpu.memoryTotalMb ?? 0;
+      const memoryUsed = sysInfo.gpu.memoryUsedMb ?? 0;
+      const memoryPercent = memoryTotal > 0 ? (memoryUsed / memoryTotal) * 100 : 0;
+      const utilization = sysInfo.gpu.utilizationPercent ?? 0;
+      const name = sysInfo.gpu.name ?? 'GPU';
+
+      let status: HealthStatus = 'healthy';
+      if (memoryPercent > this.config.thresholds.gpuMemoryPercent) {
+        status = 'degraded';
+        issues.push(`High GPU memory usage: ${memoryPercent.toFixed(1)}%`);
+      }
+
+      return {
+        component: 'GPU',
+        status,
+        lastCheck: new Date(),
+        responseTime: Date.now() - startTime,
+        message: `${name} - ${memoryPercent.toFixed(1)}% memory used`,
+        metrics: {
+          memoryTotalMB: memoryTotal,
+          memoryUsedMB: memoryUsed,
+          memoryPercent,
+          utilization,
+        },
+        details: { name },
+        issues,
+      };
     } catch (error) {
       return {
         component: 'GPU',

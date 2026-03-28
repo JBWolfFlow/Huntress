@@ -5,7 +5,7 @@
  * and structured output. The primary interaction surface.
  */
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { useHuntSession } from '../contexts/HuntSessionContext';
 import { useSettings, TERMINAL_THEMES, PROMPT_FORMATS } from '../contexts/SettingsContext';
 import { ChatMessageComponent } from './ChatMessage';
@@ -80,6 +80,8 @@ export const ChatInterface: React.FC = () => {
     } else if (e.key === 'l' && e.ctrlKey) {
       // Ctrl+L to clear screen (like a real terminal)
       e.preventDefault();
+      // Scroll to bottom and visually clear by scrolling past all messages
+      messagesEndRef.current?.scrollIntoView({ behavior: 'instant' });
     }
   };
 
@@ -90,6 +92,15 @@ export const ChatInterface: React.FC = () => {
   const handleContainerClick = () => {
     inputRef.current?.focus();
   };
+
+  // Virtualization: only render the last 200 messages for performance with 1000+ message sessions
+  const RENDER_WINDOW = 200;
+  const [showAllMessages, setShowAllMessages] = useState(false);
+  const visibleMessages = useMemo(() => {
+    if (showAllMessages || messages.length <= RENDER_WINDOW) return messages;
+    return messages.slice(-RENDER_WINDOW);
+  }, [messages, showAllMessages]);
+  const hiddenCount = messages.length - visibleMessages.length;
 
   const promptText = promptFmt.format(phase);
 
@@ -140,11 +151,25 @@ export const ChatInterface: React.FC = () => {
           </div>
         )}
 
-        {messages.map((msg) => (
+        {hiddenCount > 0 && (
+          <button
+            onClick={() => setShowAllMessages(true)}
+            className={`${theme.dimText} hover:${theme.systemText} py-1 text-xs transition-colors`}
+          >
+            [{hiddenCount} earlier messages hidden — click to show all]
+          </button>
+        )}
+
+        {visibleMessages.map((msg) => (
           <ChatMessageComponent
             key={msg.id}
             message={msg}
             onStrategySelect={handleStrategySelect}
+            onApprovalRespond={(approvalId, approved) => {
+              const callbacks = (window as unknown as Record<string, unknown>).__huntress_approval_callbacks as Map<string, (approved: boolean) => void> | undefined;
+              callbacks?.get(approvalId)?.(approved);
+              callbacks?.delete(approvalId);
+            }}
             terminalTheme={settings.terminal.theme}
             showTimestamps={settings.terminal.showTimestamps}
           />
