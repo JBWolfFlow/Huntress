@@ -261,7 +261,7 @@ export class ReconAgent implements BaseAgent {
         observations,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
-        error: result.stopReason === 'error' ? result.summary : undefined,
+        error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),
       };
     } catch (error) {
       this.updateStatus('failed');

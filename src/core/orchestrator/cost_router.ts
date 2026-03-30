@@ -6,36 +6,73 @@
  * Complex tasks (strategy, chain detection) go to the best available.
  */
 
-import type { ModelProvider, ModelInfo } from '../providers/types';
+import type { ModelProvider } from '../providers/types';
 
 export type TaskComplexity = 'simple' | 'moderate' | 'complex';
 
-/** Agent types mapped to their expected complexity */
+/**
+ * Agent IDs mapped to their expected complexity.
+ * IDs use the actual hyphenated format from agent metadata.
+ */
 const AGENT_COMPLEXITY: Record<string, TaskComplexity> = {
-  // Simple: structured, well-defined tasks
-  recon: 'simple',
-  subdomain_takeover: 'simple',
-  cors: 'simple',
-  host_header: 'simple',
+  // Simple: structured tasks, pattern matching, low reasoning
+  'recon': 'simple',
+  'subdomain-takeover-hunter': 'simple',
+  'cors-hunter': 'simple',
+  'host-header-hunter': 'simple',
+  'crlf-hunter': 'simple',
+  'cache-hunter': 'simple',
+  'open-redirect-hunter': 'simple',
 
-  // Moderate: require reasoning about responses
-  xss: 'moderate',
-  sqli: 'moderate',
-  ssrf: 'moderate',
-  idor: 'moderate',
-  ssti: 'moderate',
-  xxe: 'moderate',
-  command_injection: 'moderate',
-  path_traversal: 'moderate',
-  graphql: 'moderate',
-  open_redirect: 'moderate',
-  prototype_pollution: 'moderate',
+  // Moderate: require tool-use reasoning about responses
+  'xss-hunter': 'moderate',
+  'sqli-hunter': 'moderate',
+  'ssrf-hunter': 'moderate',
+  'ssti-hunter': 'moderate',
+  'xxe-hunter': 'moderate',
+  'command-injection-hunter': 'moderate',
+  'path-traversal-hunter': 'moderate',
+  'graphql-hunter': 'moderate',
+  'prototype-pollution-hunter': 'moderate',
+  'http-smuggling-hunter': 'moderate',
+  'websocket-hunter': 'moderate',
+  'nosql-hunter': 'moderate',
+  'prompt-injection-hunter': 'moderate',
+  'mfa-bypass-hunter': 'moderate',
+  'deserialization-hunter': 'moderate',
+  'saml-hunter': 'moderate',
 
-  // Complex: multi-step reasoning, synthesis
-  orchestrator: 'complex',
-  chain_detection: 'complex',
-  report_generation: 'complex',
+  // Complex: multi-step exploit crafting, chain reasoning
+  'idor-hunter': 'complex',
+  'oauth_hunter': 'complex',
+  'jwt-hunter': 'complex',
+  'business-logic-hunter': 'complex',
+  'race-condition-hunter': 'complex',
+  'orchestrator': 'complex',
+  'chain_detection': 'complex',
+  'report_generation': 'complex',
 };
+
+// ─── Anthropic Model Tier Configuration ─────────────────────────────────────
+
+/** Anthropic model IDs for each cost tier */
+export const ANTHROPIC_MODEL_TIERS = {
+  /** Fast, cheap — recon, pattern matching, simple checks */
+  simple: 'claude-haiku-4-5-20251001',
+  /** Balanced — exploit reasoning, tool use, medium-complexity hunting */
+  moderate: 'claude-sonnet-4-5-20250929',
+  /** Premium — multi-step exploit chains, business logic, complex synthesis */
+  complex: 'claude-sonnet-4-5-20250929',
+} as const;
+
+/**
+ * Get the Anthropic model ID for a given task complexity.
+ * Orchestrator always uses the user's selected model (Opus).
+ * Agents use tiered models based on task complexity.
+ */
+export function getAnthropicModelForComplexity(complexity: TaskComplexity): string {
+  return ANTHROPIC_MODEL_TIERS[complexity];
+}
 
 /** Keywords in task descriptions that indicate higher complexity */
 const COMPLEX_KEYWORDS = [
@@ -93,7 +130,8 @@ const MODEL_TIER: Record<string, number> = {
   'gemini-2.0-flash': 1,
 
   // Mid-tier
-  'claude-sonnet-4-5-20250929': 2,
+  'claude-sonnet-4-5-20250514': 2,
+  'claude-sonnet-4-5-20250929': 2, // Alias for older model ID
   'gpt-4o': 2,
   'gemini-2.5-pro': 2,
 

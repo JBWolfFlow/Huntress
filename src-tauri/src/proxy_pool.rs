@@ -544,6 +544,28 @@ pub async fn load_proxies(path: String) -> Result<usize, String> {
 static GLOBAL_POOL: std::sync::LazyLock<Mutex<ProxyPool>> =
     std::sync::LazyLock::new(|| Mutex::new(ProxyPool::new(RotationStrategy::RoundRobin)));
 
+/// Try to get the next proxy URL from the global pool.
+/// Returns None if no proxies are loaded or all are unhealthy.
+/// Used internally by proxy_http_request() to route traffic through proxies.
+pub fn try_get_next_proxy() -> Option<String> {
+    let mut pool = GLOBAL_POOL.lock().ok()?;
+    pool.next_proxy().map(|p| p.url)
+}
+
+/// Mark a proxy as successful in the global pool.
+pub fn notify_proxy_success(proxy_url: &str) {
+    if let Ok(pool) = GLOBAL_POOL.lock() {
+        let _ = pool.mark_success(proxy_url);
+    }
+}
+
+/// Mark a proxy as failed in the global pool.
+pub fn notify_proxy_failure(proxy_url: &str) {
+    if let Ok(pool) = GLOBAL_POOL.lock() {
+        let _ = pool.mark_failed(proxy_url);
+    }
+}
+
 /// Set the global pool from a loaded config (called by load_proxies)
 fn set_global_pool(pool: ProxyPool) {
     let mut global = GLOBAL_POOL.lock().expect("global pool lock poisoned");

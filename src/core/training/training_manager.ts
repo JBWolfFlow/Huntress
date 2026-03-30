@@ -13,7 +13,7 @@ import { QdrantClient } from '../memory/qdrant_client';
 import { TrainingDataStorage, QualityFilter, TrainingExample } from './data_collector';
 import { fs, path, executeCommand, getSystemInfo } from '../tauri_bridge';
 import type { CommandResult } from '../tauri_bridge';
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 
 /**
  * Training job configuration

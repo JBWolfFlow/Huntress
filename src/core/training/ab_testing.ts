@@ -9,7 +9,7 @@
  * comprehensive metrics collection, and safe deployment strategies.
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { ModelVersionManager, ModelVersion } from './model_manager';
 import { fs, path } from '../tauri_bridge';
 

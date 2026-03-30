@@ -100,13 +100,27 @@ function AppHeader({ onSettingsOpen, onImportOpen, activeTab, onTabChange }: {
         </span>
 
         {/* Kill switch */}
-        <span className={
-          killSwitch.status.active
-            ? 'text-red-400 animate-pulse'
-            : 'text-green-500'
-        }>
+        <button
+          onClick={() => {
+            if (killSwitch.status.active) {
+              if (confirm('Reset kill switch? All operations will resume.')) {
+                killSwitch.reset('CONFIRM_RESET');
+              }
+            } else {
+              if (confirm('Activate KILL SWITCH? This will halt ALL operations immediately.')) {
+                killSwitch.activate('ManualStop', 'User activated via UI');
+              }
+            }
+          }}
+          className={
+            killSwitch.status.active
+              ? 'px-2 py-1 text-red-400 animate-pulse border border-red-700 hover:border-red-500 rounded transition-colors cursor-pointer'
+              : 'px-2 py-1 text-green-500 hover:text-red-400 border border-gray-700 hover:border-red-700 rounded transition-colors cursor-pointer'
+          }
+          title={killSwitch.status.active ? 'Click to RESET kill switch' : 'Click to ACTIVATE kill switch (emergency stop)'}
+        >
           {killSwitch.status.active ? '[KILL]' : '[OK]'}
-        </span>
+        </button>
 
         {/* Settings */}
         <button

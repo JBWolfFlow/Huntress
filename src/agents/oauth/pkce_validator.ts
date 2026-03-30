@@ -10,7 +10,7 @@
  */
 
 import axios from 'axios';
-import crypto from 'crypto';
+// Web Crypto API used instead of Node.js crypto (browser-compatible)
 import { tauriFetch } from '../../core/tauri_bridge';
 import { OAuthEndpoint } from './discovery';
 
@@ -185,7 +185,7 @@ export class PKCEValidator {
 
     for (const verifier of weakVerifiers) {
       try {
-        const challenge = this.generateCodeChallenge(verifier, 'S256');
+        const challenge = await this.generateCodeChallenge(verifier, 'S256');
         const url = this.buildAuthUrl(challenge, 'S256');
         
         const response = await proxyGet(url.toString(), {
@@ -223,8 +223,8 @@ export class PKCEValidator {
     try {
       // Test 1: Start with PKCE, then try without
       const verifier = this.generateCodeVerifier();
-      const challenge = this.generateCodeChallenge(verifier, 'S256');
-      
+      const challenge = await this.generateCodeChallenge(verifier, 'S256');
+
       // First request with PKCE
       const urlWithPKCE = this.buildAuthUrl(challenge, 'S256');
       const response1 = await proxyGet(urlWithPKCE.toString(), {
@@ -271,7 +271,7 @@ export class PKCEValidator {
   private async testPlainMethodDowngrade(verifier: string): Promise<void> {
     try {
       // Request with S256
-      const challengeS256 = this.generateCodeChallenge(verifier, 'S256');
+      const challengeS256 = await this.generateCodeChallenge(verifier, 'S256');
       const urlS256 = this.buildAuthUrl(challengeS256, 'S256');
       
       const response1 = await proxyGet(urlS256.toString(), {
@@ -399,27 +399,36 @@ export class PKCEValidator {
     // RFC 7636: 43-128 characters, [A-Z] / [a-z] / [0-9] / "-" / "." / "_" / "~"
     const length = 43 + Math.floor(Math.random() * 86); // 43-128
     const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
-    const randomBytes = crypto.randomBytes(length);
-    
+    const randomBytes = globalThis.crypto.getRandomValues(new Uint8Array(length));
+
     let verifier = '';
     for (let i = 0; i < length; i++) {
       verifier += charset[randomBytes[i] % charset.length];
     }
-    
+
     return verifier;
   }
 
   /**
    * Generate code_challenge from code_verifier
    */
-  private generateCodeChallenge(verifier: string, method: string): string {
+  private async generateCodeChallenge(verifier: string, method: string): Promise<string> {
     if (method === 'plain') {
       return verifier;
     }
-    
-    // S256 method
-    const hash = crypto.createHash('sha256').update(verifier).digest();
-    return hash.toString('base64')
+
+    // S256 method using Web Crypto API
+    const encoder = new TextEncoder();
+    const data = encoder.encode(verifier);
+    const hashBuffer = await globalThis.crypto.subtle.digest('SHA-256', data);
+    const hashArray = new Uint8Array(hashBuffer);
+
+    // Base64url encode
+    let binary = '';
+    for (const byte of hashArray) {
+      binary += String.fromCharCode(byte);
+    }
+    return btoa(binary)
       .replace(/\+/g, '-')
       .replace(/\//g, '_')
       .replace(/=/g, '');

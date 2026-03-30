@@ -9,7 +9,7 @@
  * traffic splitting, health monitoring, and fast rollback (<5 minutes).
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { ModelVersionManager, ModelVersion } from './model_manager';
 import { PerformanceMonitor, PerformanceMetrics } from './performance_monitor';
 import { fs, path } from '../tauri_bridge';

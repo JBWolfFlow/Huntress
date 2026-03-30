@@ -9,7 +9,7 @@
  * error handling, and graceful degradation.
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { QdrantClient } from '../memory/qdrant_client';
 import { LearningLoopOrchestrator, LearningLoopConfig } from './learning_loop';
 import { ABTestingFramework, ABTestConfig } from './ab_testing';

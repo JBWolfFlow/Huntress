@@ -736,10 +736,21 @@ async fn proxy_http_request(
         reqwest::redirect::Policy::none()
     };
 
-    let client = reqwest::Client::builder()
+    // Try to route through proxy pool if proxies are loaded
+    let proxy_url = proxy_pool::try_get_next_proxy();
+
+    let mut client_builder = reqwest::Client::builder()
         .timeout(timeout)
         .redirect(redirect_policy)
-        .danger_accept_invalid_certs(false)
+        .danger_accept_invalid_certs(false);
+
+    if let Some(ref purl) = proxy_url {
+        let proxy = reqwest::Proxy::all(purl)
+            .map_err(|e| format!("Invalid proxy URL '{}': {}", purl, e))?;
+        client_builder = client_builder.proxy(proxy);
+    }
+
+    let client = client_builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
@@ -769,9 +780,21 @@ async fn proxy_http_request(
         req = req.body(b);
     }
 
-    // Execute
-    let response = req.send().await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+    // Execute (with proxy success/failure tracking)
+    let response = match req.send().await {
+        Ok(resp) => {
+            if let Some(ref purl) = proxy_url {
+                proxy_pool::notify_proxy_success(purl);
+            }
+            resp
+        }
+        Err(e) => {
+            if let Some(ref purl) = proxy_url {
+                proxy_pool::notify_proxy_failure(purl);
+            }
+            return Err(format!("HTTP request failed: {}", e));
+        }
+    };
 
     let elapsed = start.elapsed();
     let status = response.status().as_u16();

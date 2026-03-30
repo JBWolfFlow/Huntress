@@ -138,6 +138,8 @@ export interface AppSettings {
   /** Terminal appearance customization */
   terminal: TerminalConfig;
   theme: 'dark';
+  /** Maximum budget per hunt session in USD (default $5) */
+  budgetLimitUsd: number;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -165,6 +167,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     fontSize: 13,
   },
   theme: 'dark',
+  budgetLimitUsd: 15,
 };
 
 const STORAGE_KEY = 'huntress_settings';

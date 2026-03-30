@@ -33,6 +33,11 @@ import { H1DuplicateChecker } from '../core/reporting/h1_duplicate_check';
 import { ReportQualityScorer } from '../core/reporting/report_quality';
 import { ContinuousMonitor } from '../core/discovery/continuous_monitor';
 import { checkToolHealth, getAvailableToolsSummary } from '../core/tools/tool_health';
+import { invoke } from '@tauri-apps/api/core';
+import type { CommandResult } from '../core/engine/react_loop';
+import { TraceStore } from '../core/tracing/trace_store';
+import { TracedModelProvider } from '../core/tracing/traced_provider';
+import { CostTracker } from '../core/tracing/cost_tracker';
 
 // ─── Session Persistence ──────────────────────────────────────────────────────
 
@@ -149,6 +154,8 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
   const h1DuplicateCheckerRef = useRef<H1DuplicateChecker | null>(null);
   const reportQualityRef = useRef<ReportQualityScorer | null>(null);
   const continuousMonitorRef = useRef<ContinuousMonitor | null>(null);
+  const traceStoreRef = useRef<TraceStore | null>(null);
+  const costTrackerRef = useRef<CostTracker | null>(null);
 
   const addMessage = useCallback((message: ConversationMessage) => {
     setMessages(prev => [...prev, message]);
@@ -172,7 +179,62 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
 
     try {
       const factory = getProviderFactory();
-      const provider: ModelProvider = factory.create(providerId, { apiKey });
+      const rawProvider: ModelProvider = factory.create(providerId, { apiKey });
+
+      // Initialize tracing & cost tracking
+      if (!traceStoreRef.current) {
+        traceStoreRef.current = new TraceStore({ persistIntervalMs: 0 });
+      }
+      if (!costTrackerRef.current) {
+        costTrackerRef.current = new CostTracker(traceStoreRef.current);
+      }
+
+      const sessionId = `hunt_${Date.now()}`;
+      const budgetLimit = settings.budgetLimitUsd ?? 5; // Default $5 budget
+
+      // Set session budget in cost tracker
+      costTrackerRef.current.setSessionBudget(sessionId, {
+        maxSessionCostUsd: budgetLimit,
+        maxAgentCostUsd: budgetLimit * 0.2, // 20% per agent
+        warningThreshold: 0.8,
+        hardStop: true,
+      });
+
+      // Wrap provider with tracing + budget enforcement
+      const tracedProvider = new TracedModelProvider(
+        rawProvider,
+        traceStoreRef.current,
+        {
+          sessionId,
+          spanId: `orchestrator_${sessionId}`,
+          callerType: 'orchestrator',
+          budget: {
+            maxSessionCostUsd: budgetLimit,
+            maxAgentCostUsd: budgetLimit * 0.2,
+            warningThreshold: 0.8,
+            hardStop: true,
+          },
+          onBudgetWarning: (status) => {
+            addMessage({
+              type: 'system',
+              id: generateId(),
+              content: `⚠️ Budget warning: $${status.spent.toFixed(2)} of $${status.limit.toFixed(2)} spent (${(status.percentUsed * 100).toFixed(0)}%). Consider pausing the hunt.`,
+              level: 'warning',
+              timestamp: Date.now(),
+            });
+          },
+          onBudgetExceeded: (status) => {
+            addMessage({
+              type: 'system',
+              id: generateId(),
+              content: `🛑 Budget exceeded: $${status.spent.toFixed(2)} of $${status.limit.toFixed(2)} limit reached. Hunt will be paused.`,
+              level: 'error',
+              timestamp: Date.now(),
+            });
+          },
+        }
+      );
+      const provider: ModelProvider = tracedProvider;
 
       // Create shared HTTP client if not yet initialized
       if (!httpClientRef.current) {
@@ -244,10 +306,110 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
         });
       }
 
+      // PTY-backed command execution for agents
+      const executeViaPty = async (command: string, _target: string): Promise<CommandResult> => {
+        const start = performance.now();
+        try {
+          const parts = command.split(/\s+/);
+          const program = parts[0];
+          const args = parts.slice(1);
+
+          const sessionId = await invoke<string>('spawn_pty', { command: program, args });
+
+          let output = '';
+          let consecutiveEmpty = 0;
+          for (let i = 0; i < 300; i++) { // 30s max (300 * 100ms)
+            try {
+              const chunk = await invoke<string>('read_pty', { sessionId });
+              if (chunk && chunk.length > 0) {
+                output += chunk;
+                consecutiveEmpty = 0;
+              } else {
+                consecutiveEmpty++;
+                if (output.length > 0 && consecutiveEmpty >= 20) break;
+              }
+            } catch { consecutiveEmpty++; }
+            await new Promise(r => setTimeout(r, 100));
+          }
+
+          await invoke('kill_pty', { sessionId }).catch(() => {});
+
+          return {
+            success: true,
+            stdout: output,
+            stderr: '',
+            exitCode: 0,
+            executionTimeMs: performance.now() - start,
+          };
+        } catch (err) {
+          return {
+            success: false,
+            stdout: '',
+            stderr: err instanceof Error ? err.message : String(err),
+            exitCode: 1,
+            executionTimeMs: performance.now() - start,
+          };
+        }
+      };
+
+      // Approval gate callback: bridges orchestrator ApprovalRequest → UI modal → boolean
+      const onApprovalRequest = async (request: {
+        command: string;
+        target: string;
+        reasoning: string;
+        category: string;
+        toolName?: string;
+        safetyWarnings?: string[];
+        agent?: string;
+      }): Promise<boolean> => {
+        const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+        // Ensure the global callback map exists (matches tool_executor.ts pattern)
+        const win = window as unknown as {
+          __huntress_approval_callbacks?: Map<string, (approved: boolean) => void>;
+        };
+        if (!win.__huntress_approval_callbacks) {
+          win.__huntress_approval_callbacks = new Map();
+        }
+
+        return new Promise<boolean>((resolve) => {
+          // Store resolver so App.tsx handleApprove/handleDeny can call it
+          win.__huntress_approval_callbacks!.set(approvalId, resolve);
+
+          // Dispatch event in the same format App.tsx expects (line 407)
+          window.dispatchEvent(
+            new CustomEvent('tool-approval-request', {
+              detail: {
+                approvalId,
+                request: {
+                  command: request.command,
+                  target: request.target,
+                  tool: {
+                    name: request.toolName ?? request.command.split(/\s+/)[0],
+                    safetyLevel: request.category === 'recon' || request.category === 'utility'
+                      ? 'SAFE'
+                      : request.category === 'active_testing'
+                        ? 'DANGEROUS'
+                        : 'RESTRICTED',
+                  },
+                  validation: {
+                    reasoning: request.reasoning,
+                    agent: request.agent ?? 'unknown',
+                    warnings: request.safetyWarnings ?? [],
+                  },
+                },
+              },
+            })
+          );
+        });
+      };
+
       const engine = new OrchestratorEngine({
         provider,
         model: modelId,
         autoApproveSafe: settings.autoApprove?.passiveRecon ?? false,
+        onApprovalRequest,
+        onExecuteCommand: executeViaPty,
         knowledgeGraph: kgRef.current ?? undefined,
         vulnDb: vulnDbRef.current ?? undefined,
         rewardSystem: rewardRef.current ?? undefined,
@@ -264,6 +426,8 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
         reportQuality: reportQualityRef.current ?? undefined,
         continuousMonitor: continuousMonitorRef.current ?? undefined,
         availableTools: availableSecurityTools.length > 0 ? availableSecurityTools : undefined,
+        getBudgetStatus: () => tracedProvider.getBudgetStatus(),
+        budgetLimitUsd: budgetLimit,
       });
 
       engine.setMessageCallback(addMessage);

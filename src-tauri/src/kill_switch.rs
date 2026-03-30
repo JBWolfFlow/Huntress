@@ -591,4 +591,121 @@ mod tests {
             _ => panic!("Wrong reason"),
         }
     }
+
+    // ─── Persistence Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_persistence_survives_restart() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(format!("/tmp/huntress_ks_persist_{id}.lock"));
+        let _ = std::fs::remove_file(&path);
+
+        // Activate and drop (simulates app shutdown)
+        {
+            let ks = KillSwitch::with_state_file(path.clone());
+            ks.activate(KillReason::ManualStop, Some("user clicked kill".to_string()))
+                .unwrap();
+            assert!(ks.is_active());
+            // ks dropped here — simulates app exit
+        }
+
+        // Re-create from same file (simulates app restart)
+        let ks2 = KillSwitch::with_state_file(path.clone());
+        assert!(ks2.is_active(), "Kill switch must persist as ACTIVE across restarts");
+        assert_eq!(ks2.get_activation_count().unwrap(), 1);
+
+        let event = ks2.get_last_event().unwrap().unwrap();
+        assert!(matches!(event.reason, KillReason::ManualStop));
+        assert_eq!(event.context, Some("user clicked kill".to_string()));
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_persistence_reset_survives_restart() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(format!("/tmp/huntress_ks_reset_{id}.lock"));
+        let _ = std::fs::remove_file(&path);
+
+        // Activate, then reset, then drop
+        {
+            let ks = KillSwitch::with_state_file(path.clone());
+            ks.activate(KillReason::ManualStop, None).unwrap();
+            ks.reset("CONFIRM_RESET").unwrap();
+            assert!(!ks.is_active());
+        }
+
+        // Re-create from same file — should be inactive
+        let ks2 = KillSwitch::with_state_file(path.clone());
+        assert!(!ks2.is_active(), "Reset state must persist as INACTIVE across restarts");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_corrupted_state_file_defaults_to_active() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(format!("/tmp/huntress_ks_corrupt_{id}.lock"));
+
+        // Write garbage to state file
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "NOT VALID JSON {{{{").unwrap();
+
+        let ks = KillSwitch::with_state_file(path.clone());
+        assert!(ks.is_active(), "Corrupted state file must default to ACTIVE (fail-safe)");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_missing_state_file_defaults_to_inactive() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(format!("/tmp/huntress_ks_missing_{id}.lock"));
+        let _ = std::fs::remove_file(&path); // ensure missing
+
+        let ks = KillSwitch::with_state_file(path);
+        assert!(!ks.is_active(), "Missing state file should default to INACTIVE (fresh install)");
+    }
+
+    #[test]
+    fn test_reset_requires_exact_confirmation_string() {
+        let ks = test_kill_switch();
+        ks.activate(KillReason::ManualStop, None).unwrap();
+
+        // Wrong confirmation strings should fail
+        assert!(ks.reset("confirm_reset").is_err(), "Lowercase should be rejected");
+        assert!(ks.reset("CONFIRM RESET").is_err(), "Space instead of underscore rejected");
+        assert!(ks.reset("").is_err(), "Empty string rejected");
+        assert!(ks.reset("yes").is_err(), "Generic yes rejected");
+        assert!(ks.is_active(), "Kill switch must remain active after failed resets");
+
+        // Correct confirmation succeeds
+        assert!(ks.reset("CONFIRM_RESET").is_ok());
+        assert!(!ks.is_active());
+    }
+
+    #[test]
+    fn test_activation_count_persists() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(format!("/tmp/huntress_ks_count_{id}.lock"));
+        let _ = std::fs::remove_file(&path);
+
+        // Activate 3 times across "restarts"
+        {
+            let ks = KillSwitch::with_state_file(path.clone());
+            ks.activate(KillReason::ManualStop, None).unwrap();
+            ks.reset("CONFIRM_RESET").unwrap();
+            ks.activate(KillReason::RateLimitExceeded, None).unwrap();
+            ks.reset("CONFIRM_RESET").unwrap();
+            ks.activate(KillReason::ExternalSignal, None).unwrap();
+            // Drop while active
+        }
+
+        let ks2 = KillSwitch::with_state_file(path.clone());
+        assert_eq!(ks2.get_activation_count().unwrap(), 3, "Activation count must persist");
+        assert!(ks2.is_active(), "Should still be active from last activation");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -28,6 +28,7 @@ import type {
   ContentBlock,
   SendMessageOptions,
 } from '../providers/types';
+import { invoke } from '@tauri-apps/api/core';
 import { getMessageText } from '../providers/types';
 import { ConversationManager } from '../conversation/conversation_manager';
 import type {
@@ -84,8 +85,85 @@ import type { TargetDeduplicator } from './target_dedup';
 import type { H1DuplicateChecker } from '../reporting/h1_duplicate_check';
 import type { ReportQualityScorer } from '../reporting/report_quality';
 import type { ContinuousMonitor } from '../discovery/continuous_monitor';
+import { classifyTaskComplexity, getAnthropicModelForComplexity } from './cost_router';
+import type { BudgetStatus } from '../tracing/types';
 
 // ─── Callback Types ───────────────────────────────────────────────────────────
+
+/**
+ * Normalize and deduplicate scope entries so localhost/127.0.0.1 are treated
+ * as the same target and scheme prefixes are stripped.
+ */
+export function normalizeScopeEntries(entries: string[]): string[] {
+  const normalized = new Map<string, string>();
+
+  for (const raw of entries) {
+    let entry = raw.trim();
+    // Strip scheme prefixes (http:// or https://)
+    entry = entry.replace(/^https?:\/\//, '');
+    // Strip trailing slashes
+    entry = entry.replace(/\/+$/, '');
+    // Normalize localhost variants to canonical form
+    entry = entry.replace(/^127\.0\.0\.1(?=:|$)/, 'localhost');
+    entry = entry.replace(/^0\.0\.0\.0(?=:|$)/, 'localhost');
+
+    // Deduplicate by normalized form (keep first occurrence's original label)
+    const key = entry.toLowerCase();
+    if (!normalized.has(key)) {
+      normalized.set(key, entry);
+    }
+  }
+
+  return Array.from(normalized.values());
+}
+
+/**
+ * Determine which agents to skip based on detected tech stack.
+ * Returns a Set of agent IDs to exclude from dispatch.
+ */
+export function getSkippedAgentsForTechStack(techStackLower: string): Set<string> {
+  const skip = new Set<string>();
+
+  const isNodeJS = /node\.?js|express|koa|next\.?js|nest\.?js/.test(techStackLower);
+  const isPHP = /php|laravel|wordpress|drupal|symfony/.test(techStackLower);
+  const isJava = /java|spring|tomcat|jetty|struts/.test(techStackLower);
+  const isPython = /python|django|flask|fastapi/.test(techStackLower);
+  const hasGraphQL = /graphql/.test(techStackLower);
+  const hasSAML = /saml|sso|okta|azure.ad|adfs/.test(techStackLower);
+  const hasWebSockets = /websocket|ws:\/\/|wss:\/\/|socket\.io/.test(techStackLower);
+
+  // SSTI is primarily a Python/Java/PHP concern, not Node.js
+  if (isNodeJS && !isPython && !isJava && !isPHP) {
+    skip.add('ssti-hunter');
+  }
+
+  // Deserialization is mainly Java/.NET, less relevant for Node/Python
+  if (isNodeJS && !isJava) {
+    skip.add('deserialization-hunter');
+  }
+
+  // SAML only relevant when SSO/SAML is detected
+  if (!hasSAML) {
+    skip.add('saml-hunter');
+  }
+
+  // GraphQL hunter only relevant when GraphQL endpoint detected
+  if (!hasGraphQL) {
+    skip.add('graphql-hunter');
+  }
+
+  // WebSocket hunter only relevant when WebSocket endpoints detected
+  if (!hasWebSockets) {
+    skip.add('websocket-hunter');
+  }
+
+  // HTTP smuggling less relevant for certain stacks
+  if (isNodeJS || isPython) {
+    skip.add('http-smuggling-hunter');
+  }
+
+  return skip;
+}
 
 /** Callback for when new messages should be displayed */
 export type MessageCallback = (message: ConversationMessage) => void;
@@ -157,6 +235,10 @@ export interface OrchestratorConfig {
   continuousMonitor?: ContinuousMonitor;
   /** List of available security tools on this system */
   availableTools?: string[];
+  /** Callback to check current session budget status (wired from TracedModelProvider) */
+  getBudgetStatus?: () => BudgetStatus;
+  /** Session budget limit in USD */
+  budgetLimitUsd?: number;
 }
 
 export interface ApprovalRequest {
@@ -216,6 +298,16 @@ export class OrchestratorEngine {
   private autoApproveSafe: boolean;
   private onApprovalRequest?: (request: ApprovalRequest) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
+  /** Callback to check current session budget — wired from TracedModelProvider */
+  private getBudgetStatus?: () => BudgetStatus;
+  /** Session budget limit in USD */
+  private budgetLimitUsd: number;
+  /** Whether budget soft-stop has been triggered (90% threshold) */
+  private budgetSoftStopped = false;
+
+  /** Circuit breaker: tracks recent agent error messages to detect fatal patterns */
+  private recentAgentErrors: string[] = [];
+  private static readonly CIRCUIT_BREAKER_THRESHOLD = 5;
 
   /** Cross-agent shared memory board */
   private blackboard: Blackboard;
@@ -277,6 +369,8 @@ export class OrchestratorEngine {
     this.autoApproveSafe = config.autoApproveSafe ?? false;
     this.onApprovalRequest = config.onApprovalRequest;
     this.onExecuteCommand = config.onExecuteCommand;
+    this.getBudgetStatus = config.getBudgetStatus;
+    this.budgetLimitUsd = config.budgetLimitUsd ?? 15;
     this.alloyConfig = config.alloy;
 
     // Create alloy instance if configured and enabled
@@ -720,6 +814,9 @@ Return ONLY the JSON, no other text.`;
    * 6. Repeat until the task queue is empty or the model calls stop_hunting
    */
   async startHunt(program: ProgramGuidelines): Promise<void> {
+    // Normalize and deduplicate scope entries before processing
+    program.scope.inScope = normalizeScopeEntries(program.scope.inScope);
+
     this.loadGuidelines(program);
     this.setPhase('hunting');
 
@@ -921,6 +1018,12 @@ Return ONLY the JSON, no other text.`;
       this.emitSystemMessage(`Agent ${task.agentType}: using Docker sandbox`, 'info');
     }
 
+    // Log the model tier this agent will use
+    const { model: routedModel } = this.getAgentProviderAndModel(task.agentType, task.description);
+    if (routedModel !== this.model) {
+      this.emitSystemMessage(`Agent ${task.agentType}: routed to ${routedModel}`, 'info');
+    }
+
     try {
       // Look up the agent in the catalog
       const entry = getAgentEntry(task.agentType);
@@ -932,8 +1035,8 @@ Return ONLY the JSON, no other text.`;
         }
         // Use the first match
         const agent = matches[0].factory();
-        const agentProvider = this.getAgentProvider();
-        await agent.initialize(agentProvider, this.model);
+        const { provider: agentProvider, model: agentModel } = this.getAgentProviderAndModel(task.agentType, task.description);
+        await agent.initialize(agentProvider, agentModel);
 
         // Wire sandbox-backed command execution into the agent
         if ('setCallbacks' in agent && typeof agent.setCallbacks === 'function') {
@@ -953,8 +1056,8 @@ Return ONLY the JSON, no other text.`;
 
       // Instantiate and run the agent
       const agent = entry.factory();
-      const agentProvider = this.getAgentProvider();
-      await agent.initialize(agentProvider, this.model);
+      const { provider: agentProvider, model: agentModel } = this.getAgentProviderAndModel(task.agentType, task.description);
+      await agent.initialize(agentProvider, agentModel);
 
       // Wire sandbox-backed command execution into the agent
       if ('setCallbacks' in agent && typeof agent.setCallbacks === 'function') {
@@ -977,6 +1080,10 @@ Return ONLY the JSON, no other text.`;
       const errMsg = error instanceof Error ? error.message : String(error);
       this.huntSession.taskQueue.fail(taskId, errMsg);
       this.huntSession.activeAgents--;
+
+      // Track error for circuit breaker detection
+      this.recentAgentErrors.push(errMsg);
+      if (this.recentAgentErrors.length > 10) this.recentAgentErrors.shift();
 
       const failMsg: ConversationMessage = {
         type: 'agent',
@@ -1176,6 +1283,52 @@ Return ONLY the JSON, no other text.`;
     const { taskQueue } = this.huntSession;
 
     while (this.huntSession.running && !this.huntSession.aborted) {
+      // Kill switch check — stop dispatching immediately if activated
+      if (await this.isKillSwitchActive()) {
+        this.emitSystemMessage(
+          'Kill switch activated — halting all hunt operations immediately.',
+          'error'
+        );
+        this.huntSession.aborted = true;
+        break;
+      }
+
+      // Budget enforcement — check before dispatching new agents
+      if (this.getBudgetStatus) {
+        const budget = this.getBudgetStatus();
+        if (budget.isExceeded) {
+          this.emitSystemMessage(
+            `**Budget exceeded** — $${budget.spent.toFixed(2)} spent of $${budget.limit.toFixed(2)} limit. ` +
+            `Stopping hunt to prevent further charges.`,
+            'error'
+          );
+          this.huntSession.aborted = true;
+          break;
+        }
+        if (budget.isWarning && !this.budgetSoftStopped) {
+          this.budgetSoftStopped = true;
+          this.emitSystemMessage(
+            `**Budget warning** — $${budget.spent.toFixed(2)} spent (${Math.round(budget.percentUsed * 100)}% of $${budget.limit.toFixed(2)}). ` +
+            `No new agents will be dispatched. Waiting for ${this.huntSession.activeAgents} running agents to complete.`,
+            'warning'
+          );
+          // Don't dispatch new agents, but let running ones finish
+          if (this.huntSession.activeAgents > 0) {
+            await this.sleep(2000);
+            continue;
+          }
+          break;
+        }
+        if (this.budgetSoftStopped) {
+          // Already in soft-stop: wait for running agents to finish
+          if (this.huntSession.activeAgents > 0) {
+            await this.sleep(2000);
+            continue;
+          }
+          break;
+        }
+      }
+
       // Check if there are tasks to run
       if (!taskQueue.hasRunnableTasks() && this.huntSession.activeAgents === 0) {
         // No more tasks and no agents running — ask the coordinator if we should continue
@@ -1206,6 +1359,25 @@ Return ONLY the JSON, no other text.`;
       // Dispatch all tasks in the batch in parallel
       const dispatches = batch.map(task => this.dispatchAgent(task.id));
       await Promise.allSettled(dispatches);
+
+      // Circuit breaker: stop dispatching if we see repeated fatal errors
+      if (this.recentAgentErrors.length >= OrchestratorEngine.CIRCUIT_BREAKER_THRESHOLD) {
+        const lastErrors = this.recentAgentErrors.slice(-OrchestratorEngine.CIRCUIT_BREAKER_THRESHOLD);
+        const isFatalPattern = lastErrors.every(e =>
+          e.includes('credit balance is too low') ||
+          e.includes('invalid_api_key') ||
+          e.includes('authentication_error') ||
+          e.includes('insufficient_quota')
+        );
+        if (isFatalPattern) {
+          this.emitSystemMessage(
+            `Hunt stopped: ${OrchestratorEngine.CIRCUIT_BREAKER_THRESHOLD} consecutive agents failed with the same API error. ` +
+            `Check your API key credits and try again.\n\nLast error: ${lastErrors[lastErrors.length - 1]?.substring(0, 200)}`,
+            'error'
+          );
+          break;
+        }
+      }
 
       // After the batch completes, run chain detection on all accumulated findings
       if (this.huntSession.allFindings.length > 0) {
@@ -1240,12 +1412,18 @@ Return ONLY the JSON, no other text.`;
         }
       }
 
-      // Emit progress
+      // Emit progress with cost tracking
       const stats = taskQueue.getStats();
+      const budgetInfo = this.getBudgetStatus
+        ? (() => {
+            const b = this.getBudgetStatus!();
+            return ` | Cost: $${b.spent.toFixed(2)}/$${b.limit.toFixed(2)}`;
+          })()
+        : '';
       this.emitSystemMessage(
         `Progress: ${stats.done} done, ${stats.running} running, ${stats.queued} queued, ` +
         `${stats.failed} failed | Findings: ${this.huntSession.allFindings.length} | ` +
-        `Chains: ${this.huntSession.chains.length}`,
+        `Chains: ${this.huntSession.chains.length}${budgetInfo}`,
         'info'
       );
 
@@ -1722,6 +1900,15 @@ What is your next action?`;
       );
     }
 
+    // Track errors for circuit breaker
+    if (!result.success && result.error) {
+      this.recentAgentErrors.push(result.error);
+      if (this.recentAgentErrors.length > 10) this.recentAgentErrors.shift();
+    } else if (result.success) {
+      // Reset on success — the error pattern is broken
+      this.recentAgentErrors = [];
+    }
+
     // Emit agent completion message
     const completionMsg: ConversationMessage = {
       type: 'agent',
@@ -1792,33 +1979,46 @@ What is your next action?`;
         : '',
     ].filter(Boolean).join('\n');
 
-    // Map agent types to appropriate iteration budgets
+    // Map agent types to appropriate iteration budgets (using actual hyphenated IDs)
     const agentBudgets: Record<string, number> = {
-      xss_hunter: 40,
-      sqli_hunter: 40,
-      ssrf_hunter: 50,
-      ssti_hunter: 30,
-      idor_hunter: 40,
-      graphql_hunter: 50,
-      cors_hunter: 30,
-      host_header_hunter: 30,
-      xxe_hunter: 40,
-      command_injection_hunter: 40,
-      path_traversal_hunter: 40,
-      subdomain_takeover_hunter: 30,
+      'xss-hunter': 40,
+      'sqli-hunter': 40,
+      'ssrf-hunter': 50,
+      'ssti-hunter': 30,
+      'idor-hunter': 40,
+      'graphql-hunter': 50,
+      'cors-hunter': 30,
+      'host-header-hunter': 30,
+      'xxe-hunter': 40,
+      'command-injection-hunter': 40,
+      'path-traversal-hunter': 40,
+      'subdomain-takeover-hunter': 30,
     };
+
+    // Tech-stack-aware agent filtering: skip agents irrelevant to the detected stack
+    const techStackLower = techStack.join(' ').toLowerCase();
+    const skippedAgents = getSkippedAgentsForTechStack(techStackLower);
 
     // Create targeted solver tasks for each relevant agent
     const availableAgents = getAllAgents();
+    let dispatched = 0;
+    let skipped = 0;
 
     for (const agentEntry of availableAgents) {
       // Skip recon — it just completed
       if (agentEntry.metadata.id === 'recon') continue;
 
+      // Tech-stack-aware filtering
+      if (skippedAgents.has(agentEntry.metadata.id)) {
+        skipped++;
+        continue;
+      }
+
       const budget = agentBudgets[agentEntry.metadata.id] ?? 40;
 
       // For agents with specific endpoint targets, create per-endpoint tasks
-      if (uniqueEndpoints.length > 0 && ['xss_hunter', 'sqli_hunter', 'ssrf_hunter', 'ssti_hunter'].includes(agentEntry.metadata.id)) {
+      const endpointAgents = ['xss-hunter', 'sqli-hunter', 'ssrf-hunter', 'ssti-hunter'];
+      if (uniqueEndpoints.length > 0 && endpointAgents.includes(agentEntry.metadata.id)) {
         // Create tasks for top endpoints (limit to prevent explosion)
         for (const endpoint of uniqueEndpoints.slice(0, 5)) {
           tasks.push(taskQueue.enqueue({
@@ -1845,17 +2045,41 @@ What is your next action?`;
           tags: [agentEntry.metadata.id, 'solver'],
         }));
       }
+      dispatched++;
+    }
+
+    if (skipped > 0) {
+      this.emitSystemMessage(
+        `Tech-stack filter: dispatched ${dispatched} agents, skipped ${skipped} irrelevant agents`,
+        'info'
+      );
     }
 
     return tasks;
   }
 
-  /** Get the model provider for sub-agents — alloy if enabled, else primary */
-  private getAgentProvider(): ModelProvider {
-    if (this.alloyInstance && this.alloyConfig?.enabled) {
-      return this.alloyInstance;
+  /**
+   * Get the model provider and model ID for a sub-agent, routed by task complexity.
+   *
+   * Routing priority:
+   * 1. User-specified agentModelOverrides from settings (highest priority)
+   * 2. Cost-router tier mapping (Haiku for simple, Sonnet for moderate/complex)
+   * 3. Alloy instance if configured
+   * 4. Primary provider + model (fallback)
+   */
+  private getAgentProviderAndModel(agentType: string, taskDescription: string = ''): { provider: ModelProvider; model: string } {
+    // Only apply tiered routing for Anthropic providers
+    if (this.provider.providerId === 'anthropic') {
+      const complexity = classifyTaskComplexity(agentType, taskDescription);
+      const tieredModel = getAnthropicModelForComplexity(complexity);
+      return { provider: this.provider, model: tieredModel };
     }
-    return this.provider;
+
+    // Non-Anthropic providers: use alloy or primary as before
+    if (this.alloyInstance && this.alloyConfig?.enabled) {
+      return { provider: this.alloyInstance, model: this.model };
+    }
+    return { provider: this.provider, model: this.model };
   }
 
   /** Convert a HuntTask to the AgentTask interface expected by BaseAgent.execute() */
@@ -1944,13 +2168,34 @@ What is your next action?`;
   /** Check if a target is within a scope entry using proper domain boundary matching */
   private isTargetInScope(target: string, scopeEntry: string): boolean {
     try {
+      // Normalize target: extract hostname via URL parsing
       const targetHost = new URL(
         target.startsWith('http') ? target : `https://${target}`
-      ).hostname;
-      const scopeHost = scopeEntry.replace(/^\*\./, '');
+      ).hostname.toLowerCase();
 
-      if (scopeEntry.startsWith('*.')) {
-        // Wildcard: must match exact subdomain boundary (.example.com)
+      // Normalize scope entry: strip whitespace, then extract hostname
+      // Scope entries may be "example.com", "localhost:3001", "*.example.com",
+      // or full URLs like "http://example.com"
+      const trimmedScope = scopeEntry.trim();
+      const isWildcard = trimmedScope.startsWith('*.');
+
+      let scopeHost: string;
+      if (isWildcard) {
+        // *.example.com → example.com
+        scopeHost = trimmedScope.slice(2).toLowerCase();
+      } else {
+        // Parse as URL to strip port/path, handling bare host:port entries
+        try {
+          scopeHost = new URL(
+            trimmedScope.startsWith('http') ? trimmedScope : `https://${trimmedScope}`
+          ).hostname.toLowerCase();
+        } catch {
+          // Fallback: use as-is after stripping port
+          scopeHost = trimmedScope.split(':')[0].toLowerCase();
+        }
+      }
+
+      if (isWildcard) {
         return targetHost === scopeHost || targetHost.endsWith('.' + scopeHost);
       }
       return targetHost === scopeHost;
@@ -1997,6 +2242,18 @@ What is your next action?`;
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /** Check kill switch status. Fail-safe: assumes ACTIVE on error. */
+  private async isKillSwitchActive(): Promise<boolean> {
+    try {
+      if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
+        return await invoke<boolean>('is_kill_switch_active');
+      }
+      return false;
+    } catch {
+      return true; // Fail-safe: assume active if we can't check
+    }
   }
 
   /**

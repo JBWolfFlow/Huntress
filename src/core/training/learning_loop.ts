@@ -9,7 +9,7 @@
  * comprehensive error handling, and idempotent operations.
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { QdrantClient } from '../memory/qdrant_client';
 import { TrainingPipelineManager, TrainingJobConfig } from './training_manager';
 import { ModelVersionManager } from './model_manager';

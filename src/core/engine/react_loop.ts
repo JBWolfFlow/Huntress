@@ -26,6 +26,7 @@ import type {
 import { getMessageText } from '../providers/types';
 import { AGENT_TOOL_SCHEMAS } from './tool_schemas';
 import { checkSafetyPolicies } from './safety_policies';
+import { invoke } from '@tauri-apps/api/core';
 import { parseToolOutput, extractFindings, extractTargets } from './output_parsers';
 import { ModelAlloy } from './model_alloy';
 import type { HttpClient, HttpRequestOptions } from '../http/request_engine';
@@ -547,6 +548,24 @@ export class ReactLoop {
 
     const commandToExecute = safetyCheck.sanitizedCommand || input.command;
 
+    // ── SCOPE CHECK: Validate target is in-scope before execution ──
+    const targetFromCommand = extractTargetFromCommand(commandToExecute, input.target);
+    if (targetFromCommand) {
+      try {
+        const inScope = await invoke<boolean>('validate_target', { target: targetFromCommand });
+        if (!inScope) {
+          return {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: `BLOCKED: Target "${targetFromCommand}" is not in scope. Only in-scope targets may be tested.`,
+            is_error: true,
+          };
+        }
+      } catch {
+        // If Tauri bridge unavailable (e.g. test environment), log and continue
+      }
+    }
+
     this.emitStatus(
       'executing',
       `Executing: ${commandToExecute.substring(0, 100)}...`,
@@ -938,19 +957,33 @@ export class ReactLoop {
     let hostname: string;
     try {
       const parsed = new URL(url);
-      hostname = parsed.hostname;
+      hostname = parsed.hostname.toLowerCase();
     } catch {
       return { inScope: false, hostname: url };
     }
 
-    // Check against scope entries
-    for (const scopeEntry of this.config.scope) {
+    // Check against scope entries (normalize: lowercase, strip port/whitespace)
+    for (const rawEntry of this.config.scope) {
+      const entry = rawEntry.trim().toLowerCase();
+      // Extract hostname from scope entry (strip port if present)
+      let scopeHost: string;
+      if (entry.startsWith('*.')) {
+        scopeHost = entry.slice(2);
+      } else {
+        try {
+          scopeHost = new URL(
+            entry.startsWith('http') ? entry : `https://${entry}`
+          ).hostname;
+        } catch {
+          scopeHost = entry.split(':')[0];
+        }
+      }
+
       // Exact match
-      if (hostname === scopeEntry) return { inScope: true, hostname };
+      if (hostname === scopeHost) return { inScope: true, hostname };
       // Wildcard match: *.example.com should match sub.example.com
-      if (scopeEntry.startsWith('*.')) {
-        const baseDomain = scopeEntry.slice(2);
-        if (hostname === baseDomain || hostname.endsWith(`.${baseDomain}`)) {
+      if (entry.startsWith('*.')) {
+        if (hostname === scopeHost || hostname.endsWith(`.${scopeHost}`)) {
           return { inScope: true, hostname };
         }
       }
@@ -1425,6 +1458,37 @@ ${assetLines}`;
       });
     }
   }
+}
+
+/**
+ * Extract the primary target hostname/IP from a shell command string.
+ * Falls back to the explicit target field from the tool call.
+ */
+function extractTargetFromCommand(command: string, fallbackTarget?: string): string | null {
+  // Common security tool patterns: tool [flags] URL/host
+  const urlMatch = command.match(/https?:\/\/([^\/\s:]+)/);
+  if (urlMatch) return urlMatch[1];
+
+  // nmap TARGET, nmap -sV TARGET (target is typically last non-flag arg)
+  const nmapMatch = command.match(/\bnmap\b.*?\s+([a-zA-Z0-9][\w.-]+\.[a-zA-Z]{2,})\b/);
+  if (nmapMatch) return nmapMatch[1];
+
+  // IP address pattern (standalone, not part of a flag value like --timeout=10.0.0)
+  const ipMatch = command.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/);
+  if (ipMatch) return ipMatch[1];
+
+  // nuclei -u host, sqlmap -u URL, ffuf -u URL
+  const dashUMatch = command.match(/-u\s+https?:\/\/([^\/\s:]+)/);
+  if (dashUMatch) return dashUMatch[1];
+
+  // Fallback to explicit target from agent tool call
+  if (fallbackTarget && fallbackTarget !== 'N/A' && fallbackTarget.trim()) {
+    // Strip protocol and path if present
+    const stripped = fallbackTarget.replace(/^https?:\/\//, '').split(/[/:]/)[0];
+    if (stripped) return stripped;
+  }
+
+  return null;
 }
 
 export default ReactLoop;

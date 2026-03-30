@@ -266,8 +266,15 @@ impl ScopeValidator {
                 }
             }
 
-            // Regular domain/wildcard pattern
-            let pattern = Self::compile_pattern(target)?;
+            // Regular domain/wildcard pattern — normalize to hostname only
+            // (strip port from entries like "localhost:3001" before compiling regex)
+            let pattern_input = if target.starts_with("*.") {
+                // Wildcard entries don't have ports — pass through as-is
+                target.to_string()
+            } else {
+                Self::extract_domain(target)
+            };
+            let pattern = Self::compile_pattern(&pattern_input)?;
 
             if entry.in_scope {
                 in_scope_patterns.push(pattern);
@@ -704,17 +711,26 @@ impl ScopeValidator {
         }
     }
 
-    /// Extract domain from URL/hostname
+    /// Extract domain from URL/hostname, stripping port numbers and whitespace
     fn extract_domain(input: &str) -> String {
-        // Try parsing as URL first
-        if let Ok(url) = Url::parse(input) {
+        let trimmed = input.trim();
+
+        // Try parsing as URL first (handles http://host:port/path)
+        if let Ok(url) = Url::parse(trimmed) {
             if let Some(host) = url.host_str() {
-                return host.to_string();
+                return host.to_lowercase();
             }
         }
 
-        // If not a URL, treat as domain
-        input.trim().to_lowercase()
+        // Try with a scheme prefix (handles bare host:port like "localhost:3001")
+        if let Ok(url) = Url::parse(&format!("https://{}", trimmed)) {
+            if let Some(host) = url.host_str() {
+                return host.to_lowercase();
+            }
+        }
+
+        // Final fallback: strip port manually and lowercase
+        trimmed.split(':').next().unwrap_or(trimmed).to_lowercase()
     }
 
     /// Match wildcard patterns (*.example.com matches api.example.com but NOT example.com)

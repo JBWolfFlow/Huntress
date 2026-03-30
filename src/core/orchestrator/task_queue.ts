@@ -190,7 +190,7 @@ export class TaskQueue {
         newTasks.push(this.enqueue({
           description: `Validate XSS finding: ${finding.title}`,
           target: finding.target,
-          agentType: 'xss_validator',
+          agentType: 'xss-hunter',
           priority: 8,
           dependencies: [],
           iterationBudget: 10,
@@ -204,7 +204,7 @@ export class TaskQueue {
         newTasks.push(this.enqueue({
           description: `Validate SQLi finding: ${finding.title}`,
           target: finding.target,
-          agentType: 'sqli_validator',
+          agentType: 'sqli-hunter',
           priority: 9,
           dependencies: [],
           iterationBudget: 15,
@@ -218,7 +218,7 @@ export class TaskQueue {
         newTasks.push(this.enqueue({
           description: `Chain open redirect with SSRF: ${finding.target}`,
           target: finding.target,
-          agentType: 'ssrf_hunter',
+          agentType: 'ssrf-hunter',
           priority: 7,
           dependencies: [],
           iterationBudget: 30,

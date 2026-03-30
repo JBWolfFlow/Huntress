@@ -9,7 +9,7 @@
  * comprehensive validation, and detailed audit trails.
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { ModelVersionManager, ModelVersion, RollbackResult } from './model_manager';
 import { PerformanceMonitor } from './performance_monitor';
 import { fs, path } from '../tauri_bridge';

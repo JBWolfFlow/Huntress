@@ -9,7 +9,7 @@
  * management, and comprehensive conflict prevention.
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { LearningLoopOrchestrator } from './learning_loop';
 import { getSystemInfo } from '../tauri_bridge';
 

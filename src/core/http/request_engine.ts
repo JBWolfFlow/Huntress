@@ -225,10 +225,10 @@ async function isKillSwitchActive(): Promise<boolean> {
     try {
       return await invoke<boolean>('is_kill_switch_active');
     } catch {
-      return false;
+      return true; // Fail-safe: assume active if we can't check
     }
   }
-  return false;
+  return false; // Non-Tauri (test/Node): always allow
 }
 
 // ─── HTTP Client ─────────────────────────────────────────────────────────────

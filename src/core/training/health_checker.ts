@@ -10,7 +10,7 @@
  * automatic recovery mechanisms, and detailed health history tracking.
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { QdrantClient } from '../memory/qdrant_client';
 import { ModelVersionManager } from './model_manager';
 import { PerformanceMonitor } from './performance_monitor';

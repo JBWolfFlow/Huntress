@@ -9,7 +9,7 @@
  */
 
 import { fs, path } from '../tauri_bridge';
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 
 /**
  * Model version metadata

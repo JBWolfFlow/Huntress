@@ -175,6 +175,16 @@ fn load_or_generate_entropy() -> String {
     // Persist the entropy (best-effort — vault still works without it, just less secure)
     if let Err(e) = std::fs::write(&entropy_path, &hex_str) {
         tracing::warn!("Failed to persist vault entropy: {}", e);
+    } else {
+        // Restrict permissions to owner-only (0600) on Unix systems
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            if let Err(e) = std::fs::set_permissions(&entropy_path, perms) {
+                tracing::warn!("Failed to restrict entropy file permissions: {}", e);
+            }
+        }
     }
 
     hex_str
@@ -379,6 +389,18 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 fn load_vault() -> Vault {
     let path = vault_path();
     if path.exists() {
+        // Warn if vault exists but entropy file is missing — keys may be unrecoverable
+        let entropy_path = path.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(".vault_entropy");
+        if !entropy_path.exists() {
+            tracing::error!(
+                "CRITICAL: vault.enc exists but .vault_entropy is missing! \
+                 Stored secrets may be unrecoverable. If you have a backup of \
+                 .vault_entropy, restore it to {:?}",
+                entropy_path
+            );
+        }
         if let Ok(data) = std::fs::read_to_string(&path) {
             if let Ok(mut vault) = serde_json::from_str::<Vault>(&data) {
                 if vault.version == 1 {

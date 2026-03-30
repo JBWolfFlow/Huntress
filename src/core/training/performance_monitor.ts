@@ -9,7 +9,7 @@
  * statistical anomaly detection, and historical trend analysis.
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { QdrantClient } from '../memory/qdrant_client';
 import { TrainingExample } from './data_collector';
 import { fs, path } from '../tauri_bridge';

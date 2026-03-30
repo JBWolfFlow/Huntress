@@ -9,7 +9,7 @@
  * detailed reporting, and strict quality enforcement.
  */
 
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'eventemitter3';
 import { ModelVersionManager, ModelVersion } from './model_manager';
 import { PerformanceMonitor, PerformanceMetrics } from './performance_monitor';
 import { QdrantClient } from '../memory/qdrant_client';
