@@ -288,6 +288,11 @@ export const HTTP_REQUEST_SCHEMA: ToolDefinition = {
         type: 'number',
         description: 'Request timeout in milliseconds (default: 30000)',
       },
+      session_label: {
+        type: 'string',
+        description:
+          'Optional. Label of the auth session to use for this request. Omit to use the default session. Use to compare responses across identities for IDOR/BOLA testing — e.g., "victim" vs "attacker".',
+      },
     },
     required: ['url', 'method'],
   },
@@ -336,6 +341,74 @@ export const FUZZ_PARAMETER_SCHEMA: ToolDefinition = {
   },
 };
 
+export const BROWSER_NAVIGATE_SCHEMA: ToolDefinition = {
+  name: 'browser_navigate',
+  description: `Navigate a headless browser to an in-scope URL and return the rendered page content, title, final URL (after redirects), detected dialogs, console logs, and network requests. Use this for testing client-side vulnerabilities (DOM-XSS, prototype pollution), interacting with SPAs, and observing JavaScript execution. The browser executes JavaScript and waits for the page to settle before capturing results.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      url: {
+        type: 'string',
+        description: 'Target URL to navigate to — must be in-scope',
+      },
+      wait_ms: {
+        type: 'number',
+        description: 'Additional milliseconds to wait after page load for deferred JS (default: 2000)',
+      },
+    },
+    required: ['url'],
+  },
+};
+
+export const BROWSER_EVALUATE_SCHEMA: ToolDefinition = {
+  name: 'browser_evaluate',
+  description: `Execute JavaScript in the current browser page context and return the result. Use this for DOM-XSS sink/source analysis, reading DOM properties, checking for prototype pollution artifacts (e.g., Object.prototype.polluted), or extracting data from client-side storage. The browser must have navigated to a page first via browser_navigate.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      expression: {
+        type: 'string',
+        description: 'JavaScript expression to evaluate in the page context. Must return a JSON-serializable value.',
+      },
+    },
+    required: ['expression'],
+  },
+};
+
+export const BROWSER_CLICK_SCHEMA: ToolDefinition = {
+  name: 'browser_click',
+  description: `Click an element in the current browser page by CSS selector. Use this for interacting with SPAs — clicking buttons, following client-side routes, submitting forms, triggering event handlers. Returns the page content after the click and any dialogs/console output triggered. The browser must have navigated to a page first via browser_navigate.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      selector: {
+        type: 'string',
+        description: 'CSS selector for the element to click (e.g., "button.submit", "#login-form input[type=submit]")',
+      },
+      wait_ms: {
+        type: 'number',
+        description: 'Milliseconds to wait after clicking for navigation/JS execution (default: 2000)',
+      },
+    },
+    required: ['selector'],
+  },
+};
+
+export const BROWSER_GET_CONTENT_SCHEMA: ToolDefinition = {
+  name: 'browser_get_content',
+  description: `Get the current page HTML content, URL, title, and cookies from the headless browser. Use this to inspect the DOM after a sequence of browser_navigate and browser_click actions. Returns truncated HTML (max 50KB) plus metadata. The browser must have navigated to a page first via browser_navigate.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      include_cookies: {
+        type: 'boolean',
+        description: 'Whether to include cookies in the response (default: false)',
+      },
+    },
+    required: [],
+  },
+};
+
 export const RACE_TEST_SCHEMA: ToolDefinition = {
   name: 'race_test',
   description: `Send N identical HTTP requests simultaneously to test for race conditions. Uses Promise.all to fire all requests at once, then returns all responses for differential analysis. Use this to detect TOCTOU bugs, double-spend, duplicate coupon application, and other time-of-check/time-of-use vulnerabilities.`,
@@ -370,6 +443,14 @@ export const RACE_TEST_SCHEMA: ToolDefinition = {
 
 // ─── Schema Collections ──────────────────────────────────────────────────────
 
+/** Browser tool schemas — only provided to agents with browserEnabled */
+export const BROWSER_TOOL_SCHEMAS: ToolDefinition[] = [
+  BROWSER_NAVIGATE_SCHEMA,
+  BROWSER_EVALUATE_SCHEMA,
+  BROWSER_CLICK_SCHEMA,
+  BROWSER_GET_CONTENT_SCHEMA,
+];
+
 /** All tool schemas available to hunting agents */
 export const AGENT_TOOL_SCHEMAS: ToolDefinition[] = [
   EXECUTE_COMMAND_SCHEMA,
@@ -392,24 +473,73 @@ export const RECON_TOOL_SCHEMAS: ToolDefinition[] = [
 ];
 
 /** Schemas for the orchestrator/coordinator */
+export const ADJUST_BUDGET_SCHEMA: ToolDefinition = {
+  name: 'adjust_budget',
+  description: 'Adjust the hunt budget. Can only increase the budget — never decrease below current spend. Use when the user requests a budget change mid-hunt.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      new_budget_usd: {
+        type: 'number',
+        description: 'New budget in USD. Must be greater than current spend and at most $500.',
+      },
+      reason: {
+        type: 'string',
+        description: 'Why the budget is being adjusted',
+      },
+    },
+    required: ['new_budget_usd'],
+  },
+};
+
 export const ORCHESTRATOR_TOOL_SCHEMAS: ToolDefinition[] = [
   {
     name: 'dispatch_agent',
-    description: 'Dispatch a specialized agent to handle a specific task',
+    description: 'Dispatch a specialized agent to handle a specific task. Agents run asynchronously and report results back automatically when they complete — do NOT poll or check status, just dispatch and wait.',
     input_schema: {
       type: 'object',
       properties: {
         agent_type: {
           type: 'string',
-          description: 'Which agent to dispatch',
+          enum: [
+            'recon',
+            'sqli-hunter',
+            'xss-hunter',
+            'idor-hunter',
+            'ssrf-hunter',
+            'jwt-hunter',
+            'business-logic-hunter',
+            'path-traversal-hunter',
+            'open-redirect-hunter',
+            'prototype-pollution-hunter',
+            'xxe-hunter',
+            'ssti-hunter',
+            'command-injection-hunter',
+            'cors-hunter',
+            'crlf-hunter',
+            'host-header-hunter',
+            'graphql-hunter',
+            'http-smuggling-hunter',
+            'websocket-hunter',
+            'nosql-hunter',
+            'race-condition-hunter',
+            'mfa-bypass-hunter',
+            'deserialization-hunter',
+            'saml-hunter',
+            'cache-hunter',
+            'subdomain-takeover-hunter',
+            'prompt-injection-hunter',
+            'oauth_hunter',
+          ],
+          description: 'The agent ID to dispatch. Must be one of the listed values.',
         },
         task_description: {
           type: 'string',
-          description: 'Detailed task description for the agent',
+          description: 'Detailed task description for the agent including specific endpoints, payloads, and techniques to test',
         },
         target: {
           type: 'string',
-          description: 'Target for the agent',
+          description: 'Target URL for the agent (must be in scope)',
         },
         priority: {
           type: 'number',
@@ -455,17 +585,32 @@ export const ORCHESTRATOR_TOOL_SCHEMAS: ToolDefinition[] = [
       required: ['finding_id'],
     },
   },
+  ADJUST_BUDGET_SCHEMA,
   STOP_HUNTING_SCHEMA,
 ];
 
-/** Get tool schemas filtered by agent type */
-export function getToolSchemasForAgent(agentType: string): ToolDefinition[] {
+/** Agent types that originally had browser tools (Phase A: now all hunting agents do) */
+export const BROWSER_ENABLED_AGENTS: ReadonlySet<string> = new Set([
+  'xss-hunter',
+  'ssti-hunter',
+  'prototype-pollution-hunter',
+  'business-logic-hunter',
+]);
+
+/** Get tool schemas filtered by agent type.
+ *  Phase A: All hunting agents get browser tools by default.
+ *  Browser is lazy-initialized — agents that don't call browser tools pay zero cost.
+ *  Pass browserEnabled=false to explicitly opt out. */
+export function getToolSchemasForAgent(agentType: string, browserEnabled?: boolean): ToolDefinition[] {
   switch (agentType) {
     case 'recon':
       return RECON_TOOL_SCHEMAS;
     case 'orchestrator':
       return ORCHESTRATOR_TOOL_SCHEMAS;
     default:
-      return AGENT_TOOL_SCHEMAS;
+      if (browserEnabled === false) {
+        return AGENT_TOOL_SCHEMAS;
+      }
+      return [...AGENT_TOOL_SCHEMAS, ...BROWSER_TOOL_SCHEMAS];
   }
 }

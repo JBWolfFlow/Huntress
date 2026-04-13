@@ -14,7 +14,10 @@ import { FindingSummarizer } from '../memory/summarizer';
 import { DuplicateChecker, type Vulnerability, type DuplicateScore } from '../../utils/duplicate_checker';
 import { SeverityPredictor, type SeverityPrediction, type ProgramBountyRanges } from './severity_predictor';
 import type { H1Report } from './h1_api';
+import type { HttpExchange } from '../../agents/base_agent';
 import { REPORT_TEMPLATES, fillTemplate } from './templates';
+import { calculateCVSS, estimateMetrics, type CVSSResult } from './cvss_calculator';
+import { invoke } from '@tauri-apps/api/core';
 
 export interface ProgramGuidelines {
   programHandle: string;
@@ -42,6 +45,8 @@ export interface ReportGenerationOptions {
   skipDuplicateCheck?: boolean;
   manualSeverity?: 'critical' | 'high' | 'medium' | 'low';
   programGuidelines?: ProgramGuidelines;
+  /** RQ1/RQ3: Structured HTTP exchanges from the agent's ReAct loop */
+  httpExchanges?: HttpExchange[];
 }
 
 export class PoCGenerator {
@@ -147,8 +152,8 @@ export class PoCGenerator {
     // 6. Format reproduction steps
     const steps = this.formatSteps(vuln.steps);
 
-    // 7. Compile proof/evidence
-    const proof = this.compileProof(vuln, options);
+    // 7. Compile proof/evidence (RQ4 — embeds content instead of referencing paths)
+    const proof = await this.compileProof(vuln, options);
 
     // 8. Generate severity justification
     const severityJustification = this.generateSeverityJustification(
@@ -156,11 +161,17 @@ export class PoCGenerator {
       severityPrediction
     );
 
-    // 9. Calculate CVSS score (if applicable)
-    const cvssScore = this.calculateCVSS(vuln, severityPrediction.severity);
+    // 9. Calculate CVSS score using real CVSS 3.1 calculator (S3)
+    const cvssResult = this.calculateRealCVSS(vuln.type);
 
     // 10. Get CWE weakness ID
     const weaknessId = this.getWeaknessId(vuln.type);
+
+    // 11. Format HTTP evidence (RQ3) — from structured exchanges or fallback to text extraction
+    const httpEvidence = this.formatHttpEvidence(options.httpExchanges, vuln.description, vuln.steps);
+
+    // 12. Generate executable reproduction steps (RQ5)
+    const quickReproduction = this.generateQuickReproduction(options.httpExchanges, vuln);
 
     console.log('✓ Report generated successfully');
 
@@ -174,8 +185,11 @@ export class PoCGenerator {
       proof,
       duplicateCheck,
       severityJustification,
-      cvssScore,
+      cvssScore: cvssResult.score,
+      cvssVector: cvssResult.vectorString,
       weaknessId,
+      httpEvidence,
+      quickReproduction,
     };
   }
 
@@ -190,7 +204,11 @@ export class PoCGenerator {
     markdown += `**Suggested Bounty:** $${report.suggestedBounty.min.toLocaleString()} - $${report.suggestedBounty.max.toLocaleString()}\n`;
     
     if (report.cvssScore) {
-      markdown += `**CVSS Score:** ${report.cvssScore}\n`;
+      markdown += `**CVSS Score:** ${report.cvssScore}`;
+      if (report.cvssVector) {
+        markdown += ` (${report.cvssVector})`;
+      }
+      markdown += '\n';
     }
     
     if (report.weaknessId) {
@@ -212,14 +230,24 @@ export class PoCGenerator {
     });
     markdown += '\n';
 
+    // HTTP Evidence (RQ3)
+    if (report.httpEvidence) {
+      markdown += `## HTTP Evidence\n\n${report.httpEvidence}\n\n`;
+    }
+
+    // Quick Reproduction (RQ5)
+    if (report.quickReproduction) {
+      markdown += `## Quick Reproduction\n\n${report.quickReproduction}\n\n`;
+    }
+
     // Proof of Concept
     if (report.proof.video || report.proof.screenshots?.length || report.proof.logs?.length) {
       markdown += `## Proof of Concept\n\n`;
-      
+
       if (report.proof.video) {
         markdown += `**Video Recording:** ${report.proof.video}\n\n`;
       }
-      
+
       if (report.proof.screenshots && report.proof.screenshots.length > 0) {
         markdown += `**Screenshots:**\n`;
         report.proof.screenshots.forEach((screenshot, index) => {
@@ -227,7 +255,7 @@ export class PoCGenerator {
         });
         markdown += '\n';
       }
-      
+
       if (report.proof.logs && report.proof.logs.length > 0) {
         markdown += `**Logs:**\n`;
         report.proof.logs.forEach((log, index) => {
@@ -354,29 +382,82 @@ export class PoCGenerator {
   }
 
   /**
-   * Compile proof/evidence
+   * RQ4: Compile proof/evidence — embeds file content instead of referencing paths.
+   * - Logs: reads file content and embeds as code blocks
+   * - Screenshots: validates path exists, keeps as reference for H1 attachment upload
+   * - Video: validates path exists, keeps as reference (too large to embed)
+   * - Missing files: adds a warning note instead of a broken reference
    */
-  private compileProof(
+  private async compileProof(
     vuln: Vulnerability,
     options: ReportGenerationOptions
-  ): H1Report['proof'] {
+  ): Promise<H1Report['proof']> {
     const proof: H1Report['proof'] = {};
-    
-    if (vuln.proof) {
-      if (options.includeVideo !== false && vuln.proof.video) {
-        proof.video = vuln.proof.video;
-      }
-      
-      if (options.includeScreenshots !== false && vuln.proof.screenshots) {
-        proof.screenshots = vuln.proof.screenshots;
-      }
-      
-      if (options.includeLogs !== false && vuln.proof.logs) {
-        proof.logs = vuln.proof.logs;
-      }
+
+    if (!vuln.proof) return proof;
+
+    // Video — validate but keep as path (too large to embed)
+    if (options.includeVideo !== false && vuln.proof.video) {
+      const exists = await PoCGenerator.fileExists(vuln.proof.video);
+      proof.video = exists
+        ? vuln.proof.video
+        : `[WARNING: Video file not found: ${vuln.proof.video}]`;
     }
-    
+
+    // Screenshots — validate existence, keep path for H1 attachment upload
+    if (options.includeScreenshots !== false && vuln.proof.screenshots) {
+      const validated: string[] = [];
+      for (const screenshot of vuln.proof.screenshots) {
+        const exists = await PoCGenerator.fileExists(screenshot);
+        if (exists) {
+          validated.push(screenshot);
+        } else {
+          validated.push(`[WARNING: Screenshot not found: ${screenshot}]`);
+        }
+      }
+      proof.screenshots = validated;
+    }
+
+    // Logs — read file content and embed as code blocks
+    if (options.includeLogs !== false && vuln.proof.logs) {
+      const embedded: string[] = [];
+      for (const logPath of vuln.proof.logs) {
+        const content = await PoCGenerator.readFileContent(logPath);
+        if (content !== null) {
+          // Embed the content as a code block with the filename as label
+          const filename = logPath.split('/').pop() ?? logPath;
+          embedded.push(`**${filename}:**\n\`\`\`\n${content.substring(0, 5000)}\n\`\`\``);
+        } else {
+          embedded.push(`[WARNING: Log file not found: ${logPath}]`);
+        }
+      }
+      proof.logs = embedded;
+    }
+
     return proof;
+  }
+
+  /**
+   * Check if a file exists via Tauri bridge. Returns false if bridge unavailable.
+   */
+  static async fileExists(path: string): Promise<boolean> {
+    try {
+      return await invoke<boolean>('file_exists', { path });
+    } catch {
+      // Tauri bridge unavailable (e.g., test environment) — assume file exists
+      return true;
+    }
+  }
+
+  /**
+   * Read file content via Tauri bridge. Returns null if file not found or bridge unavailable.
+   */
+  static async readFileContent(path: string): Promise<string | null> {
+    try {
+      return await invoke<string>('read_file_text', { path });
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -411,45 +492,225 @@ export class PoCGenerator {
   }
 
   /**
-   * Calculate CVSS score (simplified)
+   * S3: Calculate CVSS score using the real CVSS 3.1 calculator.
+   * Maps vulnerability types to proper CVSS metrics and produces both
+   * a numeric score and a vector string for HackerOne reports.
    */
-  private calculateCVSS(vuln: Vulnerability, severity: string): number {
-    // Simplified CVSS calculation based on severity
-    const baseScores: Record<string, number> = {
-      critical: 9.5,
-      high: 7.5,
-      medium: 5.5,
-      low: 3.5,
-    };
-    
-    let score = baseScores[severity] || 5.0;
-    
-    // Adjust based on vulnerability characteristics
-    const description = vuln.description.toLowerCase();
-    const impact = vuln.impact.toLowerCase();
-    const combined = `${description} ${impact}`;
-    
-    // Increase for RCE
-    if (/remote.*code.*execution|rce/i.test(combined)) {
-      score = Math.min(score + 1.0, 10.0);
+  private calculateRealCVSS(vulnType: string): CVSSResult {
+    const metrics = estimateMetrics(vulnType);
+    return calculateCVSS(metrics);
+  }
+
+  /**
+   * RQ3: Format structured HTTP exchanges as markdown code blocks.
+   * Falls back to extracting HTTP patterns from raw text if no structured data is available.
+   */
+  formatHttpEvidence(
+    exchanges?: HttpExchange[],
+    description?: string,
+    steps?: string[],
+  ): string | undefined {
+    if (exchanges && exchanges.length > 0) {
+      return this.formatStructuredExchanges(exchanges);
     }
-    
-    // Increase for authentication bypass
-    if (/auth.*bypass|bypass.*auth/i.test(combined)) {
-      score = Math.min(score + 0.8, 10.0);
+
+    // Fallback: extract HTTP patterns from raw text
+    const allText = [description ?? '', ...(steps ?? [])].join('\n');
+    return this.extractHttpFromText(allText) || undefined;
+  }
+
+  private formatStructuredExchanges(exchanges: HttpExchange[]): string {
+    const parts: string[] = [];
+
+    // Show up to 5 most relevant exchanges (the ones most likely to demonstrate the vuln)
+    const displayExchanges = exchanges.slice(0, 5);
+
+    for (let i = 0; i < displayExchanges.length; i++) {
+      const ex = displayExchanges[i];
+      const label = displayExchanges.length > 1 ? ` ${i + 1}` : '';
+
+      // Request
+      parts.push(`**Request${label}:**`);
+      let reqBlock = `${ex.request.method} ${this.extractPath(ex.request.url)} HTTP/1.1\n`;
+      reqBlock += `Host: ${this.extractHost(ex.request.url)}`;
+
+      if (ex.request.headers) {
+        for (const [key, value] of Object.entries(ex.request.headers)) {
+          if (key.toLowerCase() !== 'host') {
+            reqBlock += `\n${key}: ${value}`;
+          }
+        }
+      }
+
+      if (ex.request.body) {
+        reqBlock += `\n\n${ex.request.body}`;
+      }
+
+      parts.push('```http\n' + reqBlock + '\n```');
+
+      // Response
+      parts.push(`**Response${label}:**`);
+      let resBlock = `HTTP/1.1 ${ex.response.status}`;
+      if (ex.response.statusText) {
+        resBlock += ` ${ex.response.statusText}`;
+      }
+
+      if (ex.response.headers) {
+        // Show key security-relevant headers only
+        const importantHeaders = ['content-type', 'set-cookie', 'location', 'access-control-allow-origin',
+          'x-frame-options', 'content-security-policy', 'authorization', 'www-authenticate'];
+        for (const [key, value] of Object.entries(ex.response.headers)) {
+          if (importantHeaders.includes(key.toLowerCase())) {
+            resBlock += `\n${key}: ${value}`;
+          }
+        }
+      }
+
+      if (ex.response.bodySnippet) {
+        const snippetLimit = 500;
+        const snippet = ex.response.bodySnippet.length > snippetLimit
+          ? ex.response.bodySnippet.substring(0, snippetLimit) + '\n[...truncated]'
+          : ex.response.bodySnippet;
+        resBlock += `\n\n${snippet}`;
+      }
+
+      parts.push('```http\n' + resBlock + '\n```');
+
+      // Curl command for this exchange
+      parts.push(`**Curl command${label}:**`);
+      parts.push('```bash\n' + PoCGenerator.generateCurlCommand(ex) + '\n```');
+
+      if (i < displayExchanges.length - 1) {
+        parts.push('---');
+      }
     }
-    
-    // Decrease if authentication required
-    if (/authenticated|requires.*login/i.test(combined)) {
-      score = Math.max(score - 0.5, 0.1);
+
+    return parts.join('\n\n');
+  }
+
+  private extractHttpFromText(text: string): string | null {
+    // Look for HTTP-like patterns in raw text and format them
+    const httpPattern = /(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\s+(\/\S+)\s+HTTP\/\d\.\d/g;
+    const matches = text.match(httpPattern);
+    if (!matches || matches.length === 0) return null;
+
+    return `*Note: HTTP evidence extracted from agent text output (no structured exchange data available)*\n\n` +
+      matches.slice(0, 3).map(m => '```http\n' + m + '\n```').join('\n\n');
+  }
+
+  /**
+   * RQ5: Generate executable reproduction commands from HTTP exchanges.
+   */
+  private generateQuickReproduction(
+    exchanges?: HttpExchange[],
+    vuln?: Vulnerability,
+  ): string | undefined {
+    const parts: string[] = [];
+
+    if (exchanges && exchanges.length > 0) {
+      // Generate curl for the most significant exchange (the one that demonstrates the vuln)
+      // Prefer non-GET requests, or the last exchange (most likely to be the exploitation step)
+      const significantExchange = exchanges.find(e => e.request.method !== 'GET') ?? exchanges[exchanges.length - 1];
+
+      parts.push('**Curl:**');
+      parts.push('```bash\n' + PoCGenerator.generateCurlCommand(significantExchange) + '\n```');
+
+      // For multi-step findings, generate a Python script
+      if (exchanges.length >= 2) {
+        parts.push('\n**Python (multi-step):**');
+        parts.push('```python\n' + this.generatePythonScript(exchanges) + '\n```');
+      }
+    } else if (vuln) {
+      // Fallback: generate a basic curl from the vuln URL and steps
+      const urlMatch = vuln.url.match(/^https?:\/\/\S+/);
+      if (urlMatch) {
+        parts.push('**Curl:**');
+        parts.push(`\`\`\`bash\ncurl -v "${vuln.url}"\n\`\`\``);
+      }
     }
-    
-    // Decrease if user interaction required
-    if (/user.*interaction|click/i.test(combined)) {
-      score = Math.max(score - 0.3, 0.1);
+
+    return parts.length > 0 ? parts.join('\n') : undefined;
+  }
+
+  /**
+   * Generate a curl command from an HttpExchange.
+   */
+  static generateCurlCommand(exchange: HttpExchange): string {
+    const parts = ['curl'];
+
+    // Method (only explicit if not GET)
+    if (exchange.request.method !== 'GET') {
+      parts.push(`-X ${exchange.request.method}`);
     }
-    
-    return Math.round(score * 10) / 10;
+
+    // Headers
+    if (exchange.request.headers) {
+      for (const [key, value] of Object.entries(exchange.request.headers)) {
+        // Redact sensitive headers
+        const safeValue = key.toLowerCase() === 'authorization'
+          ? value.substring(0, 15) + '...[REDACTED]'
+          : value;
+        parts.push(`-H '${key}: ${safeValue}'`);
+      }
+    }
+
+    // Body
+    if (exchange.request.body) {
+      parts.push(`-d '${exchange.request.body.replace(/'/g, "'\\''")}'`);
+    }
+
+    // URL (always last)
+    parts.push(`'${exchange.request.url}'`);
+
+    return parts.join(' \\\n  ');
+  }
+
+  private generatePythonScript(exchanges: HttpExchange[]): string {
+    const lines: string[] = ['import requests', '', 's = requests.Session()', ''];
+
+    for (let i = 0; i < exchanges.length; i++) {
+      const ex = exchanges[i];
+      const method = ex.request.method.toLowerCase();
+      const comment = i === exchanges.length - 1 ? '# Exploitation step' : `# Step ${i + 1}`;
+      lines.push(comment);
+
+      let call = `r${i + 1} = s.${method}('${ex.request.url}'`;
+
+      if (ex.request.headers) {
+        const headerStr = JSON.stringify(ex.request.headers);
+        call += `, headers=${headerStr}`;
+      }
+
+      if (ex.request.body) {
+        call += `, data='${ex.request.body.replace(/'/g, "\\'")}'`;
+      }
+
+      call += ')';
+      lines.push(call);
+      lines.push(`print(f'Step ${i + 1}: {r${i + 1}.status_code}')`);
+      lines.push('');
+    }
+
+    lines.push(`print(f'Final response: {r${exchanges.length}.text[:500]}')`);
+    return lines.join('\n');
+  }
+
+  private extractPath(url: string): string {
+    try {
+      const parsed = new URL(url);
+      return parsed.pathname + parsed.search;
+    } catch {
+      return url;
+    }
+  }
+
+  private extractHost(url: string): string {
+    try {
+      const parsed = new URL(url);
+      return parsed.host;
+    } catch {
+      return 'unknown';
+    }
   }
 
   /**

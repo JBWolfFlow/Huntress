@@ -23,8 +23,9 @@ import type {
   CommandResult,
   ReactFinding,
 } from '../core/engine/react_loop';
-import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import { AGENT_TOOL_SCHEMAS, BROWSER_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const SSTI_SYSTEM_PROMPT = `You are an expert Server-Side Template Injection (SSTI) security researcher with deep knowledge of template engine internals, sandbox escape techniques, and exploitation chains across all major template engines. You specialize in detecting SSTI vulnerabilities that lead to remote code execution, configuration disclosure, and sensitive data exfiltration.
 
@@ -177,8 +178,8 @@ export class SSTIHunterAgent implements BaseAgent {
         model: this.model,
         systemPrompt: SSTI_SYSTEM_PROMPT,
         goal: `Test for Server-Side Template Injection vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
-        tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        tools: [...AGENT_TOOL_SCHEMAS, ...BROWSER_TOOL_SCHEMAS],
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -194,6 +195,11 @@ export class SSTIHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
+        browserEnabled: true,
       });
 
       const result = await loop.execute();
@@ -212,6 +218,7 @@ export class SSTIHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

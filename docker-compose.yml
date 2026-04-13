@@ -34,6 +34,33 @@ services:
       retries: 5
       start_period: 60s
 
+  attack-machine:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.attack-machine
+    image: huntress-attack-machine:latest
+    container_name: huntress-attack-machine
+    profiles:
+      - attack
+    environment:
+      - HUNTRESS_ALLOWED_DOMAINS=${HUNTRESS_ALLOWED_DOMAINS:-localhost}
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,noexec,nosuid
+      - /home/hunter:size=256m,noexec,nosuid
+      - /var/log/tinyproxy:size=16m,noexec,nosuid
+      - /etc/tinyproxy:size=1m,noexec,nosuid
+      - /var/run:size=8m,noexec,nosuid
+    mem_limit: 4g
+    cpus: 2.0
+    pids_limit: 100
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+
 volumes:
   qdrant_storage:
     driver: local

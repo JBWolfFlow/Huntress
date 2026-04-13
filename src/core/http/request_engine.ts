@@ -17,8 +17,12 @@
  */
 
 import axios from 'axios';
-import type { AxiosInstance, AxiosRequestConfig, AxiosResponse, InternalAxiosRequestConfig } from 'axios';
+import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
 import { invoke } from '@tauri-apps/api/core';
+import { StealthModule } from '../evasion/stealth';
+import type { StealthConfig } from '../evasion/stealth';
+import { RateController } from './rate_controller';
+import type { RateControllerConfig, DomainRateState } from './rate_controller';
 
 // ─── Environment Detection ──────────────────────────────────────────────────
 
@@ -67,10 +71,77 @@ export interface Cookie {
   sameSite?: 'Strict' | 'Lax' | 'None';
 }
 
+/** WAF detection result attached to HTTP responses */
+export interface WAFDetection {
+  detected: boolean;
+  provider: 'cloudflare' | 'akamai' | 'aws-waf' | 'generic' | 'none';
+  signal: string;
+}
+
+/** Known WAF response signatures */
+const WAF_SIGNATURES: Array<{ provider: WAFDetection['provider']; test: (status: number, headers: Record<string, string>, body: string) => string | null }> = [
+  {
+    provider: 'cloudflare',
+    test: (_status, headers, body) => {
+      if (headers['server']?.toLowerCase().includes('cloudflare')) return 'Server: cloudflare header';
+      if (headers['cf-ray']) return 'CF-Ray header present';
+      if (/cf-challenge|challenge-platform|turnstile/i.test(body)) return 'Cloudflare challenge page';
+      return null;
+    },
+  },
+  {
+    provider: 'akamai',
+    test: (_status, headers, body) => {
+      if (headers['server']?.toLowerCase().includes('akamaighost')) return 'Server: AkamaiGHost header';
+      if (/reference\s*#[\da-f.]+/i.test(body) && body.length < 2000) return 'Akamai reference block page';
+      return null;
+    },
+  },
+  {
+    provider: 'aws-waf',
+    test: (_status, headers) => {
+      if (headers['x-amzn-waf-action']) return 'x-amzn-waf-action header';
+      return null;
+    },
+  },
+  {
+    provider: 'generic',
+    test: (status, headers, body) => {
+      if (status === 429) return '429 Too Many Requests';
+      if (status === 403 && body.length < 2000 && /blocked|denied|forbidden.*request/i.test(body)) return 'Generic 403 block page';
+      const rateHeaders = ['x-ratelimit-remaining', 'x-rate-limit-remaining', 'ratelimit-remaining'];
+      for (const h of rateHeaders) {
+        const val = headers[h];
+        if (val !== undefined && parseInt(val, 10) === 0) return `${h}: 0`;
+      }
+      return null;
+    },
+  },
+];
+
+/** Detect WAF presence from an HTTP response */
+export function detectWAF(status: number, headers: Record<string, string>, body: string): WAFDetection {
+  for (const sig of WAF_SIGNATURES) {
+    const signal = sig.test(status, headers, body);
+    if (signal) {
+      return { detected: true, provider: sig.provider, signal };
+    }
+  }
+  return { detected: false, provider: 'none', signal: '' };
+}
+
 export interface HttpClientConfig {
   defaultHeaders?: Record<string, string>;
   maxRedirects?: number;
   defaultTimeoutMs?: number;
+  /** Stealth configuration. When provided, enables UA rotation, header normalization, and timing jitter. */
+  stealth?: StealthConfig & { enabled?: boolean };
+  /** Adaptive rate controller configuration. Replaces basic sliding-window rate limiting. */
+  rateControl?: Partial<RateControllerConfig>;
+  /** Whether to route requests through the Tauri proxy pool when in Tauri environment */
+  proxyEnabled?: boolean;
+  /** Callback invoked when WAF is detected on a response */
+  onWAFDetected?: (domain: string, waf: WAFDetection) => void;
 }
 
 interface RequestLogEntry {
@@ -192,6 +263,105 @@ class CookieJar {
   }
 }
 
+// ─── Cross-Origin Header Stripping (Q6 Gap 7) ───────────────────────────────
+
+/**
+ * Well-known sensitive headers that MUST be stripped on cross-origin redirect.
+ * Matches reqwest's default policy (0.11.20+) plus browsers' fetch behavior.
+ * @internal exported for tests
+ */
+export const WELL_KNOWN_AUTH_HEADERS: readonly string[] = [
+  'authorization',
+  'cookie',
+  'www-authenticate',
+  'proxy-authorization',
+];
+
+/**
+ * Patterns identifying custom auth headers. Matched case-insensitively against
+ * the header name. Covers the auth headers Huntress has observed in live hunts
+ * (Telegram Wallet's `wallet-authorization`, Slack's `xoxp` tokens in custom
+ * headers, API-gateway `x-api-key`, CSRF double-submit tokens).
+ *
+ * Pattern list is narrow on purpose — false positives here silently break
+ * legitimate requests. Each pattern below was added from an observed real-world
+ * auth header, not speculatively.
+ * @internal exported for tests
+ */
+const CUSTOM_AUTH_HEADER_PATTERNS: readonly RegExp[] = [
+  /-authorization$/i,           // wallet-authorization, x-wallet-authorization
+  /^(?:x-)?api-key$/i,           // X-API-Key, api-key
+  /^(?:x-)?(?:csrf|xsrf)-token$/i, // X-CSRF-Token, csrf-token, X-XSRF-Token
+  /^(?:x-)?session-token$/i,     // X-Session-Token
+  /^(?:x-)?access-token$/i,      // X-Access-Token
+  /^(?:x-)?auth-token$/i,        // X-Auth-Token
+  /wallet-device-serial/i,       // x-wallet-device-serial
+  /^x-.*-token$/i,               // catch-all: X-Foo-Token
+];
+
+/**
+ * Returns true when the header name is auth-sensitive and should be stripped
+ * on cross-origin redirects. Case-insensitive.
+ */
+export function isSensitiveAuthHeaderName(name: string): boolean {
+  const lower = name.toLowerCase();
+  if (WELL_KNOWN_AUTH_HEADERS.includes(lower)) return true;
+  return CUSTOM_AUTH_HEADER_PATTERNS.some(p => p.test(lower));
+}
+
+/**
+ * Returns the origin (scheme://host[:port]) of a URL, or null on parse error.
+ */
+export function getOrigin(url: string): string | null {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns true when `toUrl` has a different origin than `fromUrl`. A null
+ * origin (unparseable URL) is treated as cross-origin for safety.
+ */
+export function isCrossOrigin(fromUrl: string, toUrl: string): boolean {
+  const a = getOrigin(fromUrl);
+  const b = getOrigin(toUrl);
+  if (!a || !b) return true;
+  return a !== b;
+}
+
+/**
+ * Strip auth-sensitive headers from `headers` when `toUrl` is cross-origin
+ * from `fromUrl`. Returns a new object — never mutates the input. Stripped
+ * headers are returned alongside for audit logging.
+ *
+ * This is the core Q6 Gap 7 fix: reqwest auto-strips Authorization/Cookie on
+ * cross-origin but not custom headers like `wallet-authorization`. Running
+ * this guard in the TS redirect loop protects both the axios path and any
+ * Tauri path that loops through here.
+ */
+export function stripCrossOriginAuthHeaders(
+  headers: Record<string, string>,
+  fromUrl: string,
+  toUrl: string,
+): { headers: Record<string, string>; stripped: string[] } {
+  if (!isCrossOrigin(fromUrl, toUrl)) {
+    return { headers: { ...headers }, stripped: [] };
+  }
+  const next: Record<string, string> = {};
+  const stripped: string[] = [];
+  for (const [key, value] of Object.entries(headers)) {
+    if (isSensitiveAuthHeaderName(key)) {
+      stripped.push(key);
+      continue;
+    }
+    next[key] = value;
+  }
+  return { headers: next, stripped };
+}
+
 // ─── Scope Validator ─────────────────────────────────────────────────────────
 
 async function validateScope(url: string): Promise<boolean> {
@@ -243,6 +413,22 @@ export class HttpClient {
   private defaultTimeoutMs: number;
   private maxRedirects: number;
 
+  /** Stealth module for UA rotation, header normalization, and timing jitter */
+  private stealthModule: StealthModule | null = null;
+  private stealthEnabled: boolean;
+
+  /** Adaptive rate controller (replaces basic sliding-window for external use) */
+  private rateController: RateController;
+
+  /** Whether to route requests through Tauri proxy pool */
+  private proxyEnabled: boolean;
+
+  /** Callback for WAF detection events */
+  private onWAFDetected?: (domain: string, waf: WAFDetection) => void;
+
+  /** Last WAF detection per domain */
+  private wafStates: Map<string, WAFDetection> = new Map();
+
   /** Maximum response body size to store in the request log (100KB) */
   private static readonly LOG_BODY_MAX_BYTES = 100 * 1024;
 
@@ -250,6 +436,21 @@ export class HttpClient {
     this.defaultTimeoutMs = config?.defaultTimeoutMs ?? 30000;
     this.maxRedirects = config?.maxRedirects ?? 10;
     this.cookieJar = new CookieJar();
+
+    // Initialize stealth module
+    this.stealthEnabled = config?.stealth?.enabled ?? false;
+    if (this.stealthEnabled) {
+      this.stealthModule = new StealthModule(config?.stealth);
+    }
+
+    // Initialize adaptive rate controller
+    this.rateController = new RateController(config?.rateControl);
+
+    // Proxy configuration
+    this.proxyEnabled = config?.proxyEnabled ?? false;
+
+    // WAF detection callback
+    this.onWAFDetected = config?.onWAFDetected;
 
     // Build axios config — force Node.js http adapter when running in Node
     // (jsdom environment makes axios default to XHR which can't reach localhost)
@@ -270,7 +471,7 @@ export class HttpClient {
     this.axiosInstance = axios.create(axiosCreateConfig);
   }
 
-  /** Make an HTTP request with full scope/killswitch/ratelimit enforcement */
+  /** Make an HTTP request with full scope/killswitch/ratelimit/stealth enforcement */
   async request(options: HttpRequestOptions): Promise<HttpResponse> {
     // ── Kill switch check ──
     if (await isKillSwitchActive()) {
@@ -283,72 +484,165 @@ export class HttpClient {
       throw new Error(`Target ${hostname} is out of scope`);
     }
 
-    // ── Rate limiting ──
     const domain = new URL(options.url).hostname;
+
+    // ── Adaptive rate control (acquire permission to send) ──
+    await this.rateController.acquire(domain);
+
+    // ── Legacy rate limiting (kept for per-domain overrides set via setRateLimit) ──
     await this.enforceRateLimit(domain);
 
     // ── Check backoff ──
     await this.enforceBackoff(domain);
 
+    // ── Stealth: apply UA rotation, header normalization, jitter delay ──
+    let stealthOptions = options;
+    if (this.stealthEnabled && this.stealthModule) {
+      stealthOptions = this.stealthModule.applyToRequest(options);
+
+      // Apply timing jitter (random delay to avoid fingerprinting)
+      const jitterMs = this.stealthModule.getJitterDelay();
+      if (jitterMs > 0) {
+        await sleep(jitterMs);
+      }
+    }
+
     const startTime = performance.now();
 
     // ── Route through Tauri backend to bypass CORS ──
+    let response: HttpResponse;
     if (checkIsTauri()) {
-      return this.requestViaTauri(options, domain, startTime);
+      response = await this.requestViaTauri(stealthOptions, domain, startTime);
+    } else {
+      // ── Fallback: axios for Node.js/test environments ──
+      response = await this.requestViaAxios(stealthOptions, domain, startTime);
     }
 
-    // ── Fallback: axios for Node.js/test environments ──
-    return this.requestViaAxios(options, domain, startTime);
+    // ── Report response to adaptive rate controller ──
+    this.rateController.reportResponse(domain, response.status, response.headers, response.body);
+
+    // ── WAF detection ──
+    const waf = detectWAF(response.status, response.headers, response.body);
+    if (waf.detected) {
+      this.wafStates.set(domain, waf);
+      this.onWAFDetected?.(domain, waf);
+    }
+
+    return response;
   }
 
-  /** Execute HTTP request via Tauri IPC (bypasses browser CORS) */
+  /**
+   * Execute HTTP request via Tauri IPC (bypasses browser CORS).
+   *
+   * The Rust `proxy_http_request` command is always called with
+   * `followRedirects: false` — we handle redirects in this TS layer so that
+   * (a) scope is validated on every hop, and (b) custom auth headers like
+   * `wallet-authorization` are stripped on cross-origin hops (Q6 Gap 7).
+   * reqwest's built-in policy only strips the well-known set
+   * (Authorization/Cookie/WWW-Authenticate/Proxy-Authorization) — not enough
+   * for Telegram-class targets.
+   */
   private async requestViaTauri(
     options: HttpRequestOptions,
     domain: string,
     startTime: number,
   ): Promise<HttpResponse> {
-    const headers: Record<string, string> = {
+    let currentUrl = options.url;
+    let currentDomain = domain;
+    let hopHeaders: Record<string, string> = {
       ...this.authHeaders,
       ...options.headers,
     };
 
-    // Apply cookies from jar
     const cookieHeader = this.cookieJar.buildCookieHeader(domain);
-    if (cookieHeader && !headers['Cookie']) {
-      headers['Cookie'] = cookieHeader;
+    if (cookieHeader && !hopHeaders['Cookie']) {
+      hopHeaders['Cookie'] = cookieHeader;
+    }
+    if (options.contentType && !hopHeaders['Content-Type']) {
+      hopHeaders['Content-Type'] = options.contentType;
     }
 
-    if (options.contentType && !headers['Content-Type']) {
-      headers['Content-Type'] = options.contentType;
-    }
+    const redirectChain: Array<{ url: string; status: number }> = [];
+    const shouldFollowRedirects = options.followRedirects !== false;
+    const maxHops = this.maxRedirects;
 
-    const result = await invoke<{
+    let currentMethod = options.method;
+    let currentBody: string | null = options.body ?? null;
+
+    type ProxyResult = {
       status: number;
       statusText: string;
       headers: Record<string, string>;
       body: string;
       size: number;
       totalMs: number;
-    }>('proxy_http_request', {
-      url: options.url,
-      method: options.method,
-      headers,
-      body: options.body ?? null,
+    };
+
+    let result: ProxyResult = await invoke<ProxyResult>('proxy_http_request', {
+      url: currentUrl,
+      method: currentMethod,
+      headers: hopHeaders,
+      body: currentBody,
       timeoutMs: options.timeoutMs ?? this.defaultTimeoutMs,
-      followRedirects: options.followRedirects !== false,
+      followRedirects: false,
     });
 
-    const totalMs = performance.now() - startTime;
+    // Process cookies from the initial response
+    this.ingestSetCookieFromHeaders(result.headers, currentDomain);
 
-    // Parse Set-Cookie headers from response
-    const setCookie = result.headers['set-cookie'];
-    if (setCookie) {
-      for (const cookieStr of setCookie.split(/,(?=\s*\w+=)/)) {
-        this.cookieJar.parseAndStore(cookieStr.trim(), domain);
+    let hopCount = 0;
+    while (
+      shouldFollowRedirects &&
+      hopCount < maxHops &&
+      result.status >= 300 &&
+      result.status < 400 &&
+      (result.headers['location'] ?? result.headers['Location'])
+    ) {
+      redirectChain.push({ url: currentUrl, status: result.status });
+
+      const location = result.headers['location'] ?? result.headers['Location'];
+      const nextUrl = new URL(location, currentUrl).toString();
+
+      // Scope check per hop — an out-of-scope redirect stops the chain.
+      if (!(await validateScope(nextUrl))) {
+        break;
       }
+
+      // Cross-origin header strip. Affects custom auth (wallet-authorization,
+      // x-api-key) in addition to the well-known set.
+      const strip = stripCrossOriginAuthHeaders(hopHeaders, currentUrl, nextUrl);
+      hopHeaders = strip.headers;
+
+      // Per RFC 7231, 303 forces the next hop to GET with no body.
+      if (result.status === 303) {
+        currentMethod = 'GET';
+        currentBody = null;
+      }
+
+      currentUrl = nextUrl;
+      currentDomain = new URL(currentUrl).hostname;
+      hopCount++;
+
+      // Refresh jar cookies for the new domain. If Cookie was stripped above
+      // on cross-origin, let jar-resident cookies for the new domain take over.
+      if (!hopHeaders['Cookie'] && !hopHeaders['cookie']) {
+        const nextCookieHeader = this.cookieJar.buildCookieHeader(currentDomain);
+        if (nextCookieHeader) hopHeaders['Cookie'] = nextCookieHeader;
+      }
+
+      result = await invoke<ProxyResult>('proxy_http_request', {
+        url: currentUrl,
+        method: currentMethod,
+        headers: hopHeaders,
+        body: currentBody,
+        timeoutMs: options.timeoutMs ?? this.defaultTimeoutMs,
+        followRedirects: false,
+      });
+      this.ingestSetCookieFromHeaders(result.headers, currentDomain);
     }
 
-    const responseCookies = this.cookieJar.getCookies(domain);
+    const totalMs = performance.now() - startTime;
+    const responseCookies = this.cookieJar.getCookies(currentDomain);
 
     const httpResponse: HttpResponse = {
       status: result.status,
@@ -361,23 +655,35 @@ export class HttpClient {
         ttfbMs: result.totalMs,
         totalMs: Math.round(totalMs),
       },
-      redirectChain: [],
+      redirectChain,
       cookies: responseCookies,
       size: result.size,
     };
 
     // ── Handle 429 backoff ──
     if (result.status === 429) {
-      this.handleRateLimitResponse429(domain, result.headers);
+      this.handleRateLimitResponse429(currentDomain, result.headers);
     }
 
     // ── Record in request log ──
     this.recordRequest(options, httpResponse);
 
     // ── Track rate limit ──
-    this.trackRequest(domain);
+    this.trackRequest(currentDomain);
 
     return httpResponse;
+  }
+
+  /** Parse one or more Set-Cookie headers from a Tauri-proxied response. */
+  private ingestSetCookieFromHeaders(
+    headers: Record<string, string>,
+    domain: string,
+  ): void {
+    const setCookie = headers['set-cookie'] ?? headers['Set-Cookie'];
+    if (!setCookie) return;
+    for (const cookieStr of setCookie.split(/,(?=\s*\w+=)/)) {
+      this.cookieJar.parseAndStore(cookieStr.trim(), domain);
+    }
   }
 
   /** Handle 429 from Tauri-proxied response */
@@ -465,7 +771,15 @@ export class HttpClient {
     // Process cookies from initial response
     this.processCookies(response, currentUrl);
 
-    // Follow redirects manually
+    // Follow redirects manually — TS-layer loop enforces scope and strips
+    // auth headers on cross-origin hops (Q6 Gap 7). The axios instance is
+    // configured with maxRedirects: 0 so it never follows on its own.
+    //
+    // hopHeaders tracks the headers we intend to send on the NEXT request.
+    // It starts as the caller's headers and gets pruned on cross-origin.
+    let hopHeaders: Record<string, string> = { ...headers };
+    let hopFromUrl = currentUrl;
+
     while (
       shouldFollowRedirects &&
       redirectCount < maxRedirects &&
@@ -476,18 +790,41 @@ export class HttpClient {
       redirectChain.push({ url: currentUrl, status: response.status });
 
       const location = response.headers['location'];
-      // Resolve relative URLs
-      currentUrl = new URL(location, currentUrl).toString();
+      // Resolve relative URLs against the current hop's URL
+      const nextUrl = new URL(location, currentUrl).toString();
 
-      // Validate redirect target is in scope
-      if (!(await validateScope(currentUrl))) {
-        break; // Stop following — out of scope
+      // Validate redirect target is in scope BEFORE following. An out-of-scope
+      // redirect stops the chain — the 3xx response is returned as-is so the
+      // caller can inspect the Location header without the request ever
+      // touching the out-of-scope host.
+      if (!(await validateScope(nextUrl))) {
+        break;
       }
 
+      // Strip auth-sensitive headers on cross-origin hops (Q6 Gap 7).
+      // reqwest auto-strips Authorization/Cookie but not custom auth headers
+      // like `wallet-authorization` — so we do it here, for every hop, to
+      // cover both the axios path and any future Tauri-proxied hops.
+      const strip = stripCrossOriginAuthHeaders(hopHeaders, hopFromUrl, nextUrl);
+      hopHeaders = strip.headers;
+
+      currentUrl = nextUrl;
+      hopFromUrl = nextUrl;
       redirectCount++;
+
+      // Also re-compute cookie jar contribution for the new domain —
+      // the prior Cookie header (if any) was stripped above on cross-origin,
+      // but jar-resident cookies for the new domain should still be attached.
+      const nextDomain = new URL(currentUrl).hostname;
+      const nextCookieHeader = this.cookieJar.buildCookieHeader(nextDomain);
+      if (nextCookieHeader && !hopHeaders['Cookie'] && !hopHeaders['cookie']) {
+        hopHeaders['Cookie'] = nextCookieHeader;
+      }
+
       response = await this.axiosInstance.request({
         ...axiosConfig,
         url: currentUrl,
+        headers: hopHeaders,
         method: response.status === 303 ? 'get' : axiosConfig.method,
         data: response.status === 303 ? undefined : axiosConfig.data,
       });
@@ -594,6 +931,62 @@ export class HttpClient {
 
   clearRequestLog(): void {
     this.requestLog = [];
+  }
+
+  // ─── Stealth Control ──────────────────────────────────────────────────────
+
+  /** Enable or disable stealth mode at runtime */
+  setStealthEnabled(enabled: boolean): void {
+    this.stealthEnabled = enabled;
+    if (enabled && !this.stealthModule) {
+      this.stealthModule = new StealthModule();
+    }
+  }
+
+  /** Check if stealth mode is currently enabled */
+  isStealthEnabled(): boolean {
+    return this.stealthEnabled;
+  }
+
+  // ─── Proxy Control ────────────────────────────────────────────────────────
+
+  /** Enable or disable proxy routing at runtime */
+  setProxyEnabled(enabled: boolean): void {
+    this.proxyEnabled = enabled;
+  }
+
+  /** Check if proxy routing is currently enabled */
+  isProxyEnabled(): boolean {
+    return this.proxyEnabled;
+  }
+
+  // ─── WAF Detection ────────────────────────────────────────────────────────
+
+  /** Get the last WAF detection result for a domain */
+  getWAFState(domain: string): WAFDetection | undefined {
+    return this.wafStates.get(domain);
+  }
+
+  /** Get all domains with detected WAFs */
+  getAllWAFStates(): Map<string, WAFDetection> {
+    return new Map(this.wafStates);
+  }
+
+  // ─── Adaptive Rate Controller ─────────────────────────────────────────────
+
+  /** Get the underlying rate controller for direct access */
+  getRateController(): RateController {
+    return this.rateController;
+  }
+
+  /** Check if a domain is currently banned/cooling down */
+  isDomainBanned(domain: string): boolean {
+    return this.rateController.isBanned(domain);
+  }
+
+  /** Get rate state for a domain */
+  getDomainRateState(domain: string): DomainRateState {
+    return this.rateController.getState(domain);
   }
 
   // ─── Private Helpers ───────────────────────────────────────────────────────

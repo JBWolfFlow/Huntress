@@ -26,6 +26,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const SUBDOMAIN_TAKEOVER_SYSTEM_PROMPT = `You are an expert subdomain takeover security researcher with deep knowledge of DNS resolution, cloud provider hosting configurations, and the mechanics of dangling DNS records. You specialize in finding subdomain takeover vulnerabilities where a DNS record points to an external service that has been deprovisioned, allowing an attacker to claim the subdomain by registering the abandoned resource.
 
@@ -228,7 +229,7 @@ export class SubdomainTakeoverHunterAgent implements BaseAgent {
         systemPrompt: SUBDOMAIN_TAKEOVER_SYSTEM_PROMPT,
         goal: `Test for subdomain takeover vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -244,6 +245,10 @@ export class SubdomainTakeoverHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -262,6 +267,7 @@ export class SubdomainTakeoverHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

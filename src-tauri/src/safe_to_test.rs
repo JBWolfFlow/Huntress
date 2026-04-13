@@ -535,11 +535,9 @@ impl ScopeValidator {
         let domain = Self::extract_domain(target);
 
         // Check if target is an IP address — use CIDR/range validation
-        if domain.parse::<IpAddr>().is_ok() {
-            if self.is_ip_in_scope(&domain) {
-                return true;
-            }
-            // Fall through to domain pattern matching (IPs can also match domain patterns)
+        if domain.parse::<IpAddr>().is_ok() && self.is_ip_in_scope(&domain) {
+            return true;
+            // Otherwise fall through to domain pattern matching (IPs can also match domain patterns)
         }
 
         // Default deny for empty scope (no domain patterns and no CIDR/range)

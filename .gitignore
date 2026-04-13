@@ -117,3 +117,13 @@ Thumbs.db
 
 # Kill switch state
 config/kill_switch.lock
+
+# Claude Code / MCP local state (personal, should not be shared)
+.claude/
+.playwright-mcp/
+
+# Hunt-specific local artifacts
+src-tauri/huntress_knowledge.db
+
+# Cargo registry (downloaded crate sources — local cache only)
+src-tauri/.cargo/registry/

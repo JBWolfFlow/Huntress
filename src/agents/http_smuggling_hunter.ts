@@ -25,6 +25,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const HTTP_SMUGGLING_SYSTEM_PROMPT = `You are an elite HTTP request smuggling researcher. Your mission is to detect request smuggling vulnerabilities — one of the highest-impact, highest-bounty vulnerability classes in web security ($200K+ payouts documented).
 
@@ -217,7 +218,7 @@ export class HttpSmugglingHunterAgent implements BaseAgent {
           `Scope: ${task.scope.join(', ')}\n\n${task.description}\n\n` +
           `Start by fingerprinting the CDN/proxy infrastructure, then test CL.TE, TE.CL, and TE.TE variants.`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -233,6 +234,10 @@ export class HttpSmugglingHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -250,6 +255,7 @@ export class HttpSmugglingHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

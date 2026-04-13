@@ -55,19 +55,22 @@ import {
 } from '../../agents/agent_catalog';
 // Side-effect import: triggers all agent self-registration with the catalog
 import '../../agents/standardized_agents';
-import type { AgentResult, AgentFinding, AgentTask } from '../../agents/base_agent';
+import type { AgentResult, AgentFinding, AgentTask, SharedFinding, WafContext } from '../../agents/base_agent';
 import { ORCHESTRATOR_TOOL_SCHEMAS } from '../engine/tool_schemas';
 import { ModelAlloy, createAlloy } from '../engine/model_alloy';
 import type { AlloyConfig } from '../engine/model_alloy';
 import type { ProgramGuidelines } from '../../components/GuidelinesImporter';
 import { Blackboard, postObservation, postFinding as postBBFinding } from './blackboard';
-import { setValidatorOOBServer, shutdownValidationBrowser } from '../validation/validator';
+import { setValidatorOOBServer, shutdownValidationBrowser, validateFinding } from '../validation/validator';
+import type { ValidationResult, ValidatorConfig } from '../validation/validator';
+import type { ReactFinding } from '../engine/react_loop';
+import type { DuplicateCheckResult } from '../../agents/base_agent';
 import { OOBServer } from '../validation/oob_server';
 import type { OOBCallback } from '../validation/oob_server';
 import { FeedbackLoop } from '../training/feedback_loop';
 import type { SubmittedReport, FeedbackStats } from '../training/feedback_loop';
 import { deduplicateFindings } from './finding_dedup';
-import { createSandboxedExecutor } from '../tools/sandbox_executor';
+import { createSandboxedExecutor, SandboxExecutor } from '../tools/sandbox_executor';
 import type { KnowledgeGraph, HuntResult } from '../knowledge/knowledge_graph';
 import { SASTAnalyzer } from '../sast/sast_analyzer';
 import type { SourceFile, SASTReport } from '../sast/sast_analyzer';
@@ -75,6 +78,7 @@ import type { VulnDatabase } from '../knowledge/vuln_database';
 import type { RewardSystem, ShortcutCheckInput } from '../training/reward_system';
 import type { HttpClient } from '../http/request_engine';
 import type { SessionManager } from '../auth/session_manager';
+import { buildSessionEnv } from '../auth/session_env';
 import type { HuntMemory } from '../memory/hunt_memory';
 import type { NucleiRunner } from '../discovery/nuclei_runner';
 import type { WAFDetector, WAFDetectionResult } from '../evasion/waf_detector';
@@ -237,6 +241,8 @@ export interface OrchestratorConfig {
   availableTools?: string[];
   /** Callback to check current session budget status (wired from TracedModelProvider) */
   getBudgetStatus?: () => BudgetStatus;
+  /** Callback to update session budget limit (wired from TracedModelProvider) */
+  setBudgetLimit?: (newLimitUsd: number) => void;
   /** Session budget limit in USD */
   budgetLimitUsd?: number;
 }
@@ -280,6 +286,144 @@ interface HuntSession {
   running: boolean;
   /** Abort signal */
   aborted: boolean;
+  /** Dead-letter queue: tasks that failed after retry exhaustion */
+  failedTasks: Array<{ taskId: string; agentType: string; error: string; attempts: number; timestamp: number }>;
+}
+
+// ─── Agent Retry Helpers ──────────────────────────────────────────────────────
+
+/** Permanent error patterns that should not be retried */
+const PERMANENT_ERROR_PATTERNS = [
+  'invalid_api_key',
+  'authentication_error',
+  'insufficient_quota',
+  'credit balance is too low',
+  'No agent found for type',
+  'usage limits',
+  'monthly spend limit',
+  'billing limit',
+  'account_spending_limit_reached',
+  '401',
+  '403',
+];
+
+/** Error patterns that indicate the ENTIRE API account is blocked (not per-request) */
+const API_LIMIT_PATTERNS = [
+  'You have reached your specified API usage limits',
+  'monthly spend limit',
+  'billing limit',
+  'account_spending_limit_reached',
+  'insufficient_quota',
+  'credit balance is too low',
+];
+
+/**
+ * Check if an error message indicates a global API account limit (not a transient rate limit).
+ */
+export function isApiLimitError(errMsg: string): boolean {
+  return API_LIMIT_PATTERNS.some(pat => errMsg.includes(pat));
+}
+
+/**
+ * Classify an error as transient (retryable) or permanent.
+ * Transient: network errors, rate limits (429), server errors (5xx).
+ * Permanent: auth failures (401, 403), credit exhaustion, missing agents.
+ */
+export function isTransientError(errMsg: string): boolean {
+  return !PERMANENT_ERROR_PATTERNS.some(pat => errMsg.includes(pat));
+}
+
+// ─── Evidence Normalization ─────────────────────────────────────────────────
+
+/**
+ * Normalize evidence from agent findings into a guaranteed string[].
+ * Agents are LLMs and may return evidence as a string, object, undefined,
+ * or an actual array. This must be called at the pipeline boundary before
+ * any array methods (.join, .map, .forEach, for..of) are used on evidence.
+ */
+export function normalizeEvidence(evidence: unknown): string[] {
+  if (Array.isArray(evidence)) {
+    // Filter out non-string elements and stringify them
+    return evidence.map(item =>
+      typeof item === 'string' ? item : JSON.stringify(item)
+    );
+  }
+  if (typeof evidence === 'string') {
+    return [evidence];
+  }
+  if (evidence === undefined || evidence === null) {
+    return [];
+  }
+  // Object, number, boolean, etc.
+  return [JSON.stringify(evidence)];
+}
+
+// ─── Finding Validation Helpers ──────────────────────────────────────────────
+
+/**
+ * Convert an AgentFinding to a ReactFinding for the validation engine.
+ * The validator was built against the ReAct loop's finding type, so we
+ * bridge at the orchestrator boundary.
+ */
+export function agentFindingToReactFinding(finding: AgentFinding): ReactFinding {
+  return {
+    id: finding.id,
+    title: finding.title,
+    vulnerabilityType: finding.type ?? 'unknown',
+    severity: finding.severity,
+    target: finding.target,
+    description: finding.description,
+    evidence: finding.evidence,
+    reproductionSteps: finding.reproduction,
+    impact: finding.description,
+    confidence: 50, // Default for agent findings without explicit confidence
+    discoveredAtIteration: 0,
+    agentId: finding.agentId,
+  };
+}
+
+/**
+ * Map a ValidationResult back onto the finding's validation fields.
+ */
+export function applyValidationResult(
+  finding: AgentFinding,
+  result: ValidationResult
+): void {
+  if (result.error && !result.confirmed) {
+    finding.validationStatus = 'validation_failed';
+  } else if (result.confirmed) {
+    finding.validationStatus = 'confirmed';
+  } else {
+    finding.validationStatus = 'unverified';
+  }
+  finding.validationEvidence = result.evidence;
+  finding.validationConfidence = result.confidence;
+}
+
+/**
+ * Map a DuplicateScore into a DuplicateCheckResult for display.
+ */
+export function buildDuplicateCheckResult(
+  dupScore: import('../../utils/duplicate_checker').DuplicateScore
+): DuplicateCheckResult {
+  let status: DuplicateCheckResult['status'];
+  if (dupScore.recommendation === 'skip') {
+    status = 'likely_duplicate';
+  } else if (dupScore.recommendation === 'review') {
+    status = 'possible_duplicate';
+  } else {
+    status = 'unique';
+  }
+  return {
+    status,
+    score: dupScore,
+    topMatches: dupScore.matches.slice(0, 3).map(m => ({
+      source: m.source,
+      title: m.title,
+      url: m.url,
+      similarity: m.similarity,
+    })),
+  };
 }
 
 // ─── Orchestrator Engine ──────────────────────────────────────────────────────
@@ -300,14 +444,27 @@ export class OrchestratorEngine {
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
   /** Callback to check current session budget — wired from TracedModelProvider */
   private getBudgetStatus?: () => BudgetStatus;
+  private setBudgetLimit?: (newLimitUsd: number) => void;
   /** Session budget limit in USD */
   private budgetLimitUsd: number;
   /** Whether budget soft-stop has been triggered (90% threshold) */
   private budgetSoftStopped = false;
+  private dispatchLoopRunning = false;
 
   /** Circuit breaker: tracks recent agent error messages to detect fatal patterns */
   private recentAgentErrors: string[] = [];
   private static readonly CIRCUIT_BREAKER_THRESHOLD = 5;
+  /** Sliding window: consecutive successes needed to reset circuit breaker */
+  private consecutiveSuccesses = 0;
+  private static readonly CIRCUIT_BREAKER_RESET_THRESHOLD = 5;
+  /** Global flag: set when the API account hits a usage/spending limit.
+   *  Prevents all subsequent agent dispatches until the user resumes. */
+  private apiLimitReached = false;
+
+  /** Max retries for transient agent failures */
+  private static readonly MAX_AGENT_RETRIES = 3;
+  /** Base delay (ms) for exponential backoff on agent retry */
+  private static readonly RETRY_BASE_DELAY_MS = 2000;
 
   /** Cross-agent shared memory board */
   private blackboard: Blackboard;
@@ -370,6 +527,7 @@ export class OrchestratorEngine {
     this.onApprovalRequest = config.onApprovalRequest;
     this.onExecuteCommand = config.onExecuteCommand;
     this.getBudgetStatus = config.getBudgetStatus;
+    this.setBudgetLimit = config.setBudgetLimit;
     this.budgetLimitUsd = config.budgetLimitUsd ?? 15;
     this.alloyConfig = config.alloy;
 
@@ -546,8 +704,9 @@ export class OrchestratorEngine {
     const contextMessages = this.conversation.getMessagesForModel();
 
     try {
-      // Use native tool use when the provider supports it and a hunt is active
-      const useTools = this.provider.supportsToolUse && this.huntSession?.running;
+      // Enable tool use whenever a program is loaded (guidelines exist).
+      // If no hunt session exists yet, dispatch_agent will auto-create one.
+      const useTools = this.provider.supportsToolUse && !!(this.huntSession || this.guidelines);
 
       const options: SendMessageOptions = {
         model: this.model,
@@ -813,14 +972,46 @@ Return ONLY the JSON, no other text.`;
    * 5. Ask the coordinator model what to do next (via native tool use)
    * 6. Repeat until the task queue is empty or the model calls stop_hunting
    */
-  async startHunt(program: ProgramGuidelines): Promise<void> {
-    // Normalize and deduplicate scope entries before processing
-    program.scope.inScope = normalizeScopeEntries(program.scope.inScope);
+  /**
+   * I4: Return the active hunt's guidelines (program + scope) or null if
+   * no hunt is running. Used by the UI to reopen the auth wizard mid-hunt
+   * with the correct scope.
+   */
+  getActiveProgram(): ProgramGuidelines | null {
+    return this.huntSession?.program ?? null;
+  }
 
+  /**
+   * I4: Trigger a reprioritization of queued tasks — called after new
+   * auth sessions are attached so agents that benefit from auth get
+   * bumped up. Safe no-op if no hunt is active.
+   */
+  reprioritizeForAuth(): void {
+    if (!this.huntSession) return;
+    this.huntSession.taskQueue.reprioritize(this.huntSession.allFindings);
+    this.emitSystemMessage(
+      'Auth attached mid-hunt. Queued agents will pick up the new session on next dispatch.',
+      'info'
+    );
+  }
+
+  /**
+   * Initialize a hunt session without starting the dispatch loop.
+   * Used when agents are dispatched from chat before a strategy is selected.
+   */
+  async initializeHuntSession(program: ProgramGuidelines): Promise<void> {
+    if (this.huntSession) return; // Already initialized
+
+    // I5: Reap orphan containers from prior crashed hunts before starting.
+    // Fire-and-forget — failure here must not block hunt init.
+    SandboxExecutor.reapOrphans().catch((err) => {
+      console.warn('[orchestrator] Orphan reap failed (non-fatal):', err);
+    });
+
+    program.scope.inScope = normalizeScopeEntries(program.scope.inScope);
     this.loadGuidelines(program);
     this.setPhase('hunting');
 
-    // Initialize the hunt session
     const taskQueue = new TaskQueue();
     this.huntSession = {
       program,
@@ -832,7 +1023,66 @@ Return ONLY the JSON, no other text.`;
       completedDispatches: 0,
       running: true,
       aborted: false,
+      failedTasks: [],
     };
+
+    // Score targets
+    const targetMetadata: TargetMetadata[] = program.scope.inScope.map(target => ({
+      target,
+      historicalPayouts: {
+        min: program.bountyRange.min,
+        max: program.bountyRange.max,
+        average: Math.round((program.bountyRange.min + program.bountyRange.max) / 2),
+      },
+    }));
+    this.huntSession.targetScores = rankTargets(targetMetadata);
+
+    this.emitOrchestratorMessage(
+      `Hunt initialized for **${program.programName}**.\n\n` +
+      `Scored ${this.huntSession.targetScores.length} targets. ` +
+      `Top target: ${this.huntSession.targetScores[0]?.target ?? 'none'} ` +
+      `(score: ${this.huntSession.targetScores[0]?.totalScore ?? 0}/100)`
+    );
+
+    // Start OOB server for blind vulnerability detection
+    if (this.onExecuteCommand) {
+      try {
+        this.oobServer = new OOBServer({
+          executeCommand: this.onExecuteCommand,
+          onInteraction: (callback: OOBCallback) => {
+            this.emitSystemMessage(
+              `OOB callback triggered: ${callback.id} (${callback.interaction?.protocol ?? 'unknown'} from ${callback.interaction?.sourceIp ?? 'unknown'})`,
+              'success'
+            );
+            postBBFinding(this.blackboard, 'oob_server', 'oob_callback', {
+              callbackId: callback.id,
+              protocol: callback.interaction?.protocol,
+              sourceIp: callback.interaction?.sourceIp,
+              injectionPoint: callback.injectionPoint,
+            }, ['ssrf', 'ssti', 'sqli', 'xss']);
+          },
+        });
+        const oobBaseUrl = await this.oobServer.start();
+        this.emitSystemMessage(`OOB server started: ${oobBaseUrl}`, 'info');
+      } catch (error) {
+        this.emitSystemMessage(
+          `OOB server failed to start: ${error instanceof Error ? error.message : String(error)}`,
+          'warning'
+        );
+        this.oobServer = undefined;
+      }
+    }
+
+    setValidatorOOBServer(this.oobServer);
+    this.feedbackLoop.startPolling();
+  }
+
+  async startHunt(program: ProgramGuidelines): Promise<void> {
+    // Initialize session if not already done
+    await this.initializeHuntSession(program);
+    if (!this.huntSession) return;
+
+    const { taskQueue } = this.huntSession;
 
     // ── Tool Availability Check ──
     // Verify which external tools are installed before dispatching agents
@@ -885,25 +1135,7 @@ Return ONLY the JSON, no other text.`;
       this.continuousMonitor.start();
     }
 
-    // ── Step 1: Score and rank targets ──
-    const targetMetadata: TargetMetadata[] = program.scope.inScope.map(target => ({
-      target,
-      historicalPayouts: {
-        min: program.bountyRange.min,
-        max: program.bountyRange.max,
-        average: Math.round((program.bountyRange.min + program.bountyRange.max) / 2),
-      },
-    }));
-    this.huntSession.targetScores = rankTargets(targetMetadata);
-
-    this.emitOrchestratorMessage(
-      `Hunt initialized for **${program.programName}**.\n\n` +
-      `Scored ${this.huntSession.targetScores.length} targets. ` +
-      `Top target: ${this.huntSession.targetScores[0]?.target ?? 'none'} ` +
-      `(score: ${this.huntSession.targetScores[0]?.totalScore ?? 0}/100)`
-    );
-
-    // ── Step 2: Create initial recon tasks for top-priority targets ──
+    // ── Create initial recon tasks for top-priority targets ──
     const topTargets = this.huntSession.targetScores.slice(0, Math.min(5, this.huntSession.targetScores.length));
 
     for (const scored of topTargets) {
@@ -918,42 +1150,6 @@ Return ONLY the JSON, no other text.`;
         tags: ['recon', 'initial'],
       });
     }
-
-    // ── Step 3: Start OOB server for blind vulnerability detection ──
-    if (this.onExecuteCommand) {
-      try {
-        this.oobServer = new OOBServer({
-          executeCommand: this.onExecuteCommand,
-          onInteraction: (callback: OOBCallback) => {
-            this.emitSystemMessage(
-              `OOB callback triggered: ${callback.id} (${callback.interaction?.protocol ?? 'unknown'} from ${callback.interaction?.sourceIp ?? 'unknown'})`,
-              'success'
-            );
-            // Post the OOB interaction to the blackboard for agents to consume
-            postBBFinding(this.blackboard, 'oob_server', 'oob_callback', {
-              callbackId: callback.id,
-              protocol: callback.interaction?.protocol,
-              sourceIp: callback.interaction?.sourceIp,
-              injectionPoint: callback.injectionPoint,
-            }, ['ssrf', 'ssti', 'sqli', 'xss']);
-          },
-        });
-        const oobBaseUrl = await this.oobServer.start();
-        this.emitSystemMessage(`OOB server started: ${oobBaseUrl}`, 'info');
-      } catch (error) {
-        this.emitSystemMessage(
-          `OOB server failed to start (blind vuln detection unavailable): ${error instanceof Error ? error.message : String(error)}`,
-          'warning'
-        );
-        this.oobServer = undefined;
-      }
-    }
-
-    // Wire OOB server into the validation engine
-    setValidatorOOBServer(this.oobServer);
-
-    // Start feedback loop polling for H1 report status updates
-    this.feedbackLoop.startPolling();
 
     // Emit alloy status if active
     if (this.alloyInstance && this.alloyConfig?.enabled) {
@@ -995,6 +1191,17 @@ Return ONLY the JSON, no other text.`;
       return undefined;
     }
 
+    // S5: Guard against tasks with undefined/empty targets
+    if (!task.target) {
+      this.emitSystemMessage(
+        `Skipping dispatch for ${task.agentType} (task ${taskId}): target is undefined. ` +
+        `Origin: ${task.origin}, description: ${task.description.substring(0, 100)}`,
+        'warning'
+      );
+      this.huntSession.taskQueue.fail(taskId, 'Task has no target — skipped dispatch');
+      return undefined;
+    }
+
     // Emit agent status to the chat
     const agentMsg: ConversationMessage = {
       type: 'agent',
@@ -1010,9 +1217,20 @@ Return ONLY the JSON, no other text.`;
 
     this.huntSession.activeAgents++;
 
-    // Create a sandboxed executor for this agent (falls back to PTY if Docker unavailable)
+    // Create a sandboxed executor for this agent (falls back to PTY if Docker unavailable).
+    // Thread active session auth through as env vars + ~/.curlrc so shell-tool
+    // invocations (curl, ffuf, nuclei, sqlmap) inherit the session without the
+    // LLM needing to paste tokens into commands. (Phase 1 / Q1)
     const scope = this.guidelines?.scope.inScope ?? [task.target];
-    const sandboxedExec = await createSandboxedExecutor(scope, this.onExecuteCommand);
+    const activeSession = this.sessionManager?.listSessions()[0];
+    const sessionEnv = buildSessionEnv(activeSession);
+    const sandboxedExec = await createSandboxedExecutor(
+      scope,
+      this.onExecuteCommand,
+      activeSession
+        ? { envVars: sessionEnv.envVars, curlrc: sessionEnv.curlrcContent }
+        : undefined,
+    );
 
     if (sandboxedExec.usingSandbox) {
       this.emitSystemMessage(`Agent ${task.agentType}: using Docker sandbox`, 'info');
@@ -1050,7 +1268,6 @@ Return ONLY the JSON, no other text.`;
         const agentTask = await this.huntTaskToAgentTask(task);
         const result = await agent.execute(agentTask);
         await agent.cleanup();
-        await sandboxedExec.cleanup();
         return this.handleAgentResult(task, result);
       }
 
@@ -1071,12 +1288,9 @@ Return ONLY the JSON, no other text.`;
       const agentTask = await this.huntTaskToAgentTask(task);
       const result = await agent.execute(agentTask);
       await agent.cleanup();
-      await sandboxedExec.cleanup();
 
       return this.handleAgentResult(task, result);
     } catch (error) {
-      // Clean up sandbox even on error
-      await sandboxedExec.cleanup();
       const errMsg = error instanceof Error ? error.message : String(error);
       this.huntSession.taskQueue.fail(taskId, errMsg);
       this.huntSession.activeAgents--;
@@ -1098,6 +1312,93 @@ Return ONLY the JSON, no other text.`;
       this.emitMessage(failMsg);
 
       return undefined;
+    } finally {
+      // I5: Guarantee sandbox cleanup on every exit path — success, error, or
+      // unexpected throw. cleanup() is idempotent (SandboxExecutor.destroy
+      // short-circuits when already destroyed).
+      await sandboxedExec.cleanup().catch((err) => {
+        console.warn('[dispatchAgent] sandbox cleanup warning:', err);
+      });
+    }
+  }
+
+  /** Delegate to the exported helper */
+  private isTransientError(errMsg: string): boolean {
+    return isTransientError(errMsg);
+  }
+
+  /**
+   * Dispatch an agent with retry for transient failures.
+   * Retries up to MAX_AGENT_RETRIES times with exponential backoff.
+   * On permanent failure or retry exhaustion, adds to dead-letter queue.
+   */
+  private async dispatchWithRetry(taskId: string, agentType: string): Promise<void> {
+    // H25: Check global API limit flag before dispatching
+    if (this.apiLimitReached) {
+      this.emitSystemMessage(
+        `Skipping ${agentType} dispatch — API usage limit reached. Resume hunt when limit resets.`,
+        'warning'
+      );
+      return;
+    }
+
+    let lastError = '';
+    for (let attempt = 0; attempt <= OrchestratorEngine.MAX_AGENT_RETRIES; attempt++) {
+      try {
+        await this.dispatchAgent(taskId);
+        return; // Success — no retry needed
+      } catch (err: unknown) {
+        lastError = err instanceof Error ? err.message : String(err);
+
+        // H25: Detect API account-level limit on first occurrence
+        if (isApiLimitError(lastError)) {
+          this.apiLimitReached = true;
+          if (this.huntSession) {
+            this.huntSession.running = false;
+          }
+          this.emitSystemMessage(
+            `**API usage limit reached.** Hunt paused — all agent dispatches blocked.\n\n` +
+            `Error: ${lastError.substring(0, 300)}\n\n` +
+            `To resume: wait for the limit to reset, use a different API key, or increase your spending limit.`,
+            'error'
+          );
+          return; // Don't retry — the entire account is blocked
+        }
+
+        // Don't retry permanent failures
+        if (!this.isTransientError(lastError)) {
+          break;
+        }
+
+        // Don't retry if this was the last attempt
+        if (attempt === OrchestratorEngine.MAX_AGENT_RETRIES) {
+          break;
+        }
+
+        // Exponential backoff: 2s, 4s, 8s
+        const delay = OrchestratorEngine.RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        this.emitSystemMessage(
+          `Agent ${agentType} failed (attempt ${attempt + 1}/${OrchestratorEngine.MAX_AGENT_RETRIES + 1}): ` +
+          `${lastError.substring(0, 100)}. Retrying in ${delay / 1000}s...`,
+          'warning'
+        );
+        await this.sleep(delay);
+      }
+    }
+
+    // All retries exhausted or permanent failure — add to dead-letter queue
+    if (this.huntSession) {
+      this.huntSession.failedTasks.push({
+        taskId,
+        agentType,
+        error: lastError,
+        attempts: OrchestratorEngine.MAX_AGENT_RETRIES + 1,
+        timestamp: Date.now(),
+      });
+      this.emitSystemMessage(
+        `Agent ${agentType} permanently failed after retries. Added to dead-letter queue. Error: ${lastError.substring(0, 200)}`,
+        'error'
+      );
     }
   }
 
@@ -1137,6 +1438,7 @@ Return ONLY the JSON, no other text.`;
         agent: 'sast-analyzer',
         evidence: [`${finding.filePath}:${finding.line}: ${finding.vulnerableCode}`],
         isDuplicate: false,
+        validationStatus: 'confirmed', // SAST findings are code-level, confirmed by analysis
       });
     }
 
@@ -1238,6 +1540,7 @@ Return ONLY the JSON, no other text.`;
         completedDispatches: snapshot.completedDispatches ?? 0,
         running: false,
         aborted: false,
+        failedTasks: snapshot.failedTasks ?? [],
       };
 
       this.loadGuidelines(snapshot.program);
@@ -1280,6 +1583,8 @@ Return ONLY the JSON, no other text.`;
    */
   private async runDispatchLoop(): Promise<void> {
     if (!this.huntSession) return;
+    if (this.dispatchLoopRunning) return; // Prevent concurrent loops
+    this.dispatchLoopRunning = true;
     const { taskQueue } = this.huntSession;
 
     while (this.huntSession.running && !this.huntSession.aborted) {
@@ -1329,36 +1634,64 @@ Return ONLY the JSON, no other text.`;
         }
       }
 
-      // Check if there are tasks to run
-      if (!taskQueue.hasRunnableTasks() && this.huntSession.activeAgents === 0) {
-        // No more tasks and no agents running — ask the coordinator if we should continue
-        const shouldContinue = await this.askCoordinatorForNextSteps();
-        if (!shouldContinue) break;
-        // If the coordinator added new tasks, continue the loop
-        if (!taskQueue.hasRunnableTasks()) break;
-      }
-
-      // Dequeue a batch for parallel execution
+      // Wait for running agents if all slots occupied
       const availableSlots = this.maxConcurrentAgents - this.huntSession.activeAgents;
       if (availableSlots <= 0) {
-        // All slots occupied — wait briefly and retry
         await this.sleep(1000);
         continue;
       }
 
-      const batch = taskQueue.dequeueBatch(availableSlots);
-      if (batch.length === 0) {
-        // Nothing runnable right now (dependencies pending)
-        if (this.huntSession.activeAgents > 0) {
-          await this.sleep(1000);
-          continue;
-        }
+      // H25: Check global API limit — stop dispatching immediately
+      if (this.apiLimitReached) {
+        this.emitSystemMessage('Hunt paused: API usage limit reached. No new agents will be dispatched.', 'warning');
         break;
       }
 
-      // Dispatch all tasks in the batch in parallel
-      const dispatches = batch.map(task => this.dispatchAgent(task.id));
-      await Promise.allSettled(dispatches);
+      // Dequeue a batch of runnable tasks
+      const batch = taskQueue.dequeueBatch(availableSlots);
+      if (batch.length === 0) {
+        // Nothing runnable right now — either agents are still running or hunt is done
+        if (this.huntSession.activeAgents > 0) {
+          // Agents still in-flight — they may generate follow-up tasks when they complete
+          await this.sleep(1000);
+          continue;
+        }
+
+        // No running agents AND no runnable tasks — check if there are any queued tasks
+        // with unmet dependencies (they'll become runnable when dependencies complete)
+        const stats = taskQueue.getStats();
+        if (stats.queued > 0) {
+          // Tasks exist but dependencies aren't met — wait briefly
+          await this.sleep(1000);
+          continue;
+        }
+
+        // Truly idle: no running, no runnable, no queued — ask coordinator what to do
+        const shouldContinue = await this.askCoordinatorForNextSteps();
+        if (!shouldContinue) break;
+
+        // Re-check after coordinator may have dispatched new tasks
+        if (!taskQueue.hasRunnableTasks() && this.huntSession.activeAgents === 0) {
+          break;
+        }
+        continue;
+      }
+
+      // Dispatch all tasks in the batch — fire-and-forget with retry so the loop keeps cycling.
+      // Each agent manages its own lifecycle via handleAgentResult() which decrements
+      // activeAgents and generates follow-up tasks. The loop will pick up new tasks
+      // and free slots on the next iteration.
+      for (const task of batch) {
+        this.dispatchWithRetry(task.id, task.agentType).catch(err => {
+          this.emitSystemMessage(
+            `Agent dispatch error for ${task.agentType}: ${err instanceof Error ? err.message : String(err)}`,
+            'error'
+          );
+        });
+      }
+
+      // Brief pause to let dispatched agents start and register as active
+      await this.sleep(2000);
 
       // Circuit breaker: stop dispatching if we see repeated fatal errors
       if (this.recentAgentErrors.length >= OrchestratorEngine.CIRCUIT_BREAKER_THRESHOLD) {
@@ -1379,31 +1712,35 @@ Return ONLY the JSON, no other text.`;
         }
       }
 
-      // After the batch completes, run chain detection on all accumulated findings
+      // Run chain detection on accumulated findings (runs every loop iteration)
       if (this.huntSession.allFindings.length > 0) {
         const newChains = detectChains(this.huntSession.allFindings);
         const previousChainIds = new Set(this.huntSession.chains.map(c => c.id));
         const freshChains = newChains.filter(c => !previousChainIds.has(c.id));
 
         if (freshChains.length > 0) {
-          // Validate chains with ChainValidator if available
+          // S2: Validate chains end-to-end (not just title matching)
           if (this.chainValidator) {
             for (const chain of freshChains) {
               try {
                 const validation = await this.chainValidator.validateChain(chain);
                 if (validation.isExploitable) {
+                  chain.validated = true;
                   chain.confidenceBoost = Math.round((validation.confidence ?? 0) * 100);
                 }
+                // If not exploitable, validated stays false (set by detectChains)
               } catch {
-                // Chain validation is best-effort
+                // Chain validation is best-effort — chain stays unvalidated
               }
             }
           }
 
           this.huntSession.chains.push(...freshChains);
           for (const chain of freshChains) {
+            // S2: Distinguish confirmed vs potential chains in UI
+            const chainLabel = chain.validated ? 'Confirmed Chain' : 'Potential Chain (needs manual verification)';
             this.emitOrchestratorMessage(
-              `**Vulnerability chain detected: ${chain.name}**\n` +
+              `**${chainLabel}: ${chain.name}**\n` +
               `Combined severity: **${chain.combinedSeverity.toUpperCase()}**\n` +
               `${chain.description}\n\n` +
               `Chain steps:\n${chain.chainSteps.map(s => `  - ${s}`).join('\n')}`
@@ -1432,6 +1769,7 @@ Return ONLY the JSON, no other text.`;
     }
 
     // Hunt complete — stop services and clear checkpoint
+    this.dispatchLoopRunning = false;
     this.huntSession.running = false;
     this.stopHuntServices();
     this.clearCheckpoint();
@@ -1463,7 +1801,7 @@ Return ONLY the JSON, no other text.`;
 
     const stats = this.huntSession.taskQueue.getStats();
     const findingsSummary = this.huntSession.allFindings
-      .map(f => `[${f.severity}] ${f.title} at ${f.target}`)
+      .map(f => `- id: "${f.id}" | [${f.severity}] ${f.title} at ${f.target}`)
       .join('\n') || 'None so far';
 
     const chainsSummary = this.huntSession.chains
@@ -1546,8 +1884,37 @@ What is your next action?`;
 
     if (!response.toolCalls) return;
 
+    // Check if any dispatch_agent calls are coming. If so, ensure a hunt session
+    // exists BEFORE processing them (dispatch_agent requires huntSession).
+    const hasDispatchCalls = response.toolCalls.some(tc => tc.name === 'dispatch_agent');
+    if (hasDispatchCalls && !this.huntSession && this.guidelines) {
+      this.emitSystemMessage('Auto-starting hunt session for agent dispatch...', 'info');
+      // Create the hunt session synchronously via startHunt, but DON'T await the
+      // full dispatch loop — we'll kick that off after processing tool calls.
+      await this.initializeHuntSession(this.guidelines);
+    }
+
+    let dispatchedAgents = false;
     for (const toolCall of response.toolCalls) {
       await this.executeCoordinatorTool(toolCall);
+      if (toolCall.name === 'dispatch_agent') {
+        dispatchedAgents = true;
+      }
+    }
+
+    // If agents were dispatched, ensure the dispatch loop is running to process them.
+    if (dispatchedAgents && this.huntSession && !this.dispatchLoopRunning) {
+      this.huntSession.running = true;
+      this.huntSession.aborted = false;
+      this.budgetSoftStopped = false;
+      this.emitSystemMessage('Starting dispatch loop for queued agents...', 'info');
+      // Fire-and-forget — the loop runs concurrently with the conversation
+      this.runDispatchLoop().catch(err => {
+        this.emitSystemMessage(
+          `Dispatch loop error: ${err instanceof Error ? err.message : String(err)}`,
+          'error'
+        );
+      });
     }
   }
 
@@ -1563,20 +1930,40 @@ What is your next action?`;
     if (!response.toolCalls) return false;
 
     let shouldContinue = true;
+    let dispatchedNewAgents = false;
+    let stopRequested = false;
+    let stopInput: { reason: string; summary: string; recommendations?: string[] } | undefined;
 
     for (const toolCall of response.toolCalls) {
       if (toolCall.name === 'stop_hunting') {
-        const input = toolCall.input as { reason: string; summary: string; recommendations?: string[] };
-        this.emitOrchestratorMessage(
-          `**Stopping hunt:** ${input.reason}\n\n${input.summary}` +
-          (input.recommendations?.length
-            ? `\n\n**Recommendations:**\n${input.recommendations.map(r => `  - ${r}`).join('\n')}`
-            : '')
-        );
-        shouldContinue = false;
+        stopInput = toolCall.input as { reason: string; summary: string; recommendations?: string[] };
+        stopRequested = true;
       } else {
         await this.executeCoordinatorTool(toolCall);
+        if (toolCall.name === 'dispatch_agent') {
+          dispatchedNewAgents = true;
+        }
       }
+    }
+
+    // If the model dispatched new agents AND called stop_hunting in the same turn,
+    // the dispatch calls win — we need the loop to keep running so those agents execute.
+    // The model often treats tool calls as a batch plan, not realizing stop_hunting
+    // is terminal and would prevent the dispatched agents from running.
+    if (stopRequested && dispatchedNewAgents) {
+      this.emitSystemMessage(
+        'Coordinator requested stop alongside new dispatches — continuing to let dispatched agents run.',
+        'info'
+      );
+      shouldContinue = true;
+    } else if (stopRequested) {
+      this.emitOrchestratorMessage(
+        `**Stopping hunt:** ${stopInput!.reason}\n\n${stopInput!.summary}` +
+        (stopInput!.recommendations?.length
+          ? `\n\n**Recommendations:**\n${stopInput!.recommendations.map(r => `  - ${r}`).join('\n')}`
+          : '')
+      );
+      shouldContinue = false;
     }
 
     return shouldContinue;
@@ -1601,6 +1988,16 @@ What is your next action?`;
 
         if (!this.huntSession) {
           this.emitSystemMessage('Cannot dispatch agent: no active hunt session.', 'error');
+          return;
+        }
+
+        // S5: Guard against undefined/empty target from orchestrator LLM
+        if (!args.target) {
+          this.emitSystemMessage(
+            `Blocked dispatch for ${args.agent_type}: target is undefined or empty. ` +
+            `Task: ${args.task_description?.substring(0, 100) ?? 'none'}`,
+            'warning'
+          );
           return;
         }
 
@@ -1670,11 +2067,19 @@ What is your next action?`;
       case 'generate_report': {
         const args = input as { finding_id: string };
 
-        const finding = this.huntSession?.allFindings.find(f => f.id === args.finding_id);
+        // Look up by exact ID first, then fall back to partial title match
+        let finding = this.huntSession?.allFindings.find(f => f.id === args.finding_id);
+        if (!finding) {
+          // Model may have passed a title or partial title instead of the hash ID
+          const needle = args.finding_id.toLowerCase();
+          finding = this.huntSession?.allFindings.find(
+            f => f.title.toLowerCase().includes(needle) || needle.includes(f.title.toLowerCase())
+          );
+        }
         if (!finding) {
           this.emitSystemMessage(
             `Finding ${args.finding_id} not found. Available: ${
-              this.huntSession?.allFindings.map(f => f.id).join(', ') || 'none'
+              this.huntSession?.allFindings.map(f => `${f.id} (${f.title})`).join(', ') || 'none'
             }`,
             'error'
           );
@@ -1690,11 +2095,60 @@ What is your next action?`;
           agent: finding.agentId,
           evidence: finding.evidence,
           isDuplicate: false,
+          validationStatus: finding.validationStatus ?? 'pending',
+          validationEvidence: finding.validationEvidence,
+          validationConfidence: finding.validationConfidence,
+          duplicateCheck: finding.duplicateCheck,
         });
 
         this.emitOrchestratorMessage(
           `Report generated for: **${finding.title}** [${finding.severity.toUpperCase()}]`
         );
+        break;
+      }
+
+      case 'adjust_budget': {
+        const args = input as { new_budget_usd: number; reason?: string };
+        const newBudget = args.new_budget_usd;
+
+        // Validate: positive and within reasonable cap
+        if (newBudget <= 0 || newBudget > 500) {
+          this.emitSystemMessage(
+            `Budget adjustment rejected: $${newBudget} is out of range. Must be between $0.01 and $500.`,
+            'error'
+          );
+          break;
+        }
+
+        // Validate: cannot decrease below current spend
+        const currentBudget = this.getBudgetStatus?.();
+        if (currentBudget && newBudget < currentBudget.spent) {
+          this.emitSystemMessage(
+            `Budget adjustment rejected: cannot set budget to $${newBudget.toFixed(2)} — ` +
+            `already spent $${currentBudget.spent.toFixed(2)}.`,
+            'error'
+          );
+          break;
+        }
+
+        const oldLimit = currentBudget?.limit ?? this.budgetLimitUsd;
+        this.budgetLimitUsd = newBudget;
+
+        // Update the actual budget in the cost tracker
+        if (this.setBudgetLimit) {
+          this.setBudgetLimit(newBudget);
+        }
+
+        this.emitOrchestratorMessage(
+          `**Budget adjusted** from $${(oldLimit ?? 0).toFixed(2)} to $${newBudget.toFixed(2)}.` +
+          (args.reason ? ` Reason: ${args.reason}` : '')
+        );
+
+        // If hunt was paused due to budget, resume dispatching
+        if (this.huntSession && !this.huntSession.running && currentBudget && currentBudget.percentUsed >= 1.0) {
+          this.huntSession.running = true;
+          this.emitSystemMessage('Hunt resumed — budget increased above current spend.', 'info');
+        }
         break;
       }
 
@@ -1729,8 +2183,24 @@ What is your next action?`;
     this.huntSession.activeAgents = Math.max(0, this.huntSession.activeAgents - 1);
     this.huntSession.completedDispatches++;
 
+    // I1: Partition specialist_request entries out of the finding pipeline.
+    // They are orchestration directives, not vulnerabilities — routing them
+    // through validateFinding() produces "No validator available" noise.
+    const specialistRequests = result.findings.filter(f => f.type === 'specialist_request');
+    result.findings = result.findings.filter(f => f.type !== 'specialist_request');
+    for (const req of specialistRequests) {
+      this.routeSpecialistRequest(req);
+    }
+
     // Collect findings — deduplicate against existing findings first
     if (result.findings.length > 0) {
+      // Normalize evidence at the pipeline boundary — agents may return
+      // string, object, undefined, or array. All downstream code expects string[].
+      for (const finding of result.findings) {
+        finding.evidence = normalizeEvidence(finding.evidence);
+        finding.reproduction = normalizeEvidence(finding.reproduction);
+      }
+
       const combined = [...this.huntSession.allFindings, ...result.findings];
       const deduped = deduplicateFindings(combined);
       // Only add findings that survived dedup and aren't already in allFindings
@@ -1738,32 +2208,18 @@ What is your next action?`;
       const newFindings = deduped.filter(f => !existingIds.has(f.id));
       this.huntSession.allFindings = deduped;
 
-      // Check H1 duplicate risk for new findings (async, non-blocking display)
-      if (this.h1DuplicateChecker && newFindings.length > 0 && this.huntSession.program) {
-        const programHandle = this.huntSession.program.programName;
-        for (const finding of newFindings) {
-          // Build a minimal H1Report from the finding for duplicate checking
-          const minimalReport: import('../reporting/h1_api').H1Report = {
-            title: finding.title,
-            description: finding.description,
-            severity: (finding.severity as 'critical' | 'high' | 'medium' | 'low') ?? 'medium',
-            impact: finding.description,
-            steps: finding.evidence ?? [],
-            proof: { screenshots: [], logs: [] },
-            suggestedBounty: { min: 0, max: 0 },
-          };
-          this.h1DuplicateChecker.checkDuplicate(minimalReport, programHandle).then(dupScore => {
-            if (dupScore && dupScore.recommendation === 'skip') {
-              this.emitOrchestratorMessage(
-                `Finding "${finding.title}" has high duplicate risk on H1 (score: ${dupScore.overall}%). Review before submitting.`
-              );
-            }
-          }).catch(() => {});
-        }
-      }
+      // ─── Phase 3: Validation + Duplicate Check Pipeline ��────────────────────
+      // 1. Emit each finding immediately with 'pending' status (non-blocking)
+      // 2. Fire async validation (deterministic proof) per finding
+      // 3. Fire async H1 duplicate check per finding
+      // 4. Update finding status + emit status messages when async checks complete
 
-      // Emit each NEW finding to the chat and post to blackboard
       for (const finding of newFindings) {
+        // Initialize finding with pending validation and not-checked duplicate status
+        finding.validationStatus = 'pending';
+        finding.duplicateCheck = { status: 'not_checked' };
+
+        // Emit finding to chat immediately with pending status
         this.addFinding({
           title: finding.title,
           severity: finding.severity as Severity,
@@ -1772,6 +2228,8 @@ What is your next action?`;
           agent: finding.agentId,
           evidence: finding.evidence,
           isDuplicate: false,
+          validationStatus: 'pending',
+          duplicateCheck: { status: 'not_checked' },
         });
 
         // Post finding to blackboard so other agents can discover it
@@ -1781,6 +2239,15 @@ What is your next action?`;
           target: finding.target,
           description: finding.description,
         }, getAllAgents().map(a => a.metadata.id));
+
+        // ── Async Validation (fire-and-forget, updates finding on completion) ──
+        this.runFindingValidation(finding).catch(() => {});
+
+        // ── Async H1 Duplicate Check (fire-and-forget) ──
+        this.runH1DuplicateCheck(finding).catch(() => {});
+
+        // ── Async Cross-Hunt Duplicate Check (H26 — fire-and-forget) ──
+        this.runCrossHuntDuplicateCheck(finding).catch(() => {});
       }
 
       // Reprioritize the queue based on new findings
@@ -1883,8 +2350,8 @@ What is your next action?`;
       }
     }
 
-    // Generate follow-up tasks from the result
-    const followUps = this.huntSession.taskQueue.generateFollowUpTasks(result);
+    // Generate follow-up tasks from the result (S5: pass parent target as fallback)
+    const followUps = this.huntSession.taskQueue.generateFollowUpTasks(result, task.target);
 
     // After recon completes, generate focused SolverTask objects
     // with specific endpoints (not broad domains) and iteration budgets
@@ -1900,13 +2367,17 @@ What is your next action?`;
       );
     }
 
-    // Track errors for circuit breaker
+    // Track errors for circuit breaker (sliding window — reset after 5 consecutive successes)
     if (!result.success && result.error) {
       this.recentAgentErrors.push(result.error);
       if (this.recentAgentErrors.length > 10) this.recentAgentErrors.shift();
+      this.consecutiveSuccesses = 0;
     } else if (result.success) {
-      // Reset on success — the error pattern is broken
-      this.recentAgentErrors = [];
+      this.consecutiveSuccesses++;
+      if (this.consecutiveSuccesses >= OrchestratorEngine.CIRCUIT_BREAKER_RESET_THRESHOLD) {
+        this.recentAgentErrors = [];
+        this.consecutiveSuccesses = 0;
+      }
     }
 
     // Emit agent completion message
@@ -1925,6 +2396,253 @@ What is your next action?`;
     this.emitMessage(completionMsg);
 
     return result;
+  }
+
+  /**
+   * I1: Route a specialist_request pseudo-finding to the dispatch queue.
+   * Reconstructs agent_type/priority from the recon agent's encoding and
+   * enqueues a task like dispatch_agent would. Skips if out of scope or
+   * already queued.
+   */
+  private routeSpecialistRequest(finding: AgentFinding): void {
+    if (!this.huntSession) return;
+
+    // Title format: "Specialist requested: ${agentType}"
+    const match = finding.title.match(/Specialist requested:\s*(\S+)/);
+    const agentType = match?.[1];
+    if (!agentType) {
+      this.emitSystemMessage(
+        `Ignored specialist_request with unparseable title: "${finding.title}"`,
+        'warning'
+      );
+      return;
+    }
+
+    // Evidence format: ["Agent type: X", "Priority: Y"]
+    const priorityStr = finding.evidence
+      .find(e => e.toLowerCase().startsWith('priority:'))
+      ?.split(':')[1]
+      ?.trim();
+    // Map string priority to numeric (dispatch uses number). Unknown → 50 (medium).
+    const priority = priorityStr === 'high' ? 80
+      : priorityStr === 'medium' ? 50
+      : priorityStr === 'low' ? 20
+      : 50;
+
+    const target = finding.target;
+    if (!target) return;
+
+    // Scope gate — same policy as dispatch_agent
+    const inScope = this.huntSession.program.scope.inScope.some(s =>
+      this.isTargetInScope(target, s)
+    );
+    if (!inScope) {
+      this.emitSystemMessage(
+        `Ignored specialist_request: ${target} is not in scope.`,
+        'warning'
+      );
+      return;
+    }
+
+    // Dedup against existing queued tasks
+    const existingTasks = this.huntSession.taskQueue.getAllTasks();
+    const alreadyQueued = existingTasks.some(
+      t => t.agentType === agentType && t.target === target
+    );
+    if (alreadyQueued) return;
+
+    this.huntSession.taskQueue.enqueue({
+      description: finding.description || `Specialist ${agentType} requested from recon`,
+      target,
+      agentType,
+      priority,
+      dependencies: [],
+      iterationBudget: 40,
+      origin: 'orchestrator',
+      tags: [agentType, 'specialist_request'],
+    });
+  }
+
+  // ─── Phase 3: Async Validation & Duplicate Check ───────────────────────────
+
+  /**
+   * Run deterministic validation for a finding (fire-and-forget).
+   * Converts AgentFinding → ReactFinding, runs the appropriate validator,
+   * then updates the finding status and emits a status message.
+   */
+  private async runFindingValidation(finding: AgentFinding): Promise<void> {
+    const reactFinding = agentFindingToReactFinding(finding);
+
+    // Build ValidatorConfig with executeCommand routed through Tauri PTY
+    const config: ValidatorConfig = {
+      executeCommand: async (command: string, target: string): Promise<{
+        success: boolean;
+        stdout: string;
+        stderr: string;
+        exitCode: number;
+        executionTimeMs: number;
+      }> => {
+        const startMs = Date.now();
+        try {
+          // Route through Tauri PTY for safe command execution
+          const output = await invoke<string>('spawn_pty', {
+            command,
+            args: [] as string[],
+          });
+          return {
+            success: true,
+            stdout: output,
+            stderr: '',
+            exitCode: 0,
+            executionTimeMs: Date.now() - startMs,
+          };
+        } catch (err) {
+          return {
+            success: false,
+            stdout: '',
+            stderr: err instanceof Error ? err.message : String(err),
+            exitCode: 1,
+            executionTimeMs: Date.now() - startMs,
+          };
+        }
+      },
+      timeout: 30_000, // 30s per finding validation
+    };
+
+    try {
+      const validationResult = await validateFinding(reactFinding, config);
+      applyValidationResult(finding, validationResult);
+
+      // Emit status update to chat
+      if (finding.validationStatus === 'confirmed') {
+        const evidenceCount = validationResult.evidence.length;
+        this.emitSystemMessage(
+          `Finding "${finding.title}" **VERIFIED** (${validationResult.validatorUsed}, ` +
+          `${evidenceCount} evidence item${evidenceCount !== 1 ? 's' : ''}, ` +
+          `confidence: ${validationResult.confidence}%)`,
+          'success'
+        );
+      } else if (finding.validationStatus === 'unverified') {
+        this.emitSystemMessage(
+          `Finding "${finding.title}" could not be verified ` +
+          `(${validationResult.validatorUsed}, confidence: ${validationResult.confidence}%)`,
+          'warning'
+        );
+      } else if (finding.validationStatus === 'validation_failed') {
+        this.emitSystemMessage(
+          `Validation failed for "${finding.title}": ${validationResult.error ?? 'unknown error'}`,
+          'warning'
+        );
+      }
+    } catch (err) {
+      // Graceful degradation: validation failure never discards the finding
+      finding.validationStatus = 'validation_failed';
+      this.emitSystemMessage(
+        `Validation error for "${finding.title}": ${err instanceof Error ? err.message : String(err)}`,
+        'warning'
+      );
+    }
+  }
+
+  /**
+   * Run H1 duplicate check for a finding (fire-and-forget).
+   * Attaches DuplicateCheckResult to the finding and emits status messages.
+   * Gracefully degrades when no H1 credentials are available.
+   */
+  private async runH1DuplicateCheck(finding: AgentFinding): Promise<void> {
+    if (!this.h1DuplicateChecker || !this.huntSession?.program) {
+      // No H1 checker available — graceful degradation
+      finding.duplicateCheck = { status: 'not_checked' };
+      return;
+    }
+
+    const programHandle = this.huntSession.program.programName;
+
+    // Build a minimal H1Report from the finding
+    const minimalReport: import('../reporting/h1_api').H1Report = {
+      title: finding.title,
+      description: finding.description,
+      severity: (finding.severity as 'critical' | 'high' | 'medium' | 'low') ?? 'medium',
+      impact: finding.description,
+      steps: finding.evidence ?? [],
+      proof: { screenshots: [], logs: [] },
+      suggestedBounty: { min: 0, max: 0 },
+    };
+
+    try {
+      const dupScore = await this.h1DuplicateChecker.checkDuplicate(
+        minimalReport,
+        programHandle
+      );
+
+      finding.duplicateCheck = buildDuplicateCheckResult(dupScore);
+
+      // Emit appropriate status message based on duplicate risk
+      if (finding.duplicateCheck.status === 'likely_duplicate') {
+        this.emitOrchestratorMessage(
+          `Finding "${finding.title}" is a **likely duplicate** on H1 ` +
+          `(score: ${dupScore.overall}%). ` +
+          (finding.duplicateCheck.topMatches?.[0]
+            ? `Top match: "${finding.duplicateCheck.topMatches[0].title}" (${Math.round(finding.duplicateCheck.topMatches[0].similarity * 100)}%)`
+            : 'Review before submitting.')
+        );
+      } else if (finding.duplicateCheck.status === 'possible_duplicate') {
+        this.emitSystemMessage(
+          `Finding "${finding.title}" has possible H1 duplicates ` +
+          `(score: ${dupScore.overall}%). Review recommended.`,
+          'warning'
+        );
+      }
+      // 'unique' — no message needed (clean path)
+    } catch {
+      // Graceful degradation: duplicate check failure is non-fatal
+      finding.duplicateCheck = { status: 'not_checked' };
+    }
+  }
+
+  /**
+   * Cross-hunt duplicate check (H26).
+   * Queries hunt_memory for past findings with the same target and vuln type.
+   * Flags duplicates but does not block them — the user may want to re-test.
+   */
+  private async runCrossHuntDuplicateCheck(finding: AgentFinding): Promise<void> {
+    if (!this.huntMemory) return;
+
+    try {
+      const dupResult = await this.huntMemory.checkDuplicate({
+        title: finding.title,
+        vulnerabilityType: finding.type ?? 'unknown',
+        severity: finding.severity ?? 'info',
+        target: finding.target,
+        description: finding.description,
+        evidence: finding.evidence,
+        confidence: 50,
+      });
+
+      if (dupResult.isDuplicate && dupResult.similarFinding) {
+        // Flag but don't block — update duplicate check if not already flagged by H1 check
+        if (!finding.duplicateCheck || finding.duplicateCheck.status === 'not_checked') {
+          finding.duplicateCheck = {
+            status: 'possible_duplicate',
+            topMatches: [{
+              source: 'hunt_memory',
+              title: String(dupResult.similarFinding.payload.title ?? 'Previous session finding'),
+              url: '',
+              similarity: dupResult.similarFinding.score,
+            }],
+          };
+        }
+
+        this.emitSystemMessage(
+          `Finding "${finding.title}" matches a finding from a previous hunt session ` +
+          `(similarity: ${Math.round(dupResult.similarFinding.score * 100)}%). ` +
+          `Review for potential cross-hunt duplicate.`,
+          'warning'
+        );
+      }
+    } catch {
+      // Cross-hunt dedup is best-effort — non-fatal
+    }
   }
 
   // ─── Private Helpers ────────────────────────────────────────────────────────
@@ -2118,17 +2836,58 @@ What is your next action?`;
       } catch { /* best-effort */ }
     }
 
+    // Build structured shared findings from Blackboard (max 10, highest priority first)
+    const bbEntries = this.blackboard.readFor(task.agentType);
+    const sharedFindings: SharedFinding[] = bbEntries
+      .filter(e => e.type === 'finding')
+      .slice(0, 10)
+      .map(e => ({
+        agentId: e.agentId,
+        vulnType: e.category,
+        title: String(e.content.title ?? ''),
+        severity: (e.content.severity as SharedFinding['severity']) ?? 'info',
+        target: String(e.content.target ?? ''),
+        description: String(e.content.description ?? '').slice(0, 300),
+      }));
+
+    // Build WAF context from dynamic HttpClient detection (per-domain, accumulated during hunt)
+    // Falls back to static WAFDetectionResult from hunt-init probe
+    let wafContext: WafContext | undefined;
+    if (this.httpClient) {
+      try {
+        const domain = new URL(task.target).hostname;
+        const dynamicWaf = this.httpClient.getWAFState(domain);
+        if (dynamicWaf?.detected) {
+          wafContext = {
+            vendor: dynamicWaf.provider,
+            confidence: 0.8,
+            signal: dynamicWaf.signal,
+          };
+        }
+      } catch { /* invalid URL — skip dynamic lookup */ }
+    }
+    // Fall back to static detection from hunt-init WAF probe
+    if (!wafContext && this.wafDetectionResult?.detected) {
+      wafContext = {
+        vendor: this.wafDetectionResult.vendor,
+        confidence: this.wafDetectionResult.confidence,
+        signal: this.wafDetectionResult.evidence.join('; '),
+      };
+    }
+
     return {
       id: task.id,
       target: task.target,
       scope: this.guidelines?.scope.inScope ?? [task.target],
       description: task.description,
+      sharedFindings: sharedFindings.length > 0 ? sharedFindings : undefined,
+      wafContext,
       parameters: {
         iterationBudget: task.iterationBudget,
         origin: task.origin,
         tags: task.tags,
-        // Cross-agent context from the blackboard
-        blackboardContext: this.blackboard.readFor(task.agentType),
+        // Cross-agent context from the blackboard (raw entries for backward compat)
+        blackboardContext: bbEntries,
         // OOB server base URL for blind vuln testing
         oobBaseUrl: this.oobServer?.getSummary(),
         // Knowledge graph patterns for this target/agent
@@ -2139,8 +2898,10 @@ What is your next action?`;
         agentTrustLevel,
         // Direct HTTP client for agent requests (Phase 20A)
         httpClient: this.httpClient,
-        // Session manager for authenticated testing (Phase 20C)
+        // Session manager for authenticated testing (Phase 20C / S4)
         sessionManager: this.sessionManager,
+        // Active auth session IDs for this hunt (S4)
+        authSessionIds: this.sessionManager?.listSessions().map(s => s.id) ?? [],
         // Hunt memory for cross-session learning (Phase 20E)
         huntMemory: this.huntMemory,
         // WAF detection result for bypass strategies (Phase 20G)

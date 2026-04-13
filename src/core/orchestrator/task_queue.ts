@@ -29,7 +29,7 @@ export interface HuntTask {
   startedAt?: number;
   completedAt?: number;
   /** What triggered this task's creation */
-  origin: 'initial' | 'finding' | 'orchestrator' | 'user';
+  origin: 'initial' | 'finding' | 'orchestrator' | 'user' | 'api_schema';
   /** Tags for grouping/filtering */
   tags: string[];
 }
@@ -180,16 +180,21 @@ export class TaskQueue {
     }
   }
 
-  /** Generate follow-up tasks based on agent results */
-  generateFollowUpTasks(result: AgentResult): HuntTask[] {
+  /** Generate follow-up tasks based on agent results.
+   *  parentTarget is used as fallback when a finding's target is undefined. */
+  generateFollowUpTasks(result: AgentResult, parentTarget?: string): HuntTask[] {
     const newTasks: HuntTask[] = [];
 
     for (const finding of result.findings) {
+      // S5: Use the finding's target, falling back to the parent task's target
+      const target = finding.target || parentTarget;
+      if (!target) continue; // Cannot create a task without any target
+
       // XSS finding → validate with headless browser
       if (finding.type.includes('xss')) {
         newTasks.push(this.enqueue({
           description: `Validate XSS finding: ${finding.title}`,
-          target: finding.target,
+          target,
           agentType: 'xss-hunter',
           priority: 8,
           dependencies: [],
@@ -203,7 +208,7 @@ export class TaskQueue {
       if (finding.type.includes('sqli') || finding.type.includes('sql')) {
         newTasks.push(this.enqueue({
           description: `Validate SQLi finding: ${finding.title}`,
-          target: finding.target,
+          target,
           agentType: 'sqli-hunter',
           priority: 9,
           dependencies: [],
@@ -216,8 +221,8 @@ export class TaskQueue {
       // Open redirect → chain with SSRF
       if (finding.type.includes('redirect')) {
         newTasks.push(this.enqueue({
-          description: `Chain open redirect with SSRF: ${finding.target}`,
-          target: finding.target,
+          description: `Chain open redirect with SSRF: ${target}`,
+          target,
           agentType: 'ssrf-hunter',
           priority: 7,
           dependencies: [],
@@ -230,8 +235,8 @@ export class TaskQueue {
       // New subdomain discovered → recon it
       if (finding.type === 'subdomain' || finding.type === 'host') {
         newTasks.push(this.enqueue({
-          description: `Deep recon on discovered asset: ${finding.target}`,
-          target: finding.target,
+          description: `Deep recon on discovered asset: ${target}`,
+          target,
           agentType: 'recon',
           priority: 5,
           dependencies: [],

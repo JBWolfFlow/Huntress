@@ -94,6 +94,8 @@ const mockReport: H1Report = {
     'Direct impact on user sessions',
     'No authentication required for exploitation',
   ],
+  httpEvidence: '**Request:**\n```http\nGET /search?q=<script>alert(1)</script> HTTP/1.1\nHost: example.com\n```\n\n**Response:**\n```http\nHTTP/1.1 200 OK\n\n<script>alert(1)</script> reflected\n```',
+  quickReproduction: '```bash\ncurl "https://example.com/search?q=<script>alert(1)</script>"\n```',
 };
 
 // ─── Helper: mock executeCommand for OOB Server ─────────────────────────────
@@ -855,6 +857,8 @@ describe('ReportQualityScorer', () => {
           'Direct impact on user sessions resulting in account takeover',
           'No authentication required for exploitation',
         ],
+        httpEvidence: '**Request:**\n```http\nGET /comments HTTP/1.1\nHost: example.com\n```\n\n**Response:**\n```http\nHTTP/1.1 200 OK\nContent-Type: text/html\n\n<script>alert(document.cookie)</script>\n```',
+        quickReproduction: '**Curl:**\n```bash\ncurl https://example.com/comments\n```',
       };
       const result = scorer.scoreReport(perfectReport);
       expect(result.overall).toBeGreaterThanOrEqual(75);

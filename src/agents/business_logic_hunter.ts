@@ -26,8 +26,9 @@ import type {
   CommandResult,
   ReactFinding,
 } from '../core/engine/react_loop';
-import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import { AGENT_TOOL_SCHEMAS, BROWSER_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const BUSINESS_LOGIC_SYSTEM_PROMPT = `You are an elite business logic vulnerability researcher. Your mission is to discover vulnerabilities that arise from flawed application logic, improper state management, and incorrect business rule enforcement. These are the HIGHEST-VALUE bugs because they require deep understanding of the application — no scanner can find them, only creative reasoning.
 
@@ -111,7 +112,33 @@ Multi-step processes often have exploitable shortcuts:
 - Add items to cart → apply coupon → remove items → add different items → checkout (coupon still applied?)
 - Start trial → cancel → restart trial → repeat (infinite trials?)
 
-### Step 6: Rate Limit Bypass
+### Step 6: MFA and Authentication Bypass via Logic
+
+Test if multi-factor authentication can be bypassed through logic flaws:
+- **Skip MFA step:** Complete login (step 1), skip MFA verification (step 2), access dashboard (step 3) directly
+- **MFA code reuse:** Use the same TOTP code twice in quick succession — does the server invalidate after first use?
+- **MFA downgrade:** If both SMS and TOTP are configured, can you force fallback to weaker method?
+- **MFA removal race:** Send MFA disable request and authentication request simultaneously
+- **Backup code abuse:** Are backup codes single-use? Can they be replayed?
+- **Remember device bypass:** Modify the "remember this device" cookie/token to bypass MFA on new devices
+- **MFA on password change:** Can you change password without re-verifying MFA?
+- **Account recovery bypass:** Does "forgot password" flow skip MFA entirely?
+
+### Step 7: Feature Interaction Patterns
+
+Test how different features interact — security controls in Feature A may be bypassable via Feature B:
+- **Export as bypass:** Feature A restricts data access via UI, but Feature B's export/download includes unrestricted data
+- **API vs UI divergence:** Mobile API allows operations the web UI blocks (different validation)
+- **Webhook as SSRF:** Register a webhook pointing to internal URLs — the webhook feature may not validate the destination
+- **Import as injection:** Use CSV/JSON import feature to inject payloads that bypass input validation on normal forms
+- **Notification as data leak:** Trigger notification (email/SMS/push) containing sensitive data from another feature
+- **Sharing as escalation:** Share a resource with limited access → recipient may get higher access than intended
+- **Preview as disclosure:** "Preview" or "draft" features may expose data that published versions redact
+- **Batch operations bypass:** Single-item operations have validation; batch/bulk operations may skip checks
+- **Undo as replay:** "Undo" functionality re-executes the original action — can be abused for double operations
+- **Template injection via feature:** User-controlled templates (email templates, report generators) may allow SSTI
+
+### Step 8: Rate Limit Bypass
 
 Test if rate limits can be circumvented:
 - **X-Forwarded-For rotation:** Add \`X-Forwarded-For: RANDOM_IP\` to each request
@@ -121,7 +148,7 @@ Test if rate limits can be circumvented:
 - **Encoding changes:** \`/login\` vs \`/LOGIN\` vs \`/%6Cogin\`
 - **Batch/bulk endpoints:** \`/api/batch\` → send multiple operations in one request
 
-### Step 7: Feature Abuse
+### Step 9: Feature Abuse
 
 - **Free-tier exploitation:** Access premium API endpoints with free account
 - **Trial period abuse:** Create account → start trial → delete account → create new account → new trial
@@ -130,7 +157,7 @@ Test if rate limits can be circumvented:
 - **Export abuse:** Export data in different formats — does one format include more data than allowed?
 - **Webhook abuse:** Register a webhook and send requests to internal URLs (SSRF via business logic)
 
-### Step 8: Data Manipulation
+### Step 10: Data Manipulation
 
 - **Mass assignment:** Send extra fields in registration/update: \`"isAdmin": true\`, \`"verified": true\`, \`"balance": 99999\`
 - **Type juggling:** Send string where number expected, array where string expected
@@ -138,7 +165,7 @@ Test if rate limits can be circumvented:
 - **Boundary testing:** Test minimum and maximum values for all numeric fields
 - **Special characters:** Unicode homoglyphs in usernames (\`admin\` vs \`аdmin\` — Cyrillic 'а')
 
-### Step 9: Information Disclosure via Logic
+### Step 11: Information Disclosure via Logic
 
 - **Error message exploitation:** Trigger different error messages to enumerate users, permissions, features
 - **Timing attacks:** Measure response time for valid vs invalid usernames/emails
@@ -246,8 +273,8 @@ export class BusinessLogicHunterAgent implements BaseAgent {
           `Scope: ${task.scope.join(', ')}\n\n${task.description}\n\n` +
           `IMPORTANT: Start by understanding what the application does, then think about how a dishonest user could abuse its logic. ` +
           `Focus on payment flows, privilege boundaries, and multi-step workflows.`,
-        tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 40, // Business logic needs more iterations for application understanding
+        tools: [...AGENT_TOOL_SCHEMAS, ...BROWSER_TOOL_SCHEMAS],
+        agentType: this.metadata.id, // I1: adaptive budget — complex tier gets 120 iterations
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -263,6 +290,11 @@ export class BusinessLogicHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
+        browserEnabled: true,
       });
 
       const result = await loop.execute();
@@ -280,6 +312,7 @@ export class BusinessLogicHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

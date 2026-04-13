@@ -3,7 +3,7 @@
  *
  * Performs comprehensive reconnaissance using the ReAct loop engine.
  * Attack playbook:
- * 1. Subdomain enumeration (subfinder, assetfinder, findomain)
+ * 1. Subdomain enumeration (subfinder)
  * 2. DNS resolution (dnsx)
  * 3. HTTP probing (httpx with tech detection)
  * 4. WAF detection (wafw00f)
@@ -32,6 +32,7 @@ import { ReactLoop } from '../core/engine/react_loop';
 import type { ReactLoopConfig, CommandResult, ReactFinding } from '../core/engine/react_loop';
 import { RECON_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const RECON_SYSTEM_PROMPT = `You are an expert reconnaissance agent for bug bounty hunting. Your mission is to comprehensively map the target's attack surface before specialized hunters begin testing.
 
@@ -39,8 +40,7 @@ const RECON_SYSTEM_PROMPT = `You are an expert reconnaissance agent for bug boun
 
 ### Phase 1: Subdomain Enumeration
 - Run subfinder with JSON output: \`subfinder -d TARGET -json -silent\`
-- Run assetfinder for additional coverage: \`assetfinder --subs-only TARGET\`
-- Combine and deduplicate results
+- Deduplicate results. Do NOT attempt assetfinder/findomain — they are not installed in the sandbox.
 
 ### Phase 2: DNS Resolution
 - Resolve discovered subdomains: \`dnsx -l subdomains.txt -resp -json\`
@@ -90,7 +90,19 @@ const RECON_SYSTEM_PROMPT = `You are an expert reconnaissance agent for bug boun
   - Parameters reflecting input → request xss_hunter
   - API with IDs → request idor_hunter
 - Report findings with subdomain, host, url, or technology types
-- Stop when you've exhausted recon tools or reached iteration limit
+
+## CRITICAL: When to stop (Issue #6 fix)
+You are a **mapping** agent, not a hunting agent. Your job is to find the
+attack surface and hand off to specialists. **Call \`stop_hunting\` with
+reason="task_complete"** the moment you have ANY of:
+- Completed subdomain enumeration AND HTTP probed the live hosts
+- Identified the target's tech stack
+- Discovered 1+ interesting attack surfaces (GraphQL, OAuth, admin panels, APIs)
+- Hit iteration 20+ without discovering new attack surface
+
+DO NOT cycle through all 10 phases if the first 3-5 have already mapped the
+surface. DO NOT re-run subfinder/httpx on domains you've already scanned.
+Specialists need iterations to actually find bugs — don't hoard them.
 
 ## Example: Successful Recon Leading to Critical Findings
 
@@ -184,7 +196,14 @@ export class ReconAgent implements BaseAgent {
         systemPrompt: RECON_SYSTEM_PROMPT,
         goal: `Perform comprehensive reconnaissance on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: RECON_TOOL_SCHEMAS,
-        maxIterations: 60,
+        // Issue #6 fix: drop explicit maxIterations override so the ReactLoop
+        // uses the centralized simple-agent budget (30 from cost_router). The
+        // previous hardcoded 60 meant a single recon agent could run 15-30min,
+        // starving specialist dispatch because generateSolverTasks only fires
+        // on recon completion. Hunt #11 monitoring caught this: 5 recon
+        // agents grinding for 16 min with 0 specialist dispatches. Pair with
+        // the "stop_hunting early" instructions above.
+        agentType: 'recon',
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -200,6 +219,10 @@ export class ReconAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
         onSpecialistRequest: (request) => {
           // Log the specialist request as a finding
           this.findings.push({
@@ -258,6 +281,7 @@ export class ReconAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         observations,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,

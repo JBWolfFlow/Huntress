@@ -14,6 +14,15 @@ Huntress is an enterprise-grade desktop application that automates bug bounty hu
 
 Designed as a production-ready tool for professional security researchers, Huntress imports HackerOne bounty programs, analyzes attack surfaces, coordinates parallel hunting operations, and generates submission-ready vulnerability reports -- all through a conversational interface with the user in full control.
 
+### Current status (Session 25, April 2026)
+
+- **Platform readiness:** 8.0/10 — infrastructure fully working; first H1 submission remains the north star
+- **Hunt history:** 12 hunts (6 Juice Shop training + 6 real-world HackerOne programs)
+- **Build health:** 2,029 TypeScript tests, 108 Rust tests, `tsc` + `cargo clippy` clean
+- **Authentication pipeline (Phase 1):** shipped — sandbox `HUNTRESS_AUTH_*` env injection, agent auth-awareness prompts, multi-identity IDOR via `session_label`, two-probe bearer validation, TS-layer scope-aware redirect following with cross-origin header stripping
+- **Sandbox hardening:** auto-cleanup on app shutdown, tinyproxy-routed HTTP for shell tools, retention policy for PTY recordings (7-day / 500-file cap)
+- **Next up:** fully-automated auth acquisition via a dedicated `AuthWorkerAgent` (see [SESSION_25_PLAN.md](SESSION_25_PLAN.md))
+
 ---
 
 ## Table of Contents
@@ -539,8 +548,8 @@ cd src-tauri && cargo test
 
 ### Coverage
 
-- **TypeScript**: 1,061+ tests across 27 test files covering agents, orchestration, providers, training, HTTP engine, knowledge integration, and end-to-end flows
-- **Rust**: 68 tests covering scope validation, kill switch, proxy pool, secure storage, PTY management, and sandbox isolation
+- **TypeScript**: 2,029 tests across 80 test files covering agents, orchestration, providers, training, HTTP engine, knowledge integration, and end-to-end flows
+- **Rust**: 108 tests covering scope validation, kill switch, proxy pool, secure storage, PTY management, sandbox isolation, PTY recording retention, and shutdown cleanup
 
 ### Test Categories
 
@@ -590,7 +599,7 @@ huntress/
 |   |   +-- [6 more modules]
 |   |-- contexts/                   # React context providers
 |   |-- hooks/                      # Custom React hooks
-|   +-- tests/                      # 27 test files
+|   +-- tests/                      # 80 test files
 |-- src-tauri/                      # Backend (Rust / Tauri 2.0)
 |   +-- src/
 |       |-- lib.rs                  # Module integration, 50+ Tauri commands
@@ -624,15 +633,16 @@ huntress/
 |--------|-------|
 | TypeScript/TSX source files | 214 |
 | TypeScript LOC (approximate) | 88,700 |
-| Rust source files | 10 |
-| Rust LOC | 5,950 |
+| Rust source files | 11 |
+| Rust LOC | 6,400 |
 | Hunting agents | 29 |
 | React components | 19 |
 | Core modules | 20 subdirectories |
-| Test files | 27 |
-| TypeScript tests | 1,061+ |
-| Rust tests | 68 |
+| Test files | 80 |
+| TypeScript tests | 2,029 |
+| Rust tests | 108 |
 | Tauri IPC commands | 50+ |
+| Platform readiness score | 8.0/10 (Session 25) |
 
 ---
 

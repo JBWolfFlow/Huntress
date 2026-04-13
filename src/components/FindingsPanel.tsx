@@ -6,7 +6,7 @@
  */
 
 import React, { useState } from 'react';
-import type { AgentFinding, FindingSeverity } from '../agents/base_agent';
+import type { AgentFinding, FindingSeverity, ValidationStatus, DuplicateCheckResult } from '../agents/base_agent';
 
 interface FindingsPanelProps {
   findings: AgentFinding[];
@@ -23,6 +23,20 @@ const SEVERITY_CONFIG: Record<FindingSeverity, { color: string; bgColor: string;
 };
 
 const SEVERITY_ORDER: FindingSeverity[] = ['critical', 'high', 'medium', 'low', 'info'];
+
+const VALIDATION_BADGE: Record<ValidationStatus, { color: string; label: string; icon: string }> = {
+  pending: { color: 'bg-gray-600 text-gray-200', label: 'Pending', icon: '...' },
+  confirmed: { color: 'bg-green-600 text-white', label: 'Verified', icon: '\u2713' },
+  unverified: { color: 'bg-yellow-600 text-white', label: 'Unverified', icon: '?' },
+  validation_failed: { color: 'bg-gray-500 text-gray-200', label: 'Check Failed', icon: '!' },
+};
+
+function getDuplicateLabel(dup?: DuplicateCheckResult): { color: string; label: string } | null {
+  if (!dup || dup.status === 'not_checked') return null;
+  if (dup.status === 'likely_duplicate') return { color: 'text-red-400', label: 'Likely Duplicate' };
+  if (dup.status === 'possible_duplicate') return { color: 'text-yellow-400', label: 'Possible Duplicate' };
+  return { color: 'text-green-400', label: 'No Known Duplicates' };
+}
 
 export const FindingsPanel: React.FC<FindingsPanelProps> = ({
   findings,
@@ -142,9 +156,29 @@ export const FindingsPanel: React.FC<FindingsPanelProps> = ({
                     {finding.severity}
                   </span>
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-white truncate">{finding.title}</p>
+                    <div className="flex items-center gap-1.5">
+                      <p className="text-sm font-medium text-white truncate">{finding.title}</p>
+                      {/* Validation status badge */}
+                      {finding.validationStatus && (
+                        <span
+                          className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-bold uppercase flex-shrink-0 ${VALIDATION_BADGE[finding.validationStatus].color}`}
+                        >
+                          {VALIDATION_BADGE[finding.validationStatus].icon} {VALIDATION_BADGE[finding.validationStatus].label}
+                          {finding.validationEvidence && finding.validationEvidence.length > 0
+                            ? ` (${finding.validationEvidence.length})`
+                            : ''}
+                        </span>
+                      )}
+                    </div>
                     <p className="text-xs text-gray-500 mt-0.5 truncate">
                       {finding.agentId} &middot; {finding.target}
+                      {/* Duplicate check inline indicator */}
+                      {(() => {
+                        const dupLabel = getDuplicateLabel(finding.duplicateCheck);
+                        return dupLabel ? (
+                          <span className={`ml-2 ${dupLabel.color}`}>&middot; {dupLabel.label}</span>
+                        ) : null;
+                      })()}
                     </p>
                   </div>
                 </div>
@@ -182,6 +216,43 @@ export const FindingsPanel: React.FC<FindingsPanelProps> = ({
                           </li>
                         ))}
                       </ol>
+                    </div>
+                  )}
+
+                  {/* Validation evidence (Phase 3) */}
+                  {finding.validationEvidence && finding.validationEvidence.length > 0 && (
+                    <div className="mt-2">
+                      <p className="text-[10px] font-semibold text-green-500 uppercase mb-1">
+                        Validation Evidence ({finding.validationEvidence.length})
+                      </p>
+                      {finding.validationEvidence.map((ev, i) => (
+                        <div key={i} className="mb-1">
+                          <span className="text-[10px] text-gray-500 uppercase">{ev.type}</span>
+                          <p className="text-xs text-gray-400 font-mono break-all">{ev.description}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Duplicate check details (Phase 3) */}
+                  {finding.duplicateCheck && finding.duplicateCheck.status !== 'not_checked' && (
+                    <div className="mt-2">
+                      <p className="text-[10px] font-semibold text-gray-500 uppercase mb-1">
+                        Duplicate Check
+                      </p>
+                      {(() => {
+                        const dupLabel = getDuplicateLabel(finding.duplicateCheck);
+                        return dupLabel ? (
+                          <p className={`text-xs ${dupLabel.color}`}>{dupLabel.label}
+                            {finding.duplicateCheck.score ? ` (${finding.duplicateCheck.score.overall}%)` : ''}
+                          </p>
+                        ) : null;
+                      })()}
+                      {finding.duplicateCheck.topMatches?.map((match, i) => (
+                        <p key={i} className="text-xs text-gray-400">
+                          {match.source}: &ldquo;{match.title}&rdquo; ({Math.round(match.similarity * 100)}%)
+                        </p>
+                      ))}
                     </div>
                   )}
 

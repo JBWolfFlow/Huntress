@@ -25,6 +25,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const CRLF_SYSTEM_PROMPT = `You are an elite CRLF injection and HTTP response splitting security researcher. Your mission is to systematically discover CRLF injection vulnerabilities in the target application. You think deeply about each test, analyze responses carefully, and chain techniques when initial attempts are filtered or blocked.
 
@@ -230,7 +231,7 @@ export class CRLFHunterAgent implements BaseAgent {
         systemPrompt: CRLF_SYSTEM_PROMPT,
         goal: `Systematically test for CRLF injection vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -246,6 +247,10 @@ export class CRLFHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -264,6 +269,7 @@ export class CRLFHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

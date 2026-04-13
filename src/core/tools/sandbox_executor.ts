@@ -50,11 +50,14 @@ export class SandboxExecutor {
    *
    * @param scope - In-scope domains (enforced by the container's Squid proxy)
    * @param envVars - Optional environment variables to pass into the container
+   * @param files - Optional files to write into the sandbox after creation
+   *                (path → UTF-8 content). Typical use: /home/hunter/.curlrc
    * @returns A SandboxExecutor instance, or null if Docker/Podman is unavailable
    */
   static async create(
     scope: string[],
     envVars?: Record<string, string>,
+    files?: Record<string, string>,
   ): Promise<SandboxExecutor | null> {
     const config: SandboxConfig = {
       image: 'huntress-attack-machine:latest',
@@ -70,7 +73,19 @@ export class SandboxExecutor {
     try {
       const sandboxId = await invoke<string>('create_sandbox', { config });
       console.log(`[SandboxExecutor] Container created: ${sandboxId.substring(0, 12)}`);
-      return new SandboxExecutor(sandboxId);
+      const executor = new SandboxExecutor(sandboxId);
+      if (files) {
+        for (const [path, content] of Object.entries(files)) {
+          if (!content) continue;
+          try {
+            await invoke('sandbox_write_file', { sandboxId, path, content });
+          } catch (err) {
+            // Non-fatal: the agent can still function without the pre-staged file.
+            console.warn(`[SandboxExecutor] Failed to write ${path}:`, err);
+          }
+        }
+      }
+      return executor;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       // Docker/Podman not available — caller should fall back to bare PTY
@@ -95,6 +110,34 @@ export class SandboxExecutor {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * I5: Reap orphan containers from prior hunts that didn't clean up.
+   *
+   * Returns the number of containers force-removed. Safe to call even when
+   * Docker/Podman isn't available — returns 0 without throwing.
+   *
+   * @param minAgeSecs Only reap containers older than this (default 600 = 10 min)
+   */
+  static async reapOrphans(minAgeSecs = 600): Promise<number> {
+    try {
+      const count = await invoke<number>('reap_orphan_sandboxes', { minAgeSecs });
+      if (count > 0) {
+        console.log(`[SandboxExecutor] Reaped ${count} orphan container(s) from prior hunts`);
+      }
+      return count;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      // Swallow any "no Tauri host" / "not initialized" error silently — that's
+      // the normal case in the test environment and when Docker is missing.
+      if (!msg.includes('not initialized')
+          && !msg.includes('not available')
+          && !msg.includes("reading 'invoke'")) {
+        console.warn('[SandboxExecutor] Orphan reap failed:', msg);
+      }
+      return 0;
     }
   }
 
@@ -242,12 +285,15 @@ export class SandboxExecutor {
 export async function createSandboxedExecutor(
   scope: string[],
   ptyFallback?: (command: string, target: string) => Promise<CommandResult>,
+  auth?: { envVars?: Record<string, string>; curlrc?: string },
 ): Promise<{
   executeCommand: (command: string, target: string) => Promise<CommandResult>;
   cleanup: () => Promise<void>;
   usingSandbox: boolean;
 }> {
-  const sandbox = await SandboxExecutor.create(scope);
+  const files: Record<string, string> = {};
+  if (auth?.curlrc) files['/home/hunter/.curlrc'] = auth.curlrc;
+  const sandbox = await SandboxExecutor.create(scope, auth?.envVars, files);
 
   if (sandbox) {
     return {

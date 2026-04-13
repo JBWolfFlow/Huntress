@@ -12,8 +12,12 @@ import {
   PROMPT_FORMATS,
   type TerminalTheme,
   type PromptStyle,
+  type AuthProfileConfig,
 } from '../contexts/SettingsContext';
 import { getProviderFactory } from '../core/providers/provider_factory';
+import { parseAPISpec } from '../core/discovery/api_schema_parser';
+
+type AuthType = AuthProfileConfig['authType'];
 
 interface SettingsPanelProps {
   isOpen: boolean;
@@ -21,10 +25,149 @@ interface SettingsPanelProps {
 }
 
 export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose }) => {
-  const { settings, updateSettings, setApiKey, getApiKey, resetSettings } = useSettings();
+  const { settings, updateSettings, setApiKey, getApiKey, resetSettings, addAuthProfile, removeAuthProfile } = useSettings();
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [selectedProvider, setSelectedProvider] = useState('');
-  const [activeTab, setActiveTab] = useState<'general' | 'terminal' | 'keys' | 'advanced'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'terminal' | 'keys' | 'schemas' | 'auth' | 'advanced'>('general');
+
+  // Auth profile form state
+  const [showAuthForm, setShowAuthForm] = useState(false);
+  const [authLabel, setAuthLabel] = useState('');
+  const [authType, setAuthType] = useState<AuthType>('bearer');
+  const [authUrl, setAuthUrl] = useState('');
+  const [authToken, setAuthToken] = useState('');
+  const [authUsername, setAuthUsername] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authHeaderName, setAuthHeaderName] = useState('');
+  const [authApiKeyValue, setAuthApiKeyValue] = useState('');
+  const [authCustomHeaders, setAuthCustomHeaders] = useState<Array<{ key: string; value: string }>>([{ key: '', value: '' }]);
+  const [authUsernameField, setAuthUsernameField] = useState('');
+  const [authPasswordField, setAuthPasswordField] = useState('');
+  const [authCsrfField, setAuthCsrfField] = useState('');
+  const [authTestStatus, setAuthTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [authTestMessage, setAuthTestMessage] = useState('');
+  const [authSaving, setAuthSaving] = useState(false);
+
+  type AutoApproveField = 'passiveRecon' | 'activeScanning' | 'safeActiveRecon' | 'injectionPassive';
+
+  const AUTO_APPROVE_LABELS: Record<AutoApproveField, string> = {
+    passiveRecon: 'Passive Recon',
+    activeScanning: 'Active Scanning',
+    safeActiveRecon: 'Safe Active Recon',
+    injectionPassive: 'Passive Injection Probes',
+  };
+
+  const AUTO_APPROVE_TOOLS: Record<AutoApproveField, string> = {
+    passiveRecon: 'subfinder, amass, waybackurls, whois, dig, curl (GET)',
+    activeScanning: 'httpx, nuclei, katana, nmap',
+    safeActiveRecon: 'gobuster, ffuf, dirb, dirsearch, nmap (non-SYN), nuclei (default templates)',
+    injectionPassive: 'curl GET with SSTI/SQLi/XSS/path-traversal payloads in query strings',
+  };
+
+  // Auto-approve confirmation dialog state
+  const [pendingAutoApprove, setPendingAutoApprove] = useState<{
+    field: AutoApproveField;
+    label: string;
+  } | null>(null);
+
+  /** Intercept auto-approve toggle-on — require explicit confirmation */
+  const handleAutoApproveToggle = (field: AutoApproveField, newValue: boolean) => {
+    if (!newValue) {
+      // Turning OFF doesn't need confirmation
+      updateSettings({ autoApprove: { ...settings.autoApprove, [field]: false } });
+      return;
+    }
+    // Turning ON — show confirmation dialog
+    setPendingAutoApprove({ field, label: AUTO_APPROVE_LABELS[field] });
+  };
+
+  const confirmAutoApprove = () => {
+    if (pendingAutoApprove) {
+      updateSettings({
+        autoApprove: { ...settings.autoApprove, [pendingAutoApprove.field]: true },
+      });
+      setPendingAutoApprove(null);
+    }
+  };
+
+  const resetAuthForm = () => {
+    setShowAuthForm(false);
+    setAuthLabel('');
+    setAuthType('bearer');
+    setAuthUrl('');
+    setAuthToken('');
+    setAuthUsername('');
+    setAuthPassword('');
+    setAuthHeaderName('');
+    setAuthApiKeyValue('');
+    setAuthCustomHeaders([{ key: '', value: '' }]);
+    setAuthUsernameField('');
+    setAuthPasswordField('');
+    setAuthCsrfField('');
+    setAuthTestStatus('idle');
+    setAuthTestMessage('');
+  };
+
+  const handleSaveAuthProfile = async () => {
+    if (!authLabel.trim()) return;
+    setAuthSaving(true);
+
+    const id = `auth_${Date.now()}`;
+    const config: AuthProfileConfig = {
+      id,
+      label: authLabel.trim(),
+      authType,
+    };
+    const credentials: Record<string, string> = {};
+
+    switch (authType) {
+      case 'bearer':
+        config.url = authUrl.trim() || undefined;
+        credentials.token = authToken;
+        break;
+      case 'cookie':
+        config.url = authUrl.trim();
+        config.usernameField = authUsernameField.trim() || undefined;
+        config.passwordField = authPasswordField.trim() || undefined;
+        config.csrfField = authCsrfField.trim() || undefined;
+        credentials.username = authUsername;
+        credentials.password = authPassword;
+        break;
+      case 'api_key':
+        config.headerName = authHeaderName.trim() || 'X-API-Key';
+        credentials.apikey = authApiKeyValue;
+        break;
+      case 'custom_header': {
+        const validHeaders = authCustomHeaders.filter(h => h.key.trim() && h.value.trim());
+        config.customHeaderKeys = validHeaders.map(h => h.key.trim());
+        for (const header of validHeaders) {
+          credentials[`header_${header.key.trim()}`] = header.value.trim();
+        }
+        break;
+      }
+    }
+
+    try {
+      await addAuthProfile(config, credentials);
+      resetAuthForm();
+    } catch (err) {
+      setAuthTestMessage(`Failed to save: ${err instanceof Error ? err.message : String(err)}`);
+      setAuthTestStatus('error');
+    } finally {
+      setAuthSaving(false);
+    }
+  };
+
+  const handleDeleteAuthProfile = async (id: string) => {
+    await removeAuthProfile(id);
+  };
+
+  const AUTH_TYPE_LABELS: Record<AuthProfileConfig['authType'], string> = {
+    bearer: 'Bearer Token',
+    cookie: 'Form Login',
+    api_key: 'API Key',
+    custom_header: 'Custom Headers',
+  };
 
   const factory = getProviderFactory();
   const providers = factory.listProviders();
@@ -34,6 +177,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose })
   const tabs = [
     { id: 'general' as const, label: 'Models' },
     { id: 'keys' as const, label: 'API Keys' },
+    { id: 'auth' as const, label: 'Auth' },
+    { id: 'schemas' as const, label: 'API Schemas' },
     { id: 'terminal' as const, label: 'Terminal' },
     { id: 'advanced' as const, label: 'Advanced' },
   ];
@@ -267,21 +412,85 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose })
               </Section>
 
               <Section title="Auto-Approve Rules">
+                <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '10px', lineHeight: '1.5' }}>
+                  Commands matching these categories bypass the approval modal so unattended hunts
+                  aren't blocked at the 60s timeout. Mutations (POST/PUT/DELETE, sqlmap, hydra) always
+                  require manual approval regardless of these toggles.
+                </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   <CheckboxRow
                     label="Passive Recon"
-                    description="subfinder, amass, waybackurls, whois"
+                    description={AUTO_APPROVE_TOOLS.passiveRecon}
                     checked={settings.autoApprove.passiveRecon}
-                    onChange={(v) => updateSettings({ autoApprove: { ...settings.autoApprove, passiveRecon: v } })}
+                    onChange={(v) => handleAutoApproveToggle('passiveRecon', v)}
                   />
                   <CheckboxRow
-                    label="Active Scanning"
-                    description="httpx, nuclei, katana, nmap"
+                    label="Safe Active Recon"
+                    description={AUTO_APPROVE_TOOLS.safeActiveRecon}
+                    checked={settings.autoApprove.safeActiveRecon}
+                    onChange={(v) => handleAutoApproveToggle('safeActiveRecon', v)}
+                  />
+                  <CheckboxRow
+                    label="Passive Injection Probes"
+                    description={AUTO_APPROVE_TOOLS.injectionPassive}
+                    checked={settings.autoApprove.injectionPassive}
+                    onChange={(v) => handleAutoApproveToggle('injectionPassive', v)}
+                  />
+                  <CheckboxRow
+                    label="Active Scanning (legacy)"
+                    description={AUTO_APPROVE_TOOLS.activeScanning}
                     checked={settings.autoApprove.activeScanning}
-                    onChange={(v) => updateSettings({ autoApprove: { ...settings.autoApprove, activeScanning: v } })}
+                    onChange={(v) => handleAutoApproveToggle('activeScanning', v)}
                   />
                 </div>
               </Section>
+
+              {/* Auto-approve confirmation dialog */}
+              {pendingAutoApprove && (
+                <div style={{
+                  position: 'fixed', inset: 0, zIndex: 9999,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  backgroundColor: 'rgba(0,0,0,0.7)',
+                }}>
+                  <div style={{
+                    backgroundColor: '#111', border: '1px solid #dc2626',
+                    borderRadius: '8px', padding: '24px', maxWidth: '420px', width: '90%',
+                  }}>
+                    <h3 style={{ color: '#ef4444', margin: '0 0 12px 0', fontSize: '16px' }}>
+                      Enable Auto-Approve: {pendingAutoApprove.label}?
+                    </h3>
+                    <p style={{ color: '#d1d5db', fontSize: '13px', lineHeight: '1.5', margin: '0 0 8px 0' }}>
+                      When enabled, agents will execute {pendingAutoApprove.label.toLowerCase()} commands
+                      <strong style={{ color: '#f87171' }}> without asking for your approval</strong>.
+                    </p>
+                    <p style={{ color: '#9ca3af', fontSize: '12px', lineHeight: '1.4', margin: '0 0 16px 0' }}>
+                      This means tools like {AUTO_APPROVE_TOOLS[pendingAutoApprove.field]} will run automatically.
+                      Only enable this if you trust the target scope and understand the risk.
+                    </p>
+                    <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                      <button
+                        onClick={() => setPendingAutoApprove(null)}
+                        style={{
+                          padding: '8px 16px', borderRadius: '4px', border: '1px solid #374151',
+                          backgroundColor: '#1f2937', color: '#d1d5db', cursor: 'pointer', fontSize: '13px',
+                        }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={confirmAutoApprove}
+                        style={{
+                          padding: '8px 16px', borderRadius: '4px', border: '1px solid #dc2626',
+                          backgroundColor: '#7f1d1d', color: '#fca5a5', cursor: 'pointer', fontSize: '13px',
+                          fontWeight: 'bold',
+                        }}
+                      >
+                        I understand — enable
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </>
           )}
 
@@ -434,6 +643,420 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose })
                     </div>
                   )}
                 </div>
+              </Section>
+            </>
+          )}
+
+          {/* ─── AUTH TAB ─── */}
+          {activeTab === 'auth' && (
+            <>
+              <Section title="Auth Profiles" subtitle="Configure authentication for target testing. Credentials are encrypted and stored locally.">
+                {settings.authProfiles.length === 0 && !showAuthForm ? (
+                  <div style={{ color: '#6b7280', fontSize: '12px', fontStyle: 'italic', padding: '12px', backgroundColor: '#000000', border: '1px solid #1f2937', borderRadius: '6px' }}>
+                    No auth profiles configured. Add one to test authenticated endpoints.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {(() => {
+                      // IDOR-ready badge (Q3): shown when two or more distinct
+                      // non-empty roles are configured. The canonical pair is
+                      // victim+attacker, but admin+regular_user, or any two
+                      // named roles, also unlock multi-identity testing via
+                      // http_request's session_label parameter.
+                      const roles = settings.authProfiles
+                        .map(p => p.role)
+                        .filter((r): r is string => typeof r === 'string' && r.length > 0);
+                      const distinctRoles = Array.from(new Set(roles));
+                      if (distinctRoles.length < 2) return null;
+
+                      const hasCanonicalPair =
+                        distinctRoles.includes('victim') && distinctRoles.includes('attacker');
+                      const pairSummary = hasCanonicalPair
+                        ? 'victim + attacker'
+                        : distinctRoles.slice(0, 4).join(' + ');
+
+                      return (
+                        <div
+                          data-testid="idor-ready-badge"
+                          style={{
+                            fontSize: '11px',
+                            color: '#4ade80',
+                            padding: '6px 10px',
+                            border: '1px solid #166534',
+                            borderRadius: '4px',
+                            backgroundColor: 'rgba(22, 101, 52, 0.1)',
+                          }}
+                        >
+                          IDOR-ready: {pairSummary} — agents can call{' '}
+                          <code>http_request</code> with{' '}
+                          <code>session_label: &quot;victim&quot;</code> to test across identities.
+                        </div>
+                      );
+                    })()}
+                    {settings.authProfiles.map((profile) => (
+                      <div key={profile.id} style={{ backgroundColor: '#000000', border: '1px solid #1f2937', borderRadius: '6px', padding: '12px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div>
+                            <span style={{ fontSize: '13px', color: '#ffffff', fontWeight: 'bold' }}>{profile.label}</span>
+                            <span style={{ fontSize: '11px', color: '#9ca3af', marginLeft: '8px' }}>
+                              [{AUTH_TYPE_LABELS[profile.authType]}]
+                            </span>
+                            {profile.role && (
+                              <span style={{ fontSize: '10px', color: '#f59e0b', marginLeft: '8px', padding: '2px 6px', border: '1px solid #92400e', borderRadius: '3px' }}>
+                                role: {profile.role}
+                              </span>
+                            )}
+                          </div>
+                          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                            <span style={{ fontSize: '11px', color: '#4ade80' }}>[SAVED]</span>
+                            <button
+                              onClick={() => handleDeleteAuthProfile(profile.id)}
+                              style={{ color: '#f87171', border: '1px solid #991b1b', padding: '4px 10px', borderRadius: '4px', backgroundColor: 'transparent', cursor: 'pointer', fontFamily: 'monospace', fontSize: '11px' }}
+                            >
+                              [DELETE]
+                            </button>
+                          </div>
+                        </div>
+                        {profile.url && (
+                          <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>{profile.url}</div>
+                        )}
+                        {profile.headerName && (
+                          <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>Header: {profile.headerName}</div>
+                        )}
+                        {profile.customHeaderKeys && profile.customHeaderKeys.length > 0 && (
+                          <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
+                            Headers: {profile.customHeaderKeys.join(', ')}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Section>
+
+              {!showAuthForm ? (
+                <button
+                  onClick={() => setShowAuthForm(true)}
+                  style={{
+                    fontSize: '12px', color: '#f87171', background: 'transparent',
+                    border: '1px solid #991b1b', padding: '8px 16px', borderRadius: '4px',
+                    cursor: 'pointer', fontFamily: 'monospace', width: '100%',
+                  }}
+                >
+                  [+ ADD AUTH PROFILE]
+                </button>
+              ) : (
+                <Section title="New Auth Profile">
+                  <div style={{ backgroundColor: '#000000', border: '1px solid #1f2937', borderRadius: '6px', padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                    {/* Label */}
+                    <div>
+                      <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>Profile Label</label>
+                      <input
+                        type="text"
+                        value={authLabel}
+                        onChange={(e) => setAuthLabel(e.target.value)}
+                        placeholder="e.g., User A, Admin, Tester"
+                        style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#ffffff', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                      />
+                    </div>
+
+                    {/* Auth Type */}
+                    <div>
+                      <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>Auth Type</label>
+                      <select
+                        value={authType}
+                        onChange={(e) => setAuthType(e.target.value as AuthType)}
+                        style={{ width: '100%', padding: '8px 12px', backgroundColor: '#111111', color: '#ffffff', border: '1px solid #374151', borderRadius: '4px', fontSize: '13px', fontFamily: 'monospace' }}
+                      >
+                        <option value="bearer">Bearer Token</option>
+                        <option value="cookie">Form Login</option>
+                        <option value="api_key">API Key</option>
+                        <option value="custom_header">Custom Headers</option>
+                      </select>
+                    </div>
+
+                    {/* ── Bearer Token fields ── */}
+                    {authType === 'bearer' && (
+                      <>
+                        <div>
+                          <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>Bearer Token</label>
+                          <input
+                            type="password"
+                            value={authToken}
+                            onChange={(e) => setAuthToken(e.target.value)}
+                            placeholder="Paste bearer token..."
+                            style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#4ade80', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                          />
+                        </div>
+                        <div>
+                          <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>Validation URL (optional)</label>
+                          <input
+                            type="text"
+                            value={authUrl}
+                            onChange={(e) => setAuthUrl(e.target.value)}
+                            placeholder="https://api.target.com/me"
+                            style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#ffffff', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                          />
+                          <div style={{ fontSize: '10px', color: '#6b7280', marginTop: '2px' }}>GET request to verify the token works</div>
+                        </div>
+                      </>
+                    )}
+
+                    {/* ── Form Login fields ── */}
+                    {authType === 'cookie' && (
+                      <>
+                        <div>
+                          <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>Login URL</label>
+                          <input
+                            type="text"
+                            value={authUrl}
+                            onChange={(e) => setAuthUrl(e.target.value)}
+                            placeholder="https://target.com/login"
+                            style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#ffffff', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                          />
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <div style={{ flex: 1 }}>
+                            <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>Username</label>
+                            <input
+                              type="text"
+                              value={authUsername}
+                              onChange={(e) => setAuthUsername(e.target.value)}
+                              placeholder="user@example.com"
+                              style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#ffffff', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                            />
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>Password</label>
+                            <input
+                              type="password"
+                              value={authPassword}
+                              onChange={(e) => setAuthPassword(e.target.value)}
+                              placeholder="password"
+                              style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#4ade80', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                            />
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <div style={{ flex: 1 }}>
+                            <label style={{ display: 'block', fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>Username field (optional)</label>
+                            <input
+                              type="text"
+                              value={authUsernameField}
+                              onChange={(e) => setAuthUsernameField(e.target.value)}
+                              placeholder="username"
+                              style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#9ca3af', border: '1px solid #1f2937', borderRadius: '4px', fontSize: '11px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                            />
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <label style={{ display: 'block', fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>Password field (optional)</label>
+                            <input
+                              type="text"
+                              value={authPasswordField}
+                              onChange={(e) => setAuthPasswordField(e.target.value)}
+                              placeholder="password"
+                              style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#9ca3af', border: '1px solid #1f2937', borderRadius: '4px', fontSize: '11px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                            />
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <label style={{ display: 'block', fontSize: '11px', color: '#6b7280', marginBottom: '4px' }}>CSRF field (optional)</label>
+                            <input
+                              type="text"
+                              value={authCsrfField}
+                              onChange={(e) => setAuthCsrfField(e.target.value)}
+                              placeholder="_token"
+                              style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#9ca3af', border: '1px solid #1f2937', borderRadius: '4px', fontSize: '11px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                            />
+                          </div>
+                        </div>
+                      </>
+                    )}
+
+                    {/* ── API Key fields ── */}
+                    {authType === 'api_key' && (
+                      <>
+                        <div>
+                          <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>Header Name</label>
+                          <input
+                            type="text"
+                            value={authHeaderName}
+                            onChange={(e) => setAuthHeaderName(e.target.value)}
+                            placeholder="X-API-Key"
+                            style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#ffffff', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                          />
+                        </div>
+                        <div>
+                          <label style={{ display: 'block', fontSize: '11px', color: '#d1d5db', marginBottom: '4px' }}>API Key Value</label>
+                          <input
+                            type="password"
+                            value={authApiKeyValue}
+                            onChange={(e) => setAuthApiKeyValue(e.target.value)}
+                            placeholder="Paste API key..."
+                            style={{ width: '100%', padding: '6px 10px', backgroundColor: '#111111', color: '#4ade80', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace', boxSizing: 'border-box' }}
+                          />
+                        </div>
+                      </>
+                    )}
+
+                    {/* ── Custom Headers fields ── */}
+                    {authType === 'custom_header' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        <label style={{ fontSize: '11px', color: '#d1d5db' }}>Custom Headers</label>
+                        {authCustomHeaders.map((header, idx) => (
+                          <div key={idx} style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                            <input
+                              type="text"
+                              value={header.key}
+                              onChange={(e) => {
+                                const updated = [...authCustomHeaders];
+                                updated[idx] = { ...header, key: e.target.value };
+                                setAuthCustomHeaders(updated);
+                              }}
+                              placeholder="Header-Name"
+                              style={{ flex: 1, padding: '6px 10px', backgroundColor: '#111111', color: '#ffffff', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace' }}
+                            />
+                            <input
+                              type="password"
+                              value={header.value}
+                              onChange={(e) => {
+                                const updated = [...authCustomHeaders];
+                                updated[idx] = { ...header, value: e.target.value };
+                                setAuthCustomHeaders(updated);
+                              }}
+                              placeholder="value"
+                              style={{ flex: 1, padding: '6px 10px', backgroundColor: '#111111', color: '#4ade80', border: '1px solid #374151', borderRadius: '4px', fontSize: '12px', fontFamily: 'monospace' }}
+                            />
+                            {authCustomHeaders.length > 1 && (
+                              <button
+                                onClick={() => setAuthCustomHeaders(authCustomHeaders.filter((_, i) => i !== idx))}
+                                style={{ color: '#f87171', background: 'transparent', border: 'none', cursor: 'pointer', fontFamily: 'monospace', fontSize: '14px', padding: '0 4px' }}
+                              >
+                                x
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                        <button
+                          onClick={() => setAuthCustomHeaders([...authCustomHeaders, { key: '', value: '' }])}
+                          style={{ fontSize: '11px', color: '#9ca3af', background: 'transparent', border: '1px dashed #374151', padding: '6px', borderRadius: '4px', cursor: 'pointer', fontFamily: 'monospace' }}
+                        >
+                          + Add header
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Test status */}
+                    {authTestStatus !== 'idle' && (
+                      <div style={{
+                        fontSize: '11px', padding: '8px', borderRadius: '4px',
+                        backgroundColor: authTestStatus === 'success' ? 'rgba(74, 222, 128, 0.1)' : authTestStatus === 'error' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(251, 191, 36, 0.1)',
+                        border: `1px solid ${authTestStatus === 'success' ? '#166534' : authTestStatus === 'error' ? '#991b1b' : '#92400e'}`,
+                        color: authTestStatus === 'success' ? '#4ade80' : authTestStatus === 'error' ? '#f87171' : '#fbbf24',
+                      }}>
+                        {authTestStatus === 'testing' ? 'Testing...' : authTestMessage}
+                      </div>
+                    )}
+
+                    {/* Actions */}
+                    <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                      <button
+                        onClick={resetAuthForm}
+                        style={{ padding: '8px 16px', borderRadius: '4px', border: '1px solid #374151', backgroundColor: '#1f2937', color: '#d1d5db', cursor: 'pointer', fontSize: '12px', fontFamily: 'monospace' }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleSaveAuthProfile}
+                        disabled={!authLabel.trim() || authSaving}
+                        style={{
+                          padding: '8px 16px', borderRadius: '4px', border: '1px solid #15803d',
+                          backgroundColor: 'rgba(20, 83, 45, 0.5)', color: '#4ade80',
+                          cursor: authLabel.trim() && !authSaving ? 'pointer' : 'not-allowed',
+                          fontSize: '12px', fontWeight: 'bold', fontFamily: 'monospace',
+                          opacity: authLabel.trim() && !authSaving ? 1 : 0.5,
+                        }}
+                      >
+                        {authSaving ? '[SAVING...]' : '[SAVE PROFILE]'}
+                      </button>
+                    </div>
+                  </div>
+                </Section>
+              )}
+            </>
+          )}
+
+          {/* ─── API SCHEMAS TAB ─── */}
+          {activeTab === 'schemas' && (
+            <>
+              <Section title="Upload API Specification" subtitle="Upload OpenAPI 3.x, Swagger 2.x, or GraphQL introspection JSON to generate targeted vulnerability tasks.">
+                <div style={{ backgroundColor: '#000000', border: '1px dashed #374151', borderRadius: '6px', padding: '20px', textAlign: 'center' }}>
+                  <input
+                    type="file"
+                    accept=".json,.yaml,.yml"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      try {
+                        const text = await file.text();
+                        const spec = JSON.parse(text);
+                        const parsed = parseAPISpec(spec, '');
+                        const schemaEntry = {
+                          id: `schema_${Date.now()}`,
+                          name: parsed.title || file.name,
+                          source: parsed.source,
+                          baseUrl: parsed.baseUrl,
+                          endpointCount: parsed.endpoints.length,
+                          uploadedAt: Date.now(),
+                          spec,
+                        };
+                        updateSettings({
+                          apiSchemas: [...(settings.apiSchemas || []), schemaEntry],
+                        });
+                      } catch (err) {
+                        alert(`Failed to parse API spec: ${err instanceof Error ? err.message : 'Unknown error'}`);
+                      }
+                    }}
+                    style={{ display: 'none' }}
+                    id="schema-upload"
+                  />
+                  <label htmlFor="schema-upload" style={{ cursor: 'pointer', color: '#9ca3af', fontSize: '13px', fontFamily: 'monospace' }}>
+                    <div style={{ color: '#ef4444', fontSize: '14px', marginBottom: '4px' }}>[UPLOAD SPEC FILE]</div>
+                    <div>Drag & drop or click to upload .json / .yaml</div>
+                  </label>
+                </div>
+              </Section>
+
+              <Section title="Loaded Schemas">
+                {(!settings.apiSchemas || settings.apiSchemas.length === 0) ? (
+                  <div style={{ color: '#6b7280', fontSize: '12px', fontStyle: 'italic', padding: '12px' }}>
+                    No API schemas loaded. Upload a spec file above.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {settings.apiSchemas.map((schema) => (
+                      <div key={schema.id} style={{ backgroundColor: '#000000', border: '1px solid #1f2937', borderRadius: '6px', padding: '12px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div>
+                            <div style={{ fontSize: '13px', color: '#ffffff', fontWeight: 'bold' }}>{schema.name}</div>
+                            <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '2px' }}>
+                              {schema.source.toUpperCase()} | {schema.endpointCount} endpoints | {schema.baseUrl || 'No base URL'}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => {
+                              updateSettings({
+                                apiSchemas: settings.apiSchemas.filter((s) => s.id !== schema.id),
+                              });
+                            }}
+                            style={{ color: '#f87171', border: '1px solid #991b1b', padding: '4px 10px', borderRadius: '4px', backgroundColor: 'transparent', cursor: 'pointer', fontFamily: 'monospace', fontSize: '11px' }}
+                          >
+                            [REMOVE]
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </Section>
             </>
           )}

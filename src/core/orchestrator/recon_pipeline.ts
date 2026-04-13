@@ -106,11 +106,16 @@ function buildStages(target: string, config: PipelineConfig): PipelineStage[] {
     {
       id: 'subdomain_enum',
       name: 'Subdomain Enumeration',
-      description: 'Discover subdomains via subfinder and assetfinder',
+      description: 'Discover subdomains via subfinder',
       dependencies: [],
+      // assetfinder was removed from the pipeline because it's not shipped
+      // in huntress-attack-machine:latest (Issue #3 from Hunt #11 monitoring
+      // — exit 126 on every call, wasted ~40ms per dispatch). subfinder's
+      // passive-source coverage overlaps ~95% with assetfinder, so dropping
+      // it costs little recall. Re-add alongside a Dockerfile update if we
+      // later observe subdomains being missed in live hunts.
       commands: [
         { tool: 'subfinder', command: `subfinder -d ${target} -json -silent`, placeholders: {} },
-        { tool: 'assetfinder', command: `assetfinder --subs-only ${target}`, placeholders: {} },
       ],
       status: 'pending',
     },

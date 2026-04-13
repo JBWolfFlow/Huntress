@@ -27,6 +27,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const IDOR_SYSTEM_PROMPT = `You are an elite access control and IDOR (Insecure Direct Object Reference) security researcher. Your mission is to systematically discover authorization vulnerabilities where one user can access or modify another user's resources by manipulating object identifiers. You approach each test methodically, carefully comparing authorized vs unauthorized responses, and you document every finding with precise reproduction steps.
 
@@ -230,7 +231,7 @@ export class IDORHunterAgent implements BaseAgent {
         systemPrompt: IDOR_SYSTEM_PROMPT,
         goal: `Systematically test for IDOR and access control vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -246,6 +247,10 @@ export class IDORHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -264,6 +269,7 @@ export class IDORHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

@@ -16,12 +16,17 @@ import axios, { AxiosInstance } from 'axios';
 import type { H1Report } from './h1_api';
 import type { DuplicateScore, DuplicateMatch } from '../../utils/duplicate_checker';
 import { computeSimHash, simHashDistance } from '../orchestrator/finding_dedup';
+import type { HuntMemory } from '../memory/hunt_memory';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 export interface H1DuplicateConfig {
   h1Username?: string;
   h1ApiToken?: string;
+  /** GitHub PAT for advisory search (S1: GitHub duplicate source) */
+  githubToken?: string;
+  /** HuntMemory instance for internal duplicate matching (S1: internal source) */
+  huntMemory?: HuntMemory;
   /** Cache disclosed reports per program for 1 hour (default true) */
   cacheDisclosedReports?: boolean;
   /** Minimum similarity to flag as a potential match (default 0.7) */
@@ -111,6 +116,8 @@ function normalizeVulnType(raw: string): string {
 
 export class H1DuplicateChecker {
   private client: AxiosInstance | null;
+  private githubClient: AxiosInstance | null;
+  private huntMemory: HuntMemory | null;
   private cache: Map<string, CacheEntry>;
   private cacheEnabled: boolean;
   private similarityThreshold: number;
@@ -119,8 +126,13 @@ export class H1DuplicateChecker {
   constructor(config: H1DuplicateConfig) {
     this.cache = new Map();
     this.cacheEnabled = config.cacheDisclosedReports ?? true;
-    this.similarityThreshold = config.similarityThreshold ?? 0.7;
+    // Phase 4.1 tuning: lowered from 0.7 to 0.5 — Jaccard+SimHash produces
+    // lower scores than expected for paraphrased descriptions of the same vuln.
+    // 0.5 catches more potential duplicates for human review, which is safer
+    // than missing real duplicates at a higher threshold.
+    this.similarityThreshold = config.similarityThreshold ?? 0.5;
     this.configured = !!(config.h1Username && config.h1ApiToken);
+    this.huntMemory = config.huntMemory ?? null;
 
     if (this.configured) {
       this.client = axios.create({
@@ -138,42 +150,68 @@ export class H1DuplicateChecker {
     } else {
       this.client = null;
     }
+
+    // S1: GitHub advisory client
+    if (config.githubToken) {
+      this.githubClient = axios.create({
+        baseURL: 'https://api.github.com',
+        timeout: 15_000,
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${config.githubToken}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      });
+    } else {
+      this.githubClient = null;
+    }
   }
 
   // ─── Public API ───────────────────────────────────────────────────────────
 
   /**
    * Full duplicate check pipeline: fetch disclosed reports, compare, score.
+   * Queries all available sources: H1 hacktivity, GitHub advisories, internal memory.
    * Never throws -- always returns a DuplicateScore.
    */
   async checkDuplicate(report: H1Report, programHandle: string): Promise<DuplicateScore> {
-    if (!this.configured || !this.client) {
-      return this.buildEmptyScore('H1 API credentials not configured — skipping HackerOne duplicate check');
+    // If no sources are configured at all, return a conservative "review" recommendation
+    const hasAnySources = this.configured || this.githubClient !== null || this.huntMemory !== null;
+    if (!hasAnySources) {
+      return {
+        overall: 0,
+        h1Match: 0,
+        githubMatch: 0,
+        internalMatch: 0,
+        recommendation: 'review',
+        matches: [],
+        reasoning: ['H1 API credentials not configured and no other duplicate sources available — manual review recommended'],
+      };
     }
 
-    let disclosed: DisclosedReport[];
+    // Run all three source checks concurrently — each is independently fault-tolerant
+    const [h1Matches, githubResult, internalResult] = await Promise.all([
+      this.getH1Matches(report, programHandle),
+      this.searchGitHubAdvisories(report),
+      this.checkInternalDuplicates(report),
+    ]);
+
+    return this.buildScore(h1Matches, githubResult.score, githubResult.matches, internalResult.score, internalResult.matches);
+  }
+
+  /**
+   * H1 hacktivity source: fetch disclosed reports and compare.
+   */
+  private async getH1Matches(report: H1Report, programHandle: string): Promise<DuplicateMatch[]> {
+    if (!this.configured || !this.client) return [];
+
     try {
-      disclosed = await this.getDisclosedReports(programHandle, this.inferVulnType(report));
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return this.buildEmptyScore(`Failed to fetch disclosed reports: ${message}`);
+      const disclosed = await this.getDisclosedReports(programHandle, this.inferVulnType(report));
+      if (disclosed.length === 0) return [];
+      return await this.compareWithDisclosed(report, disclosed);
+    } catch {
+      return [];
     }
-
-    if (disclosed.length === 0) {
-      return this.buildEmptyScore(
-        `No disclosed reports found for program "${programHandle}" — cannot check duplicates`,
-      );
-    }
-
-    let matches: DuplicateMatch[];
-    try {
-      matches = await this.compareWithDisclosed(report, disclosed);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return this.buildEmptyScore(`Comparison failed: ${message}`);
-    }
-
-    return this.buildScore(matches);
   }
 
   /**
@@ -634,35 +672,212 @@ export class H1DuplicateChecker {
     }
   }
 
+  // ─── S1: GitHub Advisory Search ────────────────────────────────────────────
+
+  /**
+   * Search GitHub Security Advisories for CVE/CWE matches against the report.
+   * Returns a similarity score (0-1) and any matching advisories.
+   */
+  private async searchGitHubAdvisories(
+    report: H1Report,
+  ): Promise<{ score: number; matches: DuplicateMatch[] }> {
+    if (!this.githubClient) return { score: 0, matches: [] };
+
+    // Build search keywords from the report's vuln type and CWEs
+    const vulnType = this.inferVulnType(report);
+    const cwes = this.extractCWEs(`${report.title} ${report.description}`);
+    const searchKeywords: string[] = [];
+
+    if (vulnType) searchKeywords.push(normalizeVulnType(vulnType));
+    for (const cwe of cwes) searchKeywords.push(cwe.toUpperCase());
+
+    // Fall back to title keywords if no structured type info
+    if (searchKeywords.length === 0) {
+      const titleType = this.extractVulnTypeFromTitle(report.title);
+      if (titleType) searchKeywords.push(titleType);
+    }
+
+    if (searchKeywords.length === 0) return { score: 0, matches: [] };
+
+    const matches: DuplicateMatch[] = [];
+
+    try {
+      // Query GitHub advisories API with the most specific keyword
+      const query = searchKeywords[0];
+      const response = await this.githubClient.get('/advisories', {
+        params: {
+          type: 'reviewed',
+          per_page: 10,
+        },
+        // Use the keyword filter via the API query parameter
+        paramsSerializer: (params) => {
+          const parts: string[] = [];
+          for (const [key, value] of Object.entries(params)) {
+            parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+          }
+          // GitHub advisories filter by keyword in the path
+          parts.push(`keywords=${encodeURIComponent(query)}`);
+          return parts.join('&');
+        },
+      });
+
+      const advisories: unknown[] = response.data ?? [];
+
+      for (const advisory of advisories) {
+        const adv = advisory as Record<string, unknown>;
+        const ghsaId = String(adv.ghsa_id ?? '');
+        const summary = String(adv.summary ?? '');
+        const description = String(adv.description ?? '');
+        const cveId = String(adv.cve_id ?? '');
+        const htmlUrl = String(adv.html_url ?? '');
+        const publishedAt = String(adv.published_at ?? '');
+
+        // Compute similarity between our report and the advisory
+        const titleSim = this.jaccardSimilarity(report.title, summary);
+        const descSim = this.descriptionSimilarity(report.description, description);
+
+        // CWE match boost
+        const advCwes = this.extractAdvisoryCWEs(adv);
+        let cweBoost = 0;
+        for (const ourCwe of cwes) {
+          if (advCwes.has(ourCwe)) {
+            cweBoost = 0.2;
+            break;
+          }
+        }
+
+        const similarity = Math.min(1.0, titleSim * 0.4 + descSim * 0.4 + cweBoost + 0.0);
+
+        if (similarity >= 0.3) {
+          matches.push({
+            source: 'github',
+            title: summary || cveId || ghsaId,
+            url: htmlUrl,
+            similarity,
+            reportId: cveId || ghsaId,
+            disclosedAt: publishedAt,
+          });
+        }
+      }
+    } catch {
+      // GitHub API failure is non-fatal — return empty
+      return { score: 0, matches: [] };
+    }
+
+    matches.sort((a, b) => b.similarity - a.similarity);
+    const bestScore = matches.length > 0 ? matches[0].similarity : 0;
+    return { score: bestScore, matches };
+  }
+
+  /** Extract CWE IDs from a GitHub advisory object */
+  private extractAdvisoryCWEs(advisory: Record<string, unknown>): Set<string> {
+    const result = new Set<string>();
+    const cwes = advisory.cwes as Array<Record<string, unknown>> | undefined;
+    if (Array.isArray(cwes)) {
+      for (const cwe of cwes) {
+        const id = String(cwe.cwe_id ?? '').toLowerCase();
+        if (id) result.add(id);
+      }
+    }
+    return result;
+  }
+
+  // ─── S1: Internal Memory Duplicate Check ──────────────────────────────────
+
+  /**
+   * Check HuntMemory (Qdrant) for semantically similar past findings.
+   * Returns a similarity score (0-1) and any matching past findings.
+   */
+  private async checkInternalDuplicates(
+    report: H1Report,
+  ): Promise<{ score: number; matches: DuplicateMatch[] }> {
+    if (!this.huntMemory) return { score: 0, matches: [] };
+
+    try {
+      const dupResult = await this.huntMemory.checkDuplicate({
+        title: report.title,
+        vulnerabilityType: report.weaknessId ?? this.inferVulnType(report) ?? 'unknown',
+        severity: report.severity,
+        target: '', // We don't filter by target for broad internal matching
+        description: report.description,
+        evidence: report.steps ?? [],
+        confidence: 50,
+      }, 0.5); // Lower threshold to catch more potential matches
+
+      if (dupResult.isDuplicate && dupResult.similarFinding) {
+        const finding = dupResult.similarFinding;
+        const match: DuplicateMatch = {
+          source: 'internal',
+          title: String(finding.payload.title ?? 'Previous finding'),
+          url: '', // Internal findings don't have URLs
+          similarity: finding.score,
+          reportId: finding.id,
+        };
+        return { score: finding.score, matches: [match] };
+      }
+    } catch {
+      // Hunt memory failure is non-fatal
+    }
+
+    return { score: 0, matches: [] };
+  }
+
   // ─── Score Builders ───────────────────────────────────────────────────────
 
   /**
-   * Build a DuplicateScore from the set of matches found.
+   * Build a DuplicateScore from all available sources.
+   * Composite scoring: H1 (40%), GitHub (30%), Internal (30%).
    */
-  private buildScore(matches: DuplicateMatch[]): DuplicateScore {
-    const h1Match = matches.length > 0
-      ? Math.max(...matches.map(m => m.similarity))
+  private buildScore(
+    h1Matches: DuplicateMatch[],
+    githubScore: number,
+    githubMatches: DuplicateMatch[],
+    internalScore: number,
+    internalMatches: DuplicateMatch[],
+  ): DuplicateScore {
+    const h1Match = h1Matches.length > 0
+      ? Math.max(...h1Matches.map(m => m.similarity))
       : 0;
 
-    const overall = Math.round(h1Match * 100);
+    // Composite score weighted across sources
+    const compositeRaw = h1Match * 0.4 + githubScore * 0.3 + internalScore * 0.3;
+    const overall = Math.round(Math.min(100, compositeRaw * 100));
 
     const reasoning: string[] = [];
+    const allMatches = [...h1Matches, ...githubMatches, ...internalMatches];
 
-    if (matches.length === 0) {
+    // H1 reasoning
+    if (h1Matches.length === 0) {
       reasoning.push('No similar disclosed reports found on HackerOne');
     } else {
-      const topMatch = matches[0];
+      const topMatch = h1Matches[0];
       reasoning.push(
         `Closest H1 match: "${topMatch.title}" (${(topMatch.similarity * 100).toFixed(1)}% similarity)`,
       );
-      if (matches.length > 1) {
+      if (h1Matches.length > 1) {
         reasoning.push(
-          `${matches.length - 1} additional similar report(s) found`,
+          `${h1Matches.length - 1} additional H1 match(es) found`,
         );
       }
     }
 
-    const recommendation = this.deriveRecommendation(h1Match);
+    // GitHub reasoning
+    if (githubMatches.length > 0) {
+      const topGh = githubMatches[0];
+      reasoning.push(
+        `GitHub advisory match: "${topGh.title}" (${(topGh.similarity * 100).toFixed(1)}% similarity)`,
+      );
+    }
+
+    // Internal reasoning
+    if (internalMatches.length > 0) {
+      const topInt = internalMatches[0];
+      reasoning.push(
+        `Internal past finding match: "${topInt.title}" (${(topInt.similarity * 100).toFixed(1)}% similarity)`,
+      );
+    }
+
+    const recommendation = this.deriveRecommendation(h1Match, githubScore, internalScore);
     switch (recommendation) {
       case 'submit':
         reasoning.push('Low duplicate risk — safe to submit');
@@ -678,38 +893,34 @@ export class H1DuplicateChecker {
     return {
       overall,
       h1Match,
-      githubMatch: 0,
-      internalMatch: 0,
+      githubMatch: githubScore,
+      internalMatch: internalScore,
       recommendation,
-      matches,
+      matches: allMatches,
       reasoning,
     };
   }
 
   /**
-   * Build an empty DuplicateScore with a single reasoning message.
-   * Used when the checker cannot perform a comparison.
-   */
-  private buildEmptyScore(reason: string): DuplicateScore {
-    return {
-      overall: 0,
-      h1Match: 0,
-      githubMatch: 0,
-      internalMatch: 0,
-      recommendation: 'review',
-      matches: [],
-      reasoning: [reason],
-    };
-  }
-
-  /**
-   * Derive a submit / review / skip recommendation from the h1Match score.
+   * Derive a submit / review / skip recommendation from all source scores.
+   * Uses the composite of all available sources with H1 as the strongest signal.
    */
   private deriveRecommendation(
     h1Match: number,
+    githubScore: number = 0,
+    internalScore: number = 0,
   ): 'submit' | 'review' | 'skip' {
+    // H1 match alone can trigger skip (program-specific, most authoritative)
     if (h1Match >= 0.9) return 'skip';
-    if (h1Match >= 0.7) return 'review';
+
+    // Composite score for review/skip thresholds
+    const composite = h1Match * 0.4 + githubScore * 0.3 + internalScore * 0.3;
+    if (composite >= 0.8) return 'skip';
+    if (composite >= 0.5) return 'review';
+
+    // Individual high scores from any source trigger review
+    if (h1Match >= 0.7 || githubScore >= 0.7 || internalScore >= 0.85) return 'review';
+
     return 'submit';
   }
 }

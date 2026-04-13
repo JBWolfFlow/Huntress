@@ -23,8 +23,9 @@ import type {
   CommandResult,
   ReactFinding,
 } from '../core/engine/react_loop';
-import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import { AGENT_TOOL_SCHEMAS, BROWSER_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const PROTOTYPE_POLLUTION_SYSTEM_PROMPT = `You are an expert JavaScript prototype pollution security researcher. Your mission is to systematically discover prototype pollution vulnerabilities in the target application — both server-side (Node.js/Express) and client-side (browser JavaScript). Prototype pollution can lead to RCE, DoS, authentication bypass, and XSS depending on the application.
 
@@ -189,8 +190,8 @@ export class PrototypePollutionHunterAgent implements BaseAgent {
         model: this.model,
         systemPrompt: PROTOTYPE_POLLUTION_SYSTEM_PROMPT,
         goal: `Systematically test for prototype pollution vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
-        tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        tools: [...AGENT_TOOL_SCHEMAS, ...BROWSER_TOOL_SCHEMAS],
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -206,6 +207,11 @@ export class PrototypePollutionHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
+        browserEnabled: true,
       });
 
       const result = await loop.execute();
@@ -224,6 +230,7 @@ export class PrototypePollutionHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

@@ -74,6 +74,39 @@ export function getAnthropicModelForComplexity(complexity: TaskComplexity): stri
   return ANTHROPIC_MODEL_TIERS[complexity];
 }
 
+// ─── Adaptive Iteration Budgets (I1) ────────────────────────────────────────
+
+/**
+ * Max ReAct loop iterations by complexity tier.
+ * Simple agents (recon, CORS) finish fast — 30 is plenty.
+ * Moderate agents (XSS, SQLi) need more exploration — 80.
+ * Complex agents (business logic, race conditions, IDOR) may need extended
+ * iteration chains to find multi-step vulns — 120.
+ */
+const ITERATION_BUDGETS: Record<TaskComplexity, number> = {
+  simple: 30,
+  moderate: 80,
+  complex: 120,
+};
+
+/**
+ * Get the iteration budget for an agent type.
+ * Uses the agent's complexity tier to determine max iterations.
+ * Unknown agents default to 80 (moderate).
+ */
+export function getIterationBudget(agentType: string): number {
+  const complexity = AGENT_COMPLEXITY[agentType] ?? 'moderate';
+  return ITERATION_BUDGETS[complexity];
+}
+
+/**
+ * Get the complexity tier for an agent type.
+ * Returns 'moderate' for unknown agent types.
+ */
+export function getAgentComplexity(agentType: string): TaskComplexity {
+  return AGENT_COMPLEXITY[agentType] ?? 'moderate';
+}
+
 /** Keywords in task descriptions that indicate higher complexity */
 const COMPLEX_KEYWORDS = [
   'chain', 'bypass', 'authentication', 'authorization',
@@ -87,7 +120,28 @@ const SIMPLE_KEYWORDS = [
 ];
 
 /**
+ * Agent types whose complexity is locked and cannot be upgraded by
+ * keyword analysis. These agents perform structured, low-reasoning
+ * tasks that should always use the cheapest model regardless of what
+ * security keywords appear in the target description.
+ */
+const COMPLEXITY_LOCKED_AGENTS = new Set<string>([
+  'recon',
+  'subdomain-takeover-hunter',
+  'cors-hunter',
+  'host-header-hunter',
+  'crlf-hunter',
+  'cache-hunter',
+  'open-redirect-hunter',
+]);
+
+/**
  * Classify task complexity based on agent type and description.
+ *
+ * Priority order:
+ * 1. Locked agents always return their base complexity (no keyword upgrade)
+ * 2. Known agents use base complexity, with keyword upgrade as tiebreaker
+ * 3. Unknown agents classify purely by description keywords
  */
 export function classifyTaskComplexity(
   agentType: string,
@@ -96,6 +150,11 @@ export function classifyTaskComplexity(
   // Check known agent types first
   const known = AGENT_COMPLEXITY[agentType];
   if (known) {
+    // Locked agents: never upgrade regardless of description content
+    if (COMPLEXITY_LOCKED_AGENTS.has(agentType)) {
+      return known;
+    }
+
     // Description-based override: upgrade if complex keywords found
     const descLower = taskDescription.toLowerCase();
 

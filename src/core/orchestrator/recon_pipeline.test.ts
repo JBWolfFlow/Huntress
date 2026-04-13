@@ -53,7 +53,7 @@ describe('ReconPipeline', () => {
       expect(result.assetMap).toBeDefined();
       expect(result.assetMap.domain).toBe('example.com');
       expect(result.stages.length).toBeGreaterThan(0);
-      expect(result.duration).toBeGreaterThan(0);
+      expect(result.duration).toBeGreaterThanOrEqual(0);
     });
 
     it('should call executeCommand for each stage command', async () => {

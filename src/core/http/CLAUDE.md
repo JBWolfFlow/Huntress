@@ -10,4 +10,18 @@
 | #561 | 1:34 PM | 🔵 | Critical Gap: No Circuit Breaker for API Credit Exhaustion in Orchestrator Dispatch Loop | ~739 |
 | #518 | 2:42 AM | 🔵 | HTTP Request Engine Scope Validation Before Every Request | ~696 |
 | #514 | 2:41 AM | 🔵 | Rust validate_target Tauri Command Used in Six Components | ~508 |
+
+### Apr 10, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #923 | 12:35 AM | 🔵 | Auth Detection Feasibility Research via Explore Agent | ~765 |
+
+### Apr 12, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #1249 | 2:33 AM | ⚖️ | External observability tool selection for Huntress platform | ~1097 |
+| #1244 | 2:32 AM | 🔵 | Context management and local-first observability architecture | ~830 |
+| #1240 | 2:31 AM | 🔵 | Huntress internal observability stack and external tool evaluation | ~859 |
 </claude-mem-context>

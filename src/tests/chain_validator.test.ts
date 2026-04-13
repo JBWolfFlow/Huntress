@@ -212,6 +212,7 @@ describe('ChainValidator', () => {
         impact: 'Session hijacking',
         chainSteps: ['Step 1: XSS', 'Step 2: Cookie theft'],
         confidenceBoost: 15,
+        validated: false,
       };
 
       const result = await validator.validateChain(chain);
@@ -242,6 +243,7 @@ describe('ChainValidator', () => {
         impact: 'Test',
         chainSteps: ['Step 1'],
         confidenceBoost: 0,
+        validated: false,
       };
 
       const result = await validator.validateChain(chain);
@@ -267,6 +269,7 @@ describe('ChainValidator', () => {
         impact: 'Test',
         chainSteps: ['Step 1'],
         confidenceBoost: 0,
+        validated: false,
       };
 
       const result = await validator.validateChain(chain);
@@ -408,6 +411,7 @@ describe('ChainValidator', () => {
         impact: 'Account takeover',
         chainSteps: ['Step 1: XSS', 'Step 2: CSRF'],
         confidenceBoost: 15,
+        validated: false,
       };
 
       const poc = await validator.generateChainPoC(chain);
@@ -434,6 +438,7 @@ describe('ChainValidator', () => {
         impact: 'Test',
         chainSteps: ['Step 1'],
         confidenceBoost: 0,
+        validated: false,
       };
 
       const poc = await validator.generateChainPoC(chain);

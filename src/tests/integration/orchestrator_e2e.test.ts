@@ -272,7 +272,7 @@ describe('Finding Dedup Integration', () => {
         title: 'XSS on site A',
         severity: 'medium' as const,
         description: 'XSS in q param',
-        target: 'https://a.example.com/search?q=test',
+        target: 'https://siteA.com/search?q=test',
         evidence: ['GET /search?q=test'],
         reproduction: [],
         timestamp: new Date(),
@@ -284,7 +284,7 @@ describe('Finding Dedup Integration', () => {
         title: 'XSS on site B',
         severity: 'medium' as const,
         description: 'XSS in q param',
-        target: 'https://b.example.com/search?q=test',
+        target: 'https://siteB.com/search?q=test',
         evidence: ['GET /search?q=test'],
         reproduction: [],
         timestamp: new Date(),
@@ -346,7 +346,8 @@ describe('Cost Router Integration', () => {
     expect(classifyTaskComplexity('recon', 'enumerate subdomains')).toBe('simple');
     expect(classifyTaskComplexity('xss', 'test for reflected XSS')).toBe('moderate');
     expect(classifyTaskComplexity('orchestrator', 'analyze strategy')).toBe('complex');
-    expect(classifyTaskComplexity('recon', 'bypass WAF authentication')).toBe('moderate');
+    // recon is a locked agent — never upgrades regardless of description keywords
+    expect(classifyTaskComplexity('recon', 'bypass WAF authentication')).toBe('simple');
   });
 
   it('should select cheapest model for simple tasks', async () => {

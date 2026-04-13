@@ -1515,12 +1515,519 @@ registerValidator({
   },
 });
 
+// ─── OAuth Validators (H24 — Hunt #7 Fix) ─────────────────────────────────
+// All 9 oauth_* finding types need concrete validators that verify
+// exploitation evidence, not just HTTP 200 status codes.
+
+/**
+ * Shared helper for OAuth validators: extract the OAuth authorization endpoint
+ * from the finding's target URL or evidence.
+ */
+function extractOAuthEndpoint(finding: ReactFinding): string {
+  // Use the finding target directly — agents set this to the OAuth endpoint
+  return finding.target;
+}
+
+/**
+ * Check if an HTTP response indicates the server accepted the OAuth request
+ * (2xx or 3xx redirect to a legitimate redirect_uri), not just returned HTML.
+ */
+function isOAuthFlowAccepted(response: string): boolean {
+  // Check for redirect to callback URI (the flow was accepted)
+  const statusMatch = response.match(/HTTP\/[\d.]+ (\d{3})/);
+  const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+  if (status >= 300 && status < 400) return true;
+
+  // Check for authorization code in Location or body
+  if (/[?&]code=/.test(response)) return true;
+  if (/[?&]access_token=/.test(response)) return true;
+
+  return false;
+}
+
+// oauth_missing_state — Server accepts OAuth flow without state parameter
+registerValidator({
+  vulnType: 'oauth_missing_state',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+    let confirmed = false;
+    let confidence = finding.confidence;
+
+    const endpoint = extractOAuthEndpoint(finding);
+    steps.push(`Testing OAuth endpoint: ${endpoint}`);
+
+    // Step 1: Send OAuth authorization request WITHOUT state parameter
+    // Remove state param if present, keep other params
+    let statelessUrl = endpoint;
+    try {
+      const url = new URL(endpoint);
+      url.searchParams.delete('state');
+      statelessUrl = url.toString();
+    } catch {
+      // If not a valid URL, try regex removal
+      statelessUrl = endpoint.replace(/[?&]state=[^&]*/g, '');
+    }
+
+    const result = await config.executeCommand(
+      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', statelessUrl].join('\x00'),
+      finding.target
+    );
+
+    evidence.push({
+      type: 'http_request',
+      description: 'OAuth request without state parameter',
+      data: `GET ${statelessUrl}`,
+      timestamp: Date.now(),
+    });
+
+    evidence.push({
+      type: 'http_response',
+      description: 'Server response to stateless request',
+      data: result.stdout.substring(0, 5000),
+      timestamp: Date.now(),
+    });
+
+    steps.push(`Sent request without state parameter`);
+
+    // Step 2: Check if server accepted the request (redirect or auth code)
+    if (isOAuthFlowAccepted(result.stdout)) {
+      confirmed = true;
+      confidence = Math.min(100, confidence + 30);
+      steps.push('Server accepted OAuth flow without state parameter — CSRF possible');
+    } else {
+      // Check if server returned 400/error requiring state
+      const statusMatch = result.stdout.match(/HTTP\/[\d.]+ (\d{3})/);
+      const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+      if (status === 400 || status === 403) {
+        steps.push(`Server rejected stateless request (HTTP ${status}) — state is enforced`);
+        confidence = Math.max(0, confidence - 40);
+      } else {
+        steps.push(`Inconclusive: HTTP ${status}, no redirect or code in response`);
+      }
+    }
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: 'oauth_missing_state',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// oauth_downgrade_attack — Server accepts OAuth without PKCE code_challenge
+registerValidator({
+  vulnType: 'oauth_downgrade_attack',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+    let confirmed = false;
+    let confidence = finding.confidence;
+
+    const endpoint = extractOAuthEndpoint(finding);
+
+    // Step 1: Send request WITH code_challenge
+    const result1 = await config.executeCommand(
+      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', endpoint].join('\x00'),
+      finding.target
+    );
+
+    evidence.push({
+      type: 'http_response',
+      description: 'Response with code_challenge present',
+      data: result1.stdout.substring(0, 3000),
+      timestamp: Date.now(),
+    });
+    steps.push('Sent request with code_challenge parameter');
+
+    // Step 2: Send request WITHOUT code_challenge
+    let noChallengeUrl = endpoint;
+    try {
+      const url = new URL(endpoint);
+      url.searchParams.delete('code_challenge');
+      url.searchParams.delete('code_challenge_method');
+      noChallengeUrl = url.toString();
+    } catch {
+      noChallengeUrl = endpoint
+        .replace(/[?&]code_challenge=[^&]*/g, '')
+        .replace(/[?&]code_challenge_method=[^&]*/g, '');
+    }
+
+    const result2 = await config.executeCommand(
+      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', noChallengeUrl].join('\x00'),
+      finding.target
+    );
+
+    evidence.push({
+      type: 'http_response',
+      description: 'Response without code_challenge (downgrade attempt)',
+      data: result2.stdout.substring(0, 3000),
+      timestamp: Date.now(),
+    });
+    steps.push('Sent request without code_challenge (downgrade attempt)');
+
+    // Step 3: Check if BOTH requests were accepted (codes issued)
+    const withChallenge = isOAuthFlowAccepted(result1.stdout);
+    const withoutChallenge = isOAuthFlowAccepted(result2.stdout);
+
+    if (withChallenge && withoutChallenge) {
+      confirmed = true;
+      confidence = Math.min(100, confidence + 30);
+      steps.push('Both requests accepted — PKCE can be downgraded');
+    } else if (withoutChallenge && !withChallenge) {
+      steps.push('Only non-PKCE request accepted — unexpected but still a downgrade');
+      confidence = Math.min(100, confidence + 10);
+    } else if (!withoutChallenge) {
+      steps.push('Server rejected request without code_challenge — PKCE enforced');
+      confidence = Math.max(0, confidence - 40);
+    }
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: 'oauth_downgrade_attack',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// oauth_weak_verifier — PKCE verifier is too short (< 43 chars per RFC 7636)
+registerValidator({
+  vulnType: 'oauth_weak_verifier',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+    let confirmed = false;
+    let confidence = finding.confidence;
+
+    const endpoint = extractOAuthEndpoint(finding);
+
+    // Extract the code_verifier from finding evidence
+    const verifierMatch = finding.evidence.join(' ').match(/code_verifier[=:]\s*([^\s&"]+)/i);
+    const verifier = verifierMatch ? verifierMatch[1] : '';
+
+    if (verifier && verifier.length < 43) {
+      steps.push(`Weak verifier found: length ${verifier.length} (RFC 7636 minimum: 43)`);
+
+      // Verify the server accepted the weak verifier
+      const result = await config.executeCommand(
+        ['curl', '-s', '-D', '-', '-o', '-', endpoint].join('\x00'),
+        finding.target
+      );
+
+      evidence.push({
+        type: 'http_response',
+        description: `Server response with weak verifier (length ${verifier.length})`,
+        data: result.stdout.substring(0, 3000),
+        timestamp: Date.now(),
+      });
+
+      if (isOAuthFlowAccepted(result.stdout) || result.stdout.includes('access_token')) {
+        confirmed = true;
+        confidence = Math.min(100, confidence + 35);
+        steps.push('Server accepted weak verifier — vulnerable to brute-force');
+      } else {
+        steps.push('Server may have rejected the weak verifier');
+      }
+    } else if (verifier) {
+      steps.push(`Verifier length ${verifier.length} meets RFC 7636 minimum (43) — not weak`);
+      confidence = Math.max(0, confidence - 50);
+    } else {
+      steps.push('No code_verifier found in evidence — cannot verify');
+      confidence = Math.max(0, confidence - 30);
+    }
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: 'oauth_weak_verifier',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// oauth_scope_escalation — Server grants elevated scope beyond what was authorized
+registerValidator({
+  vulnType: 'oauth_scope_escalation',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+    let confirmed = false;
+    let confidence = finding.confidence;
+
+    const endpoint = extractOAuthEndpoint(finding);
+
+    // Re-send the request that claims scope escalation
+    const result = await config.executeCommand(
+      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', endpoint].join('\x00'),
+      finding.target
+    );
+
+    evidence.push({
+      type: 'http_response',
+      description: 'Response to scope escalation request',
+      data: result.stdout.substring(0, 5000),
+      timestamp: Date.now(),
+    });
+    steps.push('Re-sent OAuth request with escalated scope parameter');
+
+    // Check if the response actually grants the escalated scope
+    // Look for scope field in response body or token
+    const grantedScope = result.stdout.match(/"scope"\s*:\s*"([^"]+)"/);
+    const requestedScope = endpoint.match(/[?&]scope=([^&]+)/);
+
+    if (grantedScope && requestedScope) {
+      const granted = decodeURIComponent(grantedScope[1]);
+      const requested = decodeURIComponent(requestedScope[1]);
+      steps.push(`Requested scope: ${requested}`);
+      steps.push(`Granted scope: ${granted}`);
+
+      // Check if granted scope includes more permissions than a base scope
+      if (granted.includes(requested) || granted.split(' ').length > 1) {
+        confirmed = true;
+        confidence = Math.min(100, confidence + 25);
+        steps.push('Server granted escalated scope — privilege escalation confirmed');
+      }
+    } else if (isOAuthFlowAccepted(result.stdout)) {
+      // Flow accepted but no explicit scope grant — check for code/token
+      steps.push('Flow accepted but scope field not found in response — insufficient evidence');
+      confidence = Math.max(0, confidence - 20);
+    } else {
+      steps.push('Server did not accept the escalated scope request');
+      confidence = Math.max(0, confidence - 40);
+    }
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: 'oauth_scope_escalation',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// Shared OAuth validator for remaining types — re-sends the request and checks
+// for concrete exploitation evidence (not just HTTP 200)
+for (const oauthType of [
+  'oauth_state_reuse',
+  'oauth_challenge_manipulation',
+  'oauth_missing_validation',
+  'oauth_scope_boundary',
+  'oauth_scope_confusion',
+] as const) {
+  registerValidator({
+    vulnType: oauthType,
+    async validate(finding, config): Promise<ValidationResult> {
+      const startTime = Date.now();
+      const evidence: ValidationEvidence[] = [];
+      const steps: string[] = [];
+      let confirmed = false;
+      let confidence = finding.confidence;
+
+      const endpoint = extractOAuthEndpoint(finding);
+      steps.push(`Validating ${oauthType} at ${endpoint}`);
+
+      // Re-send the OAuth request from the finding
+      const result = await config.executeCommand(
+        ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', endpoint].join('\x00'),
+        finding.target
+      );
+
+      evidence.push({
+        type: 'http_response',
+        description: `Response to ${oauthType} validation request`,
+        data: result.stdout.substring(0, 5000),
+        timestamp: Date.now(),
+      });
+
+      // Check for concrete exploitation evidence
+      if (isOAuthFlowAccepted(result.stdout)) {
+        // Flow accepted — now check if there's evidence specific to the vuln type
+        const hasCode = /[?&]code=/.test(result.stdout);
+        const hasToken = /access_token/.test(result.stdout);
+
+        if (hasCode || hasToken) {
+          confirmed = true;
+          confidence = Math.min(100, confidence + 25);
+          steps.push(`OAuth flow accepted with ${hasCode ? 'authorization code' : 'access token'} — exploitable`);
+        } else {
+          steps.push('OAuth redirect accepted but no code/token in response');
+          confidence = Math.min(100, confidence + 10);
+        }
+      } else {
+        const statusMatch = result.stdout.match(/HTTP\/[\d.]+ (\d{3})/);
+        const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+        steps.push(`Server returned HTTP ${status} — no exploitation evidence`);
+        confidence = Math.max(0, confidence - 30);
+      }
+
+      return {
+        findingId: finding.id,
+        confirmed,
+        evidence,
+        reproductionSteps: steps,
+        confidence,
+        validatorUsed: oauthType,
+        validationTime: Date.now() - startTime,
+      };
+    },
+  });
+}
+
 // ─── Register remaining types as pass-through ────────────────────────────────
+// ─── NoSQL Injection Validator ─────────────────────────────────────────────
+
+registerValidator({
+  vulnType: 'nosql_injection',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+
+    // Step 1: Send the original payload (expected to return data or "true" result)
+    const injectedResult = await config.executeCommand(
+      ['curl', '-s', '-D', '-', '-o', '-', finding.target].join('\x00'),
+      finding.target
+    );
+
+    evidence.push({
+      type: 'http_response',
+      description: 'Response with NoSQL injection payload (true condition)',
+      data: injectedResult.stdout.substring(0, 5000),
+      timestamp: Date.now(),
+    });
+
+    // Step 2: Send a "false" condition — modify the payload to get empty/different result
+    // Replace common NoSQL true conditions with false equivalents
+    let falseTarget = finding.target;
+    // MongoDB operators: $gt → $lt with impossible value, $ne → $eq with impossible
+    falseTarget = falseTarget.replace(/\$gt/g, '$eq');
+    falseTarget = falseTarget.replace(/\$ne/g, '$eq');
+    falseTarget = falseTarget.replace(/\$exists.*?true/g, '$exists":false');
+    // If no substitution was made, try appending a falsy NoSQL condition
+    if (falseTarget === finding.target) {
+      falseTarget = finding.target.replace(/([?&])([^=]+)=([^&]+)/, '$1$2=____impossible_value_nosql_false____');
+    }
+
+    const falseResult = await config.executeCommand(
+      ['curl', '-s', '-D', '-', '-o', '-', falseTarget].join('\x00'),
+      finding.target
+    );
+
+    evidence.push({
+      type: 'http_response',
+      description: 'Response with false/negated condition',
+      data: falseResult.stdout.substring(0, 5000),
+      timestamp: Date.now(),
+    });
+
+    // Differential analysis: true and false payloads should produce meaningfully different responses
+    const trueBody = injectedResult.stdout.replace(/^[\s\S]*?\r?\n\r?\n/, '');
+    const falseBody = falseResult.stdout.replace(/^[\s\S]*?\r?\n\r?\n/, '');
+    const sizeDiff = Math.abs(trueBody.length - falseBody.length);
+    const contentDiffers = trueBody !== falseBody;
+    const significantDiff = sizeDiff > 50 || (contentDiffers && trueBody.length > 100);
+
+    // Check for MongoDB error messages (strong indicator)
+    const mongoErrors = [
+      /\$where|MongoError|mongoDB/i,
+      /\$gt|\$ne|\$regex|\$exists/,
+      /operator.*not.*allowed/i,
+      /unknown.*operator/i,
+    ];
+    const hasMongoError = mongoErrors.some(p => p.test(injectedResult.stdout));
+
+    steps.push(`Injected payload URL: ${finding.target}`);
+    steps.push(`False-condition URL: ${falseTarget}`);
+    steps.push(`True response size: ${trueBody.length} bytes`);
+    steps.push(`False response size: ${falseBody.length} bytes`);
+    steps.push(`Content differs: ${contentDiffers ? 'YES' : 'no'} (size diff: ${sizeDiff} bytes)`);
+    steps.push(`MongoDB error indicators: ${hasMongoError ? 'YES' : 'no'}`);
+
+    const confirmed = (significantDiff && contentDiffers) || hasMongoError;
+    let confidence = finding.confidence;
+    if (significantDiff && contentDiffers) confidence = Math.min(100, confidence + 25);
+    if (hasMongoError) confidence = Math.min(100, confidence + 30);
+    if (!contentDiffers && !hasMongoError) confidence = Math.max(0, confidence - 30);
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: 'nosql_injection',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// ─── BOLA Validator (same logic as IDOR) ──────────────────────────────────
+
+registerValidator({
+  vulnType: 'bola',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+
+    const result = await config.executeCommand(
+      ['curl', '-s', '-D', '-', '-o', '-', finding.target].join('\x00'),
+      finding.target
+    );
+
+    evidence.push({
+      type: 'http_response',
+      description: 'Response with manipulated object reference',
+      data: result.stdout.substring(0, 5000),
+      timestamp: Date.now(),
+    });
+
+    const statusMatch = result.stdout.match(/HTTP\/[\d.]+ (\d{3})/);
+    const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+
+    steps.push(`Request with manipulated object ID returned status: ${statusCode}`);
+
+    const confirmed = statusCode === 200 && result.stdout.length > 200;
+    let confidence = finding.confidence;
+    if (statusCode === 200) confidence = Math.min(100, confidence + 15);
+    if (statusCode === 401 || statusCode === 403) confidence = Math.max(0, confidence - 40);
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: 'bola',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// ─── Pass-through validators for remaining types ──────────────────────────
 // These use the agent's confidence without additional validation
 
 for (const vulnType of [
   'sqli_blind_boolean',
-  'ssrf_blind', 'bola',
+  'ssrf_blind',
   'csrf',
   'oauth_redirect_uri', 'oauth_state', 'oauth_pkce',
   'jwt_vulnerability',
@@ -1531,7 +2038,7 @@ for (const vulnType of [
   'race_condition', 'toctou', 'double_spend',
   'http_smuggling', 'cache_poisoning', 'cache_deception',
   'jwt_alg_confusion', 'jwt_none', 'jwt_kid_injection',
-  'nosql_injection', 'deserialization', 'saml_attack',
+  'deserialization', 'saml_attack',
   'mfa_bypass', 'websocket', 'crlf_injection',
   'prompt_injection', 'business_logic',
   'other',

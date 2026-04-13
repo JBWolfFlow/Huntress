@@ -28,6 +28,7 @@ import { AgentStatusPanel } from "./components/AgentStatusPanel";
 import type { AgentStatus } from "./agents/base_agent";
 import { TrainingDashboard } from "./components/TrainingDashboard";
 import { BenchmarkDashboard } from "./components/BenchmarkDashboard";
+import { AuthWizardModal } from "./components/AuthWizardModal";
 
 type AppTab = 'chat' | 'training' | 'benchmark';
 
@@ -39,7 +40,7 @@ function AppHeader({ onSettingsOpen, onImportOpen, activeTab, onTabChange }: {
   onTabChange: (tab: AppTab) => void;
 }) {
   const { killSwitch, proxyPool } = useTauri();
-  const { phase, isHunting, resetSession } = useHuntSession();
+  const { phase, isHunting, resetSession, openMidHuntAuthWizard } = useHuntSession();
 
   return (
     <header className="bg-black border-b border-gray-800 px-4 py-2 flex items-center justify-between font-mono">
@@ -98,6 +99,17 @@ function AppHeader({ onSettingsOpen, onImportOpen, activeTab, onTabChange }: {
           proxy:<span className="text-green-400">{proxyPool.stats.active}</span>
           <span className="text-gray-600">/{proxyPool.stats.total}</span>
         </span>
+
+        {/* I4: Mid-hunt [+ Add Auth] — visible only while a hunt is running */}
+        {isHunting && (
+          <button
+            onClick={openMidHuntAuthWizard}
+            className="px-2 py-1 text-cyan-400 hover:text-cyan-200 border border-cyan-800 hover:border-cyan-500 rounded transition-colors cursor-pointer"
+            title="Add or swap authentication for the currently-running hunt. Newly dispatched agents will use the new session."
+          >
+            [+ Add Auth]
+          </button>
+        )}
 
         {/* Kill switch */}
         <button
@@ -414,7 +426,16 @@ function AppContent() {
   const [reportFinding, setReportFinding] = useState<FindingCardMessage | null>(null);
   const [reviewReport, setReviewReport] = useState<{ report: H1Report; programHandle: string; qualityScore?: QualityScore } | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>('chat');
-  const { submitToH1 } = useHuntSession();
+  const {
+    submitToH1,
+    authDetectionResult,
+    pendingGuidelinesForAuth,
+    continueAfterAuth,
+    skipAuth,
+    midHuntAuth,
+    addAuthToActiveHunt,
+    closeMidHuntAuthWizard,
+  } = useHuntSession();
 
   // Listen for tool approval requests from the executor
   useEffect(() => {
@@ -489,6 +510,28 @@ function AppContent() {
       {/* Modals */}
       <SettingsPanel isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <ImportModal isOpen={importOpen} onClose={() => setImportOpen(false)} />
+
+      {/* Auth Wizard Modal — appears after import when auth is detected */}
+      {authDetectionResult && pendingGuidelinesForAuth && (
+        <AuthWizardModal
+          isOpen={true}
+          detectionResult={authDetectionResult}
+          guidelines={pendingGuidelinesForAuth}
+          onComplete={continueAfterAuth}
+          onSkip={skipAuth}
+        />
+      )}
+
+      {/* I4: Mid-hunt auth wizard — [+ Add Auth] button opens this over the running hunt */}
+      {midHuntAuth && (
+        <AuthWizardModal
+          isOpen={true}
+          detectionResult={midHuntAuth.detectionResult}
+          guidelines={midHuntAuth.guidelines}
+          onComplete={addAuthToActiveHunt}
+          onSkip={closeMidHuntAuthWizard}
+        />
+      )}
 
       {currentTask && (
         <ApproveDenyModal

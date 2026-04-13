@@ -35,9 +35,12 @@ import { ContinuousMonitor } from '../core/discovery/continuous_monitor';
 import { checkToolHealth, getAvailableToolsSummary } from '../core/tools/tool_health';
 import { invoke } from '@tauri-apps/api/core';
 import type { CommandResult } from '../core/engine/react_loop';
+import { classifyCommand } from '../core/engine/safety_policies';
 import { TraceStore } from '../core/tracing/trace_store';
 import { TracedModelProvider } from '../core/tracing/traced_provider';
 import { CostTracker } from '../core/tracing/cost_tracker';
+import { AuthDetector } from '../core/auth/auth_detector';
+import type { AuthDetectionResult } from '../core/auth/auth_detector';
 
 // ─── Session Persistence ──────────────────────────────────────────────────────
 
@@ -53,25 +56,50 @@ interface PersistedSession {
   savedAt: number;
 }
 
-function saveSessionToDisk(data: PersistedSession): void {
+async function saveSessionToDisk(data: PersistedSession): Promise<void> {
   try {
-    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(data));
+    await invoke('store_secret', {
+      key: SESSION_STORAGE_KEY,
+      value: JSON.stringify(data),
+    });
   } catch {
-    // localStorage quota exceeded — silently ignore
+    // Secure storage unavailable — silently ignore
   }
 }
 
-function loadSessionFromDisk(): PersistedSession | null {
+async function loadSessionFromDisk(): Promise<PersistedSession | null> {
+  // Try secure storage first
   try {
-    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw) as PersistedSession;
+    const raw: string = await invoke('get_secret', { key: SESSION_STORAGE_KEY });
+    if (raw) return JSON.parse(raw) as PersistedSession;
   } catch {
-    return null;
+    // Key not found or vault unavailable — check migration path
   }
+
+  // Migration: check if unencrypted data exists in localStorage
+  try {
+    const legacyRaw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (legacyRaw) {
+      const parsed = JSON.parse(legacyRaw) as PersistedSession;
+      // Migrate to secure storage and remove plaintext
+      await saveSessionToDisk(parsed);
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+      return parsed;
+    }
+  } catch {
+    // Corrupted legacy data — discard
+  }
+
+  return null;
 }
 
-function clearPersistedSession(): void {
+async function clearPersistedSession(): Promise<void> {
+  try {
+    await invoke('delete_secret', { key: SESSION_STORAGE_KEY });
+  } catch {
+    // Key may not exist — ignore
+  }
+  // Also clear any legacy plaintext data
   localStorage.removeItem(SESSION_STORAGE_KEY);
 }
 
@@ -81,6 +109,17 @@ export interface ActiveAgent {
   status: 'running' | 'waiting' | 'completed' | 'failed';
   toolsExecuted: number;
   findingsCount: number;
+}
+
+export interface ApprovalAuditEntry {
+  timestamp: number;
+  approvalId: string;
+  command: string;
+  target: string;
+  agent: string;
+  category: string;
+  decision: 'approved' | 'denied';
+  timedOut: boolean;
 }
 
 interface HuntSessionContextType {
@@ -119,6 +158,24 @@ interface HuntSessionContextType {
   getAgentTrustLevel: (agentId: string) => Promise<TrustLevel | null>;
   /** Get reward system metrics for dashboard display */
   getRewardMetrics: () => Promise<RewardMetrics | null>;
+  /** Approval audit trail for the current session */
+  approvalAuditTrail: ApprovalAuditEntry[];
+  /** Auth detection result (set when wizard should appear) */
+  authDetectionResult: AuthDetectionResult | null;
+  /** Guidelines pending auth wizard completion */
+  pendingGuidelinesForAuth: ProgramGuidelines | null;
+  /** Continue after auth wizard completes — creates sessions and starts hunt */
+  continueAfterAuth: () => Promise<void>;
+  /** Skip auth wizard — start hunt without auth */
+  skipAuth: () => Promise<void>;
+  /** I4: Mid-hunt auth wizard state — non-null when the wizard is open over a running hunt */
+  midHuntAuth: { detectionResult: AuthDetectionResult; guidelines: ProgramGuidelines } | null;
+  /** I4: Open the auth wizard against the currently-running hunt */
+  openMidHuntAuthWizard: () => void;
+  /** I4: Create sessions from profiles added during the mid-hunt wizard and reprioritize */
+  addAuthToActiveHunt: () => Promise<void>;
+  /** I4: Close the mid-hunt auth wizard without creating sessions */
+  closeMidHuntAuthWizard: () => void;
 }
 
 const HuntSessionContext = createContext<HuntSessionContextType | undefined>(undefined);
@@ -129,7 +186,7 @@ function generateId(): string {
 }
 
 export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const { settings, getApiKey } = useSettings();
+  const { settings, getApiKey, updateSettings, getAuthProfileCredentials, getRefreshConfig } = useSettings();
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [phase, setPhase] = useState<SessionPhase>('idle');
   const [activeAgents, setActiveAgents] = useState<ActiveAgent[]>([]);
@@ -138,6 +195,15 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
   const [isReady, setIsReady] = useState(false);
   const [knowledgeReady, setKnowledgeReady] = useState(false);
   const [availableSecurityTools, setAvailableSecurityTools] = useState<string[]>([]);
+  const [authDetectionResult, setAuthDetectionResult] = useState<AuthDetectionResult | null>(null);
+  const [pendingGuidelinesForAuth, setPendingGuidelinesForAuth] = useState<ProgramGuidelines | null>(null);
+  /** I4: Mid-hunt auth wizard state — when non-null, shows the wizard over an active hunt. */
+  const [midHuntAuth, setMidHuntAuth] = useState<{
+    detectionResult: AuthDetectionResult;
+    guidelines: ProgramGuidelines;
+  } | null>(null);
+  /** Track the initial profile IDs so addAuthToActiveHunt knows which profiles were *just* added. */
+  const profileIdsBeforeMidHuntRef = useRef<Set<string>>(new Set());
   const engineRef = useRef<OrchestratorEngine | null>(null);
   const kgRef = useRef<KnowledgeGraph | null>(null);
   const vulnDbRef = useRef<VulnDatabase | null>(null);
@@ -156,6 +222,7 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
   const continuousMonitorRef = useRef<ContinuousMonitor | null>(null);
   const traceStoreRef = useRef<TraceStore | null>(null);
   const costTrackerRef = useRef<CostTracker | null>(null);
+  const approvalAuditTrailRef = useRef<ApprovalAuditEntry[]>([]);
 
   const addMessage = useCallback((message: ConversationMessage) => {
     setMessages(prev => [...prev, message]);
@@ -169,7 +236,7 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
     setIsHunting(newPhase === 'hunting');
   }, []);
 
-  const initializeEngine = useCallback((): OrchestratorEngine | null => {
+  const initializeEngine = useCallback((budgetOverride?: number): OrchestratorEngine | null => {
     const { providerId, modelId } = settings.orchestratorModel;
     const apiKey = getApiKey(providerId);
 
@@ -190,7 +257,16 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
       }
 
       const sessionId = `hunt_${Date.now()}`;
-      const budgetLimit = settings.budgetLimitUsd ?? 5; // Default $5 budget
+      const budgetLimit = budgetOverride ?? settings.budgetLimitUsd ?? 15;
+
+      // Start tracing session so cost accumulation has a target
+      traceStoreRef.current.startSession({
+        id: sessionId,
+        startedAt: Date.now(),
+        status: 'active',
+        programName: 'Hunt Session',
+        targets: [],
+      });
 
       // Set session budget in cost tracker
       costTrackerRef.current.setSessionBudget(sessionId, {
@@ -245,7 +321,22 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
 
       // Create session manager (depends on HTTP client)
       if (!sessionManagerRef.current) {
-        sessionManagerRef.current = new SessionManager(httpClientRef.current);
+        sessionManagerRef.current = new SessionManager(httpClientRef.current, {
+          // S7/S8: Handle token refresh failures — notify user when credentials expire
+          onRefreshFailed: (_sessionId, error, message) => {
+            if (error === 'expired_credentials') {
+              addMessage({
+                type: 'system',
+                id: generateId(),
+                content: `Auth tokens expired — ${message}. Re-configure credentials to continue authenticated testing.`,
+                level: 'warning',
+                timestamp: Date.now(),
+              });
+            } else {
+              console.warn(`[auth-refresh] ${error}: ${message}`);
+            }
+          },
+        });
       }
 
       // Create hunt memory (Qdrant-backed, graceful degradation if unavailable)
@@ -286,10 +377,13 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
       }
 
       // Phase 23C: H1 duplicate checker (uses H1 credentials if available)
+      // S1: Now also wires GitHub advisory search and internal memory matching
       if (!h1DuplicateCheckerRef.current) {
         h1DuplicateCheckerRef.current = new H1DuplicateChecker({
           h1Username: getApiKey('hackerone_username') ?? undefined,
           h1ApiToken: getApiKey('hackerone') ?? undefined,
+          githubToken: getApiKey('github') ?? undefined,
+          huntMemory: huntMemoryRef.current ?? undefined,
         });
       }
 
@@ -352,6 +446,9 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
         }
       };
 
+      /** Timeout for approval gate — auto-deny after this many ms */
+      const APPROVAL_TIMEOUT_MS = 60_000;
+
       // Approval gate callback: bridges orchestrator ApprovalRequest → UI modal → boolean
       const onApprovalRequest = async (request: {
         command: string;
@@ -364,6 +461,29 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
       }): Promise<boolean> => {
         const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
+        // I3: Auto-approval short-circuit — if the command matches a category
+        // the user has explicitly opted into, skip the modal entirely.
+        const autoCategory = classifyCommand(request.command);
+        const autoToggles = settings.autoApprove ?? {};
+        const autoApproved =
+          (autoCategory === 'passive_recon' && autoToggles.passiveRecon) ||
+          (autoCategory === 'safe_active_recon' && autoToggles.safeActiveRecon) ||
+          (autoCategory === 'injection_passive' && autoToggles.injectionPassive);
+
+        if (autoApproved) {
+          approvalAuditTrailRef.current.push({
+            timestamp: Date.now(),
+            approvalId,
+            command: request.command,
+            target: request.target,
+            agent: request.agent ?? 'unknown',
+            category: `auto:${autoCategory}`,
+            decision: 'approved',
+            timedOut: false,
+          });
+          return true;
+        }
+
         // Ensure the global callback map exists (matches tool_executor.ts pattern)
         const win = window as unknown as {
           __huntress_approval_callbacks?: Map<string, (approved: boolean) => void>;
@@ -372,7 +492,7 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
           win.__huntress_approval_callbacks = new Map();
         }
 
-        return new Promise<boolean>((resolve) => {
+        const approvalPromise = new Promise<boolean>((resolve) => {
           // Store resolver so App.tsx handleApprove/handleDeny can call it
           win.__huntress_approval_callbacks!.set(approvalId, resolve);
 
@@ -402,6 +522,40 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
             })
           );
         });
+
+        // Race against timeout — auto-deny after 60 seconds
+        const timeoutPromise = new Promise<boolean>((resolve) => {
+          setTimeout(() => {
+            // Clean up the callback so it doesn't fire later
+            win.__huntress_approval_callbacks?.delete(approvalId);
+            console.warn(`[approval-gate] Timeout after ${APPROVAL_TIMEOUT_MS / 1000}s — auto-denied: ${request.command}`);
+            resolve(false);
+          }, APPROVAL_TIMEOUT_MS);
+        });
+
+        const decision = await Promise.race([approvalPromise, timeoutPromise]);
+
+        // Record in audit trail
+        const auditEntry: ApprovalAuditEntry = {
+          timestamp: Date.now(),
+          approvalId,
+          command: request.command,
+          target: request.target,
+          agent: request.agent ?? 'unknown',
+          category: request.category,
+          decision: decision ? 'approved' : 'denied',
+          timedOut: false,
+        };
+        // Check if it was the timeout that won
+        if (!win.__huntress_approval_callbacks?.has(approvalId)) {
+          auditEntry.decision = 'denied';
+          auditEntry.timedOut = true;
+        } else {
+          win.__huntress_approval_callbacks?.delete(approvalId);
+        }
+        approvalAuditTrailRef.current.push(auditEntry);
+
+        return decision;
       };
 
       const engine = new OrchestratorEngine({
@@ -475,17 +629,75 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
   }, [initializeEngine, settings.orchestratorModel, addMessage]);
 
   const importProgram = useCallback(async (guidelines: ProgramGuidelines) => {
+    // Apply hunt budget from the import dialog to settings
+    if (guidelines.huntBudgetUsd && guidelines.huntBudgetUsd > 0) {
+      updateSettings({ budgetLimitUsd: guidelines.huntBudgetUsd });
+    }
+
     // Always show the import in chat, even if engine fails
     const importMsg: ConversationMessage = {
       type: 'system',
       id: generateId(),
-      content: `Importing program: ${guidelines.programName}...`,
+      content: `Importing program: ${guidelines.programName} (budget: $${guidelines.huntBudgetUsd ?? settings.budgetLimitUsd ?? 15})...`,
       level: 'info',
       timestamp: Date.now(),
     };
     addMessage(importMsg);
 
-    const engine = engineRef.current ?? initializeEngine();
+    const engine = engineRef.current ?? initializeEngine(guidelines.huntBudgetUsd);
+
+    // Ensure HttpClient exists for auth detection even if full engine failed
+    if (!httpClientRef.current) {
+      httpClientRef.current = new HttpClient({
+        defaultHeaders: { 'User-Agent': 'Huntress/1.0' },
+      });
+    }
+
+    // S6: Auth Detection Wizard — probe targets on every new program import.
+    // Even if profiles exist from a prior program, this new target may need different auth.
+    // The wizard has a Skip button for when existing credentials already cover the target.
+    if (httpClientRef.current) {
+      try {
+        addMessage({
+          type: 'system',
+          id: generateId(),
+          content: 'Probing targets for auth requirements...',
+          level: 'info',
+          timestamp: Date.now(),
+        });
+
+        const detectionResult = await AuthDetector.detect(
+          guidelines.scope.inScope,
+          guidelines.programName,
+          guidelines.rules,
+          httpClientRef.current,
+        );
+
+        if (detectionResult.requiresAuth) {
+          addMessage({
+            type: 'system',
+            id: generateId(),
+            content: `Auth wall detected (${Math.round(detectionResult.confidence * 100)}% confidence). Opening auth wizard...`,
+            level: 'warning',
+            timestamp: Date.now(),
+          });
+          setAuthDetectionResult(detectionResult);
+          setPendingGuidelinesForAuth(guidelines);
+          return; // Wizard will call continueAfterAuth() or skipAuth()
+        }
+
+        addMessage({
+          type: 'system',
+          id: generateId(),
+          content: 'No auth requirements detected. Proceeding...',
+          level: 'info',
+          timestamp: Date.now(),
+        });
+      } catch (err) {
+        console.warn('[auth-detector] Detection failed (non-fatal):', err);
+        // Graceful degradation — proceed without auth
+      }
+    }
 
     if (!engine) {
       // No engine available — create a static briefing from the raw data
@@ -509,12 +721,114 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
       const warnMsg: ConversationMessage = {
         type: 'system',
         id: generateId(),
-        content: `No API key for ${providerId} — showing raw program data. Add your API key in Settings to get AI-powered strategy recommendations.`,
+        content: `Engine initialization failed for ${providerId} — showing raw program data. Check Settings to verify your API key and try again.`,
         level: 'warning',
         timestamp: Date.now(),
       };
       addMessage(warnMsg);
       return;
+    }
+
+    // S4: Initialize auth sessions from configured profiles before hunt starts
+    if (sessionManagerRef.current && settings.authProfiles.length > 0) {
+      let sessionsCreated = 0;
+      let sessionsFailed = 0;
+
+      for (const profile of settings.authProfiles) {
+        try {
+          const creds = await getAuthProfileCredentials(profile.id);
+
+          switch (profile.authType) {
+            case 'bearer': {
+              const token = creds.token;
+              if (token) {
+                await sessionManagerRef.current.loginWithBearer(
+                  token,
+                  profile.url ?? guidelines.scope.inScope[0] ?? '',
+                  profile.label
+                );
+                sessionsCreated++;
+              }
+              break;
+            }
+            case 'cookie': {
+              const username = creds.username;
+              const password = creds.password;
+              if (username && password && profile.url) {
+                await sessionManagerRef.current.login({
+                  username,
+                  password,
+                  loginUrl: profile.url,
+                  usernameField: profile.usernameField,
+                  passwordField: profile.passwordField,
+                  csrfField: profile.csrfField,
+                });
+                sessionsCreated++;
+              }
+              break;
+            }
+            case 'api_key': {
+              const apiKey = creds.apikey;
+              if (apiKey) {
+                sessionManagerRef.current.loginWithApiKey(
+                  profile.headerName ?? 'X-API-Key',
+                  apiKey,
+                  profile.label
+                );
+                sessionsCreated++;
+              }
+              break;
+            }
+            case 'custom_header': {
+              const headers: Record<string, string> = {};
+              for (const key of profile.customHeaderKeys ?? []) {
+                const val = creds[`header_${key}`];
+                if (val) headers[key] = val;
+              }
+              if (Object.keys(headers).length > 0) {
+                const runner = new (await import('../core/auth/session_manager')).AuthFlowRunner(httpClientRef.current!);
+                const session = runner.createCustomSession(headers, profile.label);
+                // Register with sessionManager by creating + setting headers
+                sessionManagerRef.current.createSession({
+                  id: session.id,
+                  label: session.label,
+                  authType: 'custom_header',
+                });
+                // Apply headers to the created session
+                const stored = sessionManagerRef.current.getSession(session.id);
+                if (stored) {
+                  Object.assign(stored.headers, headers);
+                }
+                // S8: Wire refresh config for auto-refresh (all auth types)
+                if (profile.hasRefreshConfig) {
+                  const refreshCfg = await getRefreshConfig(profile.id);
+                  if (refreshCfg) {
+                    sessionManagerRef.current.setRefreshConfig(session.id, refreshCfg);
+                  }
+                }
+                sessionsCreated++;
+              }
+              break;
+            }
+          }
+        } catch (err) {
+          sessionsFailed++;
+          console.warn(`[auth] Failed to create session for profile "${profile.label}":`, err);
+        }
+      }
+
+      if (sessionsCreated > 0 || sessionsFailed > 0) {
+        const authMsg: ConversationMessage = {
+          type: 'system',
+          id: generateId(),
+          content: sessionsCreated > 0
+            ? `Auth: ${sessionsCreated} session${sessionsCreated > 1 ? 's' : ''} active${sessionsFailed > 0 ? `, ${sessionsFailed} failed` : ''}`
+            : `Auth: all ${sessionsFailed} session${sessionsFailed > 1 ? 's' : ''} failed to initialize`,
+          level: sessionsFailed > 0 && sessionsCreated === 0 ? 'warning' : 'info',
+          timestamp: Date.now(),
+        };
+        addMessage(authMsg);
+      }
     }
 
     try {
@@ -529,7 +843,319 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
       };
       addMessage(errorMsg);
     }
-  }, [initializeEngine, settings.orchestratorModel, addMessage]);
+  }, [initializeEngine, settings.orchestratorModel, settings.budgetLimitUsd, settings.authProfiles, updateSettings, addMessage, getAuthProfileCredentials, getRefreshConfig]);
+
+  // S6: Continue after auth wizard — create sessions from newly-added profiles, then start hunt
+  const continueAfterAuth = useCallback(async () => {
+    const guidelines = pendingGuidelinesForAuth;
+    if (!guidelines) return;
+
+    // Create live sessions from any profiles just added in the wizard
+    if (sessionManagerRef.current && settings.authProfiles.length > 0) {
+      let sessionsCreated = 0;
+      let sessionsFailed = 0;
+
+      for (const profile of settings.authProfiles) {
+        try {
+          const creds = await getAuthProfileCredentials(profile.id);
+
+          switch (profile.authType) {
+            case 'bearer': {
+              const token = creds.token;
+              if (token) {
+                await sessionManagerRef.current.loginWithBearer(
+                  token,
+                  profile.url ?? guidelines.scope.inScope[0] ?? '',
+                  profile.label
+                );
+                sessionsCreated++;
+              }
+              break;
+            }
+            case 'cookie': {
+              const username = creds.username;
+              const password = creds.password;
+              if (username && password && profile.url) {
+                await sessionManagerRef.current.login({
+                  username,
+                  password,
+                  loginUrl: profile.url,
+                  usernameField: profile.usernameField,
+                  passwordField: profile.passwordField,
+                  csrfField: profile.csrfField,
+                });
+                sessionsCreated++;
+              }
+              break;
+            }
+            case 'api_key': {
+              const apiKey = creds.apikey;
+              if (apiKey) {
+                sessionManagerRef.current.loginWithApiKey(
+                  profile.headerName ?? 'X-API-Key',
+                  apiKey,
+                  profile.label
+                );
+                sessionsCreated++;
+              }
+              break;
+            }
+            case 'custom_header': {
+              const headers: Record<string, string> = {};
+              for (const key of profile.customHeaderKeys ?? []) {
+                const val = creds[`header_${key}`];
+                if (val) headers[key] = val;
+              }
+              if (Object.keys(headers).length > 0) {
+                const runner = new (await import('../core/auth/session_manager')).AuthFlowRunner(httpClientRef.current!);
+                const session = runner.createCustomSession(headers, profile.label);
+                sessionManagerRef.current.createSession({
+                  id: session.id,
+                  label: session.label,
+                  authType: 'custom_header',
+                });
+                const stored = sessionManagerRef.current.getSession(session.id);
+                if (stored) {
+                  Object.assign(stored.headers, headers);
+                }
+                // S8: Wire refresh config for auto-refresh (all auth types)
+                if (profile.hasRefreshConfig) {
+                  const refreshCfg = await getRefreshConfig(profile.id);
+                  if (refreshCfg) {
+                    sessionManagerRef.current.setRefreshConfig(session.id, refreshCfg);
+                  }
+                }
+                sessionsCreated++;
+              }
+              break;
+            }
+          }
+        } catch (err) {
+          sessionsFailed++;
+          console.warn(`[auth] Failed to create session for profile "${profile.label}":`, err);
+        }
+      }
+
+      if (sessionsCreated > 0 || sessionsFailed > 0) {
+        addMessage({
+          type: 'system',
+          id: generateId(),
+          content: sessionsCreated > 0
+            ? `Auth: ${sessionsCreated} session${sessionsCreated > 1 ? 's' : ''} active${sessionsFailed > 0 ? `, ${sessionsFailed} failed` : ''}`
+            : `Auth: all ${sessionsFailed} session${sessionsFailed > 1 ? 's' : ''} failed to initialize`,
+          level: sessionsFailed > 0 && sessionsCreated === 0 ? 'warning' : 'info',
+          timestamp: Date.now(),
+        });
+      }
+    }
+
+    // Clear wizard state
+    setAuthDetectionResult(null);
+    setPendingGuidelinesForAuth(null);
+
+    // Resume the import flow
+    const engine = engineRef.current;
+    if (engine) {
+      try {
+        await engine.analyzeBountyProgram(guidelines);
+      } catch (error) {
+        addMessage({
+          type: 'system',
+          id: generateId(),
+          content: `Failed to analyze program: ${error instanceof Error ? error.message : String(error)}`,
+          level: 'error',
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }, [pendingGuidelinesForAuth, settings.authProfiles, getAuthProfileCredentials, getRefreshConfig, addMessage]);
+
+  // S6: Skip auth wizard — proceed without auth
+  const skipAuth = useCallback(async () => {
+    const guidelines = pendingGuidelinesForAuth;
+
+    // Clear wizard state
+    setAuthDetectionResult(null);
+    setPendingGuidelinesForAuth(null);
+
+    if (!guidelines) return;
+
+    addMessage({
+      type: 'system',
+      id: generateId(),
+      content: 'Skipping auth setup. Agents will test unauthenticated endpoints only.',
+      level: 'warning',
+      timestamp: Date.now(),
+    });
+
+    const engine = engineRef.current;
+    if (engine) {
+      try {
+        await engine.analyzeBountyProgram(guidelines);
+      } catch (error) {
+        addMessage({
+          type: 'system',
+          id: generateId(),
+          content: `Failed to analyze program: ${error instanceof Error ? error.message : String(error)}`,
+          level: 'error',
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }, [pendingGuidelinesForAuth, addMessage]);
+
+  /**
+   * I4: Open the auth wizard against the currently-running hunt.
+   * Builds a synthetic AuthDetectionResult (user knows auth is needed, no
+   * probe required) and remembers which profiles already exist so the
+   * follow-up step only creates sessions for the ones just added.
+   */
+  const openMidHuntAuthWizard = useCallback(() => {
+    const engine = engineRef.current;
+    const program = engine?.getActiveProgram();
+    if (!engine || !program) {
+      addMessage({
+        type: 'system',
+        id: generateId(),
+        content: 'Cannot add auth: no active hunt.',
+        level: 'warning',
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    profileIdsBeforeMidHuntRef.current = new Set(settings.authProfiles.map(p => p.id));
+
+    const syntheticDetection: AuthDetectionResult = {
+      requiresAuth: true,
+      confidence: 1,
+      probeResults: [],
+      detectedAuthTypes: [],
+      suggestedProfiles: [],
+      manualSteps: [
+        'Hunt is running. Add an auth profile below to inject authentication into pending agent dispatches.',
+        'Newly dispatched agents will pick up the session automatically; already-running agents keep their current auth state.',
+      ],
+      programHints: [],
+    };
+
+    setMidHuntAuth({ detectionResult: syntheticDetection, guidelines: program });
+  }, [settings.authProfiles, addMessage]);
+
+  /**
+   * I4: After the wizard closes, create live sessions for any profiles that
+   * were added during it and trigger orchestrator reprioritization.
+   */
+  const addAuthToActiveHunt = useCallback(async () => {
+    const engine = engineRef.current;
+    const sessionManager = sessionManagerRef.current;
+    const httpClient = httpClientRef.current;
+    if (!engine || !sessionManager || !httpClient) {
+      setMidHuntAuth(null);
+      return;
+    }
+
+    const existingIds = profileIdsBeforeMidHuntRef.current;
+    const newProfiles = settings.authProfiles.filter(p => !existingIds.has(p.id));
+
+    let sessionsCreated = 0;
+    let sessionsFailed = 0;
+
+    for (const profile of newProfiles) {
+      try {
+        const creds = await getAuthProfileCredentials(profile.id);
+        switch (profile.authType) {
+          case 'bearer': {
+            if (creds.token) {
+              await sessionManager.loginWithBearer(
+                creds.token,
+                profile.url ?? engine.getActiveProgram()?.scope.inScope[0] ?? '',
+                profile.label,
+              );
+              sessionsCreated++;
+            }
+            break;
+          }
+          case 'cookie': {
+            if (creds.username && creds.password && profile.url) {
+              await sessionManager.login({
+                username: creds.username,
+                password: creds.password,
+                loginUrl: profile.url,
+                usernameField: profile.usernameField,
+                passwordField: profile.passwordField,
+                csrfField: profile.csrfField,
+              });
+              sessionsCreated++;
+            }
+            break;
+          }
+          case 'api_key': {
+            if (creds.apikey) {
+              sessionManager.loginWithApiKey(
+                profile.headerName ?? 'X-API-Key',
+                creds.apikey,
+                profile.label,
+              );
+              sessionsCreated++;
+            }
+            break;
+          }
+          case 'custom_header': {
+            const headers: Record<string, string> = {};
+            for (const key of profile.customHeaderKeys ?? []) {
+              const val = creds[`header_${key}`];
+              if (val) headers[key] = val;
+            }
+            if (Object.keys(headers).length > 0) {
+              const runner = new (await import('../core/auth/session_manager')).AuthFlowRunner(httpClient);
+              const session = runner.createCustomSession(headers, profile.label);
+              sessionManager.createSession({
+                id: session.id,
+                label: session.label,
+                authType: 'custom_header',
+              });
+              const stored = sessionManager.getSession(session.id);
+              if (stored) Object.assign(stored.headers, headers);
+              if (profile.hasRefreshConfig) {
+                const refreshCfg = await getRefreshConfig(profile.id);
+                if (refreshCfg) sessionManager.setRefreshConfig(session.id, refreshCfg);
+              }
+              sessionsCreated++;
+            }
+            break;
+          }
+        }
+      } catch (err) {
+        sessionsFailed++;
+        console.warn(`[auth] Failed to create mid-hunt session for profile "${profile.label}":`, err);
+      }
+    }
+
+    setMidHuntAuth(null);
+    profileIdsBeforeMidHuntRef.current = new Set();
+
+    if (sessionsCreated > 0) {
+      engine.reprioritizeForAuth();
+    }
+
+    addMessage({
+      type: 'system',
+      id: generateId(),
+      content: sessionsCreated > 0
+        ? `Mid-hunt auth attached: ${sessionsCreated} session${sessionsCreated > 1 ? 's' : ''} active${sessionsFailed > 0 ? `, ${sessionsFailed} failed` : ''}. Queued agents will pick up auth on next dispatch.`
+        : sessionsFailed > 0
+          ? `Mid-hunt auth failed: ${sessionsFailed} profile${sessionsFailed > 1 ? 's' : ''} could not be activated.`
+          : 'Mid-hunt auth wizard closed — no new profiles were added.',
+      level: sessionsCreated > 0 ? 'success' : sessionsFailed > 0 ? 'error' : 'info',
+      timestamp: Date.now(),
+    });
+  }, [settings.authProfiles, getAuthProfileCredentials, getRefreshConfig, addMessage]);
+
+  const closeMidHuntAuthWizard = useCallback(() => {
+    setMidHuntAuth(null);
+    profileIdsBeforeMidHuntRef.current = new Set();
+  }, []);
 
   const selectStrategy = useCallback(async (strategy: StrategyOption) => {
     const engine = engineRef.current;
@@ -606,17 +1232,20 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
     return () => clearInterval(interval);
   }, [messages, findings, phase, activeAgents]);
 
-  // ── Session Persistence: restore on mount ──
+  // ── Session Persistence: restore on mount (async — uses secure storage) ──
   useEffect(() => {
-    const saved = loadSessionFromDisk();
-    if (saved && saved.messages.length > 0) {
-      setMessages(saved.messages);
-      setFindings(saved.findings);
-      setPhase(saved.phase);
-      setActiveAgents(
-        saved.activeAgents.map(a => ({ ...a, status: a.status === 'running' ? 'failed' as const : a.status }))
-      );
-    }
+    loadSessionFromDisk().then(saved => {
+      if (saved && saved.messages.length > 0) {
+        setMessages(saved.messages);
+        setFindings(saved.findings);
+        setPhase(saved.phase);
+        setActiveAgents(
+          saved.activeAgents.map((a: ActiveAgent) => ({ ...a, status: a.status === 'running' ? 'failed' as const : a.status }))
+        );
+      }
+    }).catch(() => {
+      // Restore failed — start fresh
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -705,10 +1334,21 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
     getOverallStats,
     getAgentTrustLevel,
     getRewardMetrics,
+    approvalAuditTrail: approvalAuditTrailRef.current,
+    authDetectionResult,
+    pendingGuidelinesForAuth,
+    continueAfterAuth,
+    skipAuth,
+    midHuntAuth,
+    openMidHuntAuthWizard,
+    addAuthToActiveHunt,
+    closeMidHuntAuthWizard,
   }), [isReady, phase, messages, activeAgents, findings, isHunting,
        initializeEngine, sendMessage, importProgram, selectStrategy,
        submitToH1, resetSession, knowledgeReady, getOverallStats,
-       getAgentTrustLevel, getRewardMetrics]);
+       getAgentTrustLevel, getRewardMetrics,
+       authDetectionResult, pendingGuidelinesForAuth, continueAfterAuth, skipAuth,
+       midHuntAuth, openMidHuntAuthWizard, addAuthToActiveHunt, closeMidHuntAuthWizard]);
 
   return (
     <HuntSessionContext.Provider value={contextValue}>

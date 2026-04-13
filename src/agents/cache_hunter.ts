@@ -24,6 +24,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const CACHE_HUNTER_SYSTEM_PROMPT = `You are an elite web cache poisoning and web cache deception researcher. These are the #1 and #2 most impactful vulnerability classes per PortSwigger's 2024 Top 10. Your mission is to systematically discover both cache poisoning and cache deception vulnerabilities.
 
@@ -138,13 +139,24 @@ Identify the CDN to select targeted payloads:
 - \`X-MSEdge-Ref\` → Azure Front Door
 - \`X-Varnish\` → Generic Varnish
 
-## Severity Classification
+## Severity Classification (CALIBRATED FOR H1 ACCEPTANCE)
 
-- Cache poisoning with XSS: CRITICAL (stored XSS affecting all users)
-- Cache deception exposing PII: HIGH
-- Cache poisoning with open redirect: MEDIUM-HIGH
-- Cache poisoning with DoS: MEDIUM
-- Cache behavior anomaly without confirmed impact: LOW
+- Cache poisoning with XSS, 3-step proof completed: CRITICAL (stored XSS affecting all users)
+- Cache deception exposing OTHER users' PII, confirmed with clean-session request: HIGH
+- Cache poisoning with open redirect, 3-step proof completed: MEDIUM
+- Cache poisoning with DoS, 3-step proof completed: MEDIUM
+- Cache behavior anomaly WITHOUT 3-step proof: LOW at best — do NOT report as HIGH/CRITICAL
+- Unkeyed header reflected in response but NOT cached: INFO — this is NOT cache poisoning
+
+## MANDATORY 3-Step Verification (Required for ALL Cache Poisoning Findings)
+You MUST complete all 3 steps before reporting any cache poisoning finding:
+1. **POISON**: Send request with evil header + cache buster → record response
+2. **VERIFY HIT**: Confirm the response was cached (X-Cache: HIT, CF-Cache-Status: HIT, Age > 0)
+3. **CLEAN TEST**: Send the SAME URL WITHOUT the evil header → response MUST still contain the poisoned content
+
+If step 3 fails (clean response is clean), the cache is NOT poisoned. Do NOT report. This is the #1 false positive pattern.
+
+Include ALL THREE requests/responses in your evidence. Without step 3, the finding WILL be rejected.
 
 ## Safety Notes
 
@@ -225,7 +237,7 @@ export class CacheHunterAgent implements BaseAgent {
           `Scope: ${task.scope.join(', ')}\n\n${task.description}\n\n` +
           `Start by fingerprinting the CDN and identifying cacheable endpoints, then test unkeyed headers.`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -241,6 +253,10 @@ export class CacheHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -258,6 +274,7 @@ export class CacheHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

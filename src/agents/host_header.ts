@@ -25,6 +25,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const HOST_HEADER_SYSTEM_PROMPT = `You are an expert Host header injection security researcher. Your mission is to systematically discover Host header vulnerabilities in the target application, including password reset poisoning, cache poisoning, and SSRF via Host header manipulation.
 
@@ -100,13 +101,21 @@ Test if the application trusts headers that should only come from internal infra
 - \`curl -s -H "X-Forwarded-For: 127.0.0.1" -H "X-Real-IP: 127.0.0.1" -H "Host: internal.TARGET" "TARGET" -D -\`
 - Check if these headers grant access to internal-only functionality
 
-## Severity Classification
-- Password reset poisoning (confirmed token theft): CRITICAL
-- Cache poisoning serving malicious content to other users: HIGH-CRITICAL
-- Host header reflection in response body (XSS potential): HIGH
-- Web cache deception exposing authenticated data: HIGH
-- Access to internal functionality via header injection: MEDIUM-HIGH
-- Host header reflected but not exploitable: LOW
+## Severity Classification (Calibrated for H1 Acceptance)
+- Password reset poisoning (confirmed token theft via injected link): CRITICAL
+- Cache poisoning serving malicious content to OTHER users (3-step proof required): HIGH
+- Web cache deception exposing OTHER users' authenticated data: HIGH
+- Access to internal functionality via header injection: MEDIUM
+- Host header reflected in response body with exploitable context (script src, form action): MEDIUM
+- Host header reflected in Link/preconnect header: LOW — this is a browser hint, NOT SSRF. The server does NOT make a request to the injected URL. Do NOT report this as SSRF or HIGH/CRITICAL.
+- Host header reflected but not in exploitable context: LOW
+
+## Cache Poisoning Proof Requirement (MANDATORY 3-Step)
+If you find cache poisoning, you MUST complete all 3 steps before reporting:
+1. POISON: Send request with evil Host header and cache buster → note response
+2. VERIFY HIT: Check cache headers (X-Cache: HIT, CF-Cache-Status: HIT, Age > 0)
+3. CLEAN TEST: Request the SAME URL without the evil header → response MUST still contain the poisoned content
+If step 3 fails (clean request returns clean content), the cache is NOT poisoned. Report as LOW at most.
 
 Always validate findings with a second request. Document the exact request headers and response for the PoC.`;
 
@@ -181,7 +190,7 @@ export class HostHeaderHunterAgent implements BaseAgent {
         systemPrompt: HOST_HEADER_SYSTEM_PROMPT,
         goal: `Systematically test for Host header injection vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -197,6 +206,10 @@ export class HostHeaderHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -215,6 +228,7 @@ export class HostHeaderHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

@@ -8,6 +8,7 @@
 
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import type { RefreshConfig } from '../core/auth/token_refresher';
 
 export interface ModelSelection {
   providerId: string;
@@ -100,6 +101,31 @@ export const PROMPT_FORMATS: Record<PromptStyle, { label: string; format: (phase
   root: { label: 'root@huntress# ', format: (phase) => `root@${phase === 'idle' ? 'huntress' : phase}#` },
 };
 
+/** Auth profile configuration (metadata only — no secrets stored here) */
+export interface AuthProfileConfig {
+  id: string;
+  label: string;
+  authType: 'cookie' | 'bearer' | 'api_key' | 'custom_header';
+  /** For bearer: validation URL. For form login: login URL. */
+  url?: string;
+  /** For API key: the header name (e.g., "X-API-Key") */
+  headerName?: string;
+  /** For form login: optional field customization */
+  usernameField?: string;
+  passwordField?: string;
+  csrfField?: string;
+  /** For custom headers: header key names (values stored in secure storage) */
+  customHeaderKeys?: string[];
+  /** S8: Whether this profile has a refresh config for auto-refresh */
+  hasRefreshConfig?: boolean;
+  /**
+   * Identity role — drives agent behavior for IDOR/BOLA testing.
+   * When set, the value is copied into AuthenticatedSession.label so agents
+   * can reference it via `session_label` on `http_request`. (Phase 1 / Q3)
+   */
+  role?: 'victim' | 'attacker' | 'admin' | 'regular_user' | string;
+}
+
 export interface AlloySettings {
   /** Whether alloy mode is enabled (alternates models per iteration) */
   enabled: boolean;
@@ -117,6 +143,17 @@ export interface AgentModelOverride {
   modelId: string;
 }
 
+export interface StealthSettings {
+  /** Whether stealth mode is enabled (UA rotation, header normalization, jitter) */
+  enabled: boolean;
+  /** Minimum delay between requests to the same domain in ms */
+  minDelayMs: number;
+  /** Maximum delay between requests to the same domain in ms */
+  maxDelayMs: number;
+  /** Whether to route requests through the proxy pool */
+  proxyEnabled: boolean;
+}
+
 export interface AppSettings {
   firstRunComplete: boolean;
   orchestratorModel: ModelSelection;
@@ -130,6 +167,10 @@ export interface AppSettings {
   autoApprove: {
     passiveRecon: boolean;
     activeScanning: boolean;
+    /** Safe active recon: gobuster/ffuf/nmap(non-SYN)/nuclei defaults (I3) */
+    safeActiveRecon: boolean;
+    /** Passive injection probes: curl GETs with payloads (SSTI, SQLi, XSS) (I3) */
+    injectionPassive: boolean;
   };
   /** Model Alloy configuration (alternate between 2 providers per iteration) */
   alloy: AlloySettings;
@@ -140,6 +181,20 @@ export interface AppSettings {
   theme: 'dark';
   /** Maximum budget per hunt session in USD (default $5) */
   budgetLimitUsd: number;
+  /** Stealth and rate limiting configuration for live targets */
+  stealth: StealthSettings;
+  /** Auth profiles for authenticated testing (metadata only — credentials in secure storage) */
+  authProfiles: AuthProfileConfig[];
+  /** Uploaded API schema specs (OpenAPI/Swagger/GraphQL) for targeted testing */
+  apiSchemas: Array<{
+    id: string;
+    name: string;
+    source: 'openapi' | 'swagger' | 'graphql';
+    baseUrl: string;
+    endpointCount: number;
+    uploadedAt: number;
+    spec: Record<string, unknown>;
+  }>;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -150,8 +205,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   hackerOneUsername: '',
   hackerOneToken: '',
   autoApprove: {
-    passiveRecon: false,
+    passiveRecon: true,
     activeScanning: false,
+    safeActiveRecon: true,
+    injectionPassive: true,
   },
   alloy: {
     enabled: false,
@@ -168,6 +225,14 @@ const DEFAULT_SETTINGS: AppSettings = {
   },
   theme: 'dark',
   budgetLimitUsd: 15,
+  stealth: {
+    enabled: false,
+    minDelayMs: 1000,
+    maxDelayMs: 2000,
+    proxyEnabled: false,
+  },
+  authProfiles: [],
+  apiSchemas: [],
 };
 
 const STORAGE_KEY = 'huntress_settings';
@@ -176,6 +241,7 @@ const STORAGE_KEY = 'huntress_settings';
 const API_KEY_PREFIX = 'api_key_';
 const H1_USERNAME_KEY = 'h1_username';
 const H1_TOKEN_KEY = 'h1_token';
+const AUTH_PROFILE_PREFIX = 'auth_profile_';
 
 interface SettingsContextType {
   settings: AppSettings;
@@ -186,6 +252,14 @@ interface SettingsContextType {
   resetSettings: () => void;
   /** Whether secure storage has finished loading */
   isLoaded: boolean;
+  /** Add an auth profile (metadata saved to settings, credentials to secure storage) */
+  addAuthProfile: (config: AuthProfileConfig, credentials: Record<string, string>) => Promise<void>;
+  /** Remove an auth profile and its stored credentials */
+  removeAuthProfile: (id: string) => Promise<void>;
+  /** Load credentials for an auth profile from secure storage */
+  getAuthProfileCredentials: (id: string) => Promise<Record<string, string>>;
+  /** S8: Load refresh config for auto-refresh from secure storage */
+  getRefreshConfig: (id: string) => Promise<RefreshConfig | undefined>;
 }
 
 const SettingsContext = createContext<SettingsContextType | undefined>(undefined);
@@ -305,6 +379,144 @@ export const SettingsProvider: React.FC<{ children: ReactNode }> = ({ children }
     setSettings(prev => ({ ...prev, firstRunComplete: true }));
   }, []);
 
+  const addAuthProfile = useCallback(async (config: AuthProfileConfig, credentials: Record<string, string>) => {
+    // Store credentials in secure storage (keyed by profile ID + credential name)
+    for (const [credKey, credValue] of Object.entries(credentials)) {
+      if (credValue) {
+        await invoke('store_secret', {
+          key: `${AUTH_PROFILE_PREFIX}${config.id}_${credKey}`,
+          value: credValue,
+        });
+      }
+    }
+
+    // Add profile metadata to settings (no secrets in localStorage)
+    setSettings(prev => ({
+      ...prev,
+      authProfiles: [...prev.authProfiles, config],
+    }));
+  }, []);
+
+  const removeAuthProfile = useCallback(async (id: string) => {
+    // Find the profile to get its credential keys
+    const profile = settings.authProfiles.find(p => p.id === id);
+
+    // Delete all associated secrets
+    try {
+      const keys: string[] = await invoke('list_secret_keys');
+      const profilePrefix = `${AUTH_PROFILE_PREFIX}${id}_`;
+      for (const key of keys) {
+        if (key.startsWith(profilePrefix)) {
+          await invoke('delete_secret', { key });
+        }
+      }
+    } catch {
+      // Secure storage unavailable — profile removed from settings anyway
+    }
+
+    // Also clean up custom header keys if present
+    if (profile?.customHeaderKeys) {
+      for (const headerKey of profile.customHeaderKeys) {
+        await invoke('delete_secret', {
+          key: `${AUTH_PROFILE_PREFIX}${id}_header_${headerKey}`,
+        }).catch(() => {});
+      }
+    }
+
+    // Remove from settings
+    setSettings(prev => ({
+      ...prev,
+      authProfiles: prev.authProfiles.filter(p => p.id !== id),
+    }));
+  }, [settings.authProfiles]);
+
+  const getAuthProfileCredentials = useCallback(async (id: string): Promise<Record<string, string>> => {
+    const result: Record<string, string> = {};
+    try {
+      const keys: string[] = await invoke('list_secret_keys');
+      const profilePrefix = `${AUTH_PROFILE_PREFIX}${id}_`;
+      for (const key of keys) {
+        if (key.startsWith(profilePrefix)) {
+          const credName = key.slice(profilePrefix.length);
+          const value: string = await invoke('get_secret', { key });
+          result[credName] = value;
+        }
+      }
+    } catch {
+      // Secure storage unavailable
+    }
+    return result;
+  }, []);
+
+  const getRefreshConfig = useCallback(async (id: string): Promise<RefreshConfig | undefined> => {
+    const profile = settings.authProfiles.find(p => p.id === id);
+    if (!profile?.hasRefreshConfig) return undefined;
+
+    try {
+      const prefix = `${AUTH_PROFILE_PREFIX}${id}_`;
+      const refreshType = await invoke<string>('get_secret', { key: `${prefix}_refreshType` }).catch(() => '');
+      const tokenTtl = parseInt(
+        await invoke<string>('get_secret', { key: `${prefix}_refreshTokenTtl` }).catch(() => '600'),
+        10,
+      ) || 600;
+
+      // Parse token header map from stored "field=Header\nfield2=Header2" format
+      const parseTokenHeaderMap = async (): Promise<Record<string, string>> => {
+        const raw = await invoke<string>('get_secret', { key: `${prefix}_refreshTokenHeaderMap` }).catch(() => '');
+        const map: Record<string, string> = {};
+        if (raw) {
+          for (const line of raw.split('\n')) {
+            const eqIdx = line.indexOf('=');
+            if (eqIdx > 0) {
+              map[line.slice(0, eqIdx).trim()] = line.slice(eqIdx + 1).trim();
+            }
+          }
+        }
+        return map;
+      };
+
+      switch (refreshType) {
+        case 'initdata_exchange': {
+          const initData = await invoke<string>('get_secret', { key: `${prefix}_refreshInitData` });
+          const authEndpointUrl = await invoke<string>('get_secret', { key: `${prefix}_refreshAuthEndpoint` });
+          const deviceSerial = await invoke<string>('get_secret', { key: `${prefix}_refreshDeviceSerial` }).catch(() => '');
+          if (!initData || !authEndpointUrl) return undefined;
+          const tokenHeaderMap = await parseTokenHeaderMap();
+          // Fall back to custom header keys if no explicit map
+          if (Object.keys(tokenHeaderMap).length === 0 && profile.customHeaderKeys) {
+            for (const headerKey of profile.customHeaderKeys) {
+              tokenHeaderMap[headerKey] = headerKey;
+            }
+          }
+          return { type: 'initdata_exchange', initData, authEndpointUrl, deviceSerial, tokenTtlSeconds: tokenTtl, tokenHeaderMap };
+        }
+        case 'refresh_token': {
+          const refreshToken = await invoke<string>('get_secret', { key: `${prefix}_refreshToken` });
+          const tokenEndpoint = await invoke<string>('get_secret', { key: `${prefix}_refreshTokenEndpoint` });
+          if (!refreshToken || !tokenEndpoint) return undefined;
+          const clientId = await invoke<string>('get_secret', { key: `${prefix}_refreshClientId` }).catch(() => undefined);
+          const clientSecret = await invoke<string>('get_secret', { key: `${prefix}_refreshClientSecret` }).catch(() => undefined);
+          const scope = await invoke<string>('get_secret', { key: `${prefix}_refreshScope` }).catch(() => undefined);
+          return { type: 'refresh_token', refreshToken, tokenEndpoint, clientId, clientSecret, scope, tokenTtlSeconds: tokenTtl };
+        }
+        case 'custom_endpoint': {
+          const refreshEndpoint = await invoke<string>('get_secret', { key: `${prefix}_refreshEndpoint` });
+          const method = (await invoke<string>('get_secret', { key: `${prefix}_refreshMethod` }).catch(() => 'POST')) as 'GET' | 'POST';
+          const body = await invoke<string>('get_secret', { key: `${prefix}_refreshBody` }).catch(() => undefined);
+          if (!refreshEndpoint) return undefined;
+          const tokenHeaderMap = await parseTokenHeaderMap();
+          return { type: 'custom_endpoint', refreshEndpoint, method, body, tokenHeaderMap, tokenTtlSeconds: tokenTtl };
+        }
+        case 're_login':
+          return { type: 're_login' };
+        default:
+          return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  }, [settings.authProfiles]);
+
   const resetSettings = useCallback(() => {
     localStorage.removeItem(STORAGE_KEY);
     // Clear all secrets from secure storage
@@ -326,6 +538,10 @@ export const SettingsProvider: React.FC<{ children: ReactNode }> = ({ children }
         completeFirstRun,
         resetSettings,
         isLoaded,
+        addAuthProfile,
+        removeAuthProfile,
+        getAuthProfileCredentials,
+        getRefreshConfig,
       }}
     >
       {children}

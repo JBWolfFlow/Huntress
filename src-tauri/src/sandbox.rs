@@ -296,7 +296,28 @@ impl SandboxManager {
             config.allowed_domains.join(",")
         ));
 
-        // Add user-specified env vars (already validated)
+        // Issue #4 fix: route tools that honor proxy env vars (curl, wget,
+        // git, pip, python-requests, rust reqwest, go net/http) through
+        // tinyproxy so they inherit scope enforcement AND don't need
+        // working system DNS. Before this fix curl was hitting exit 6
+        // ("Could not resolve host") on every call inside the sandbox
+        // while httpx succeeded by virtue of its built-in resolver —
+        // a 2-for-1 bug: DNS path was broken AND shell tools were
+        // exempt from tinyproxy's allow-list.
+        //
+        // Both lowercase and uppercase forms are set because curl/wget
+        // prefer lowercase while Go/Rust clients prefer uppercase, and
+        // getting it wrong silently reverts to direct DNS.
+        env.push("HTTP_PROXY=http://127.0.0.1:3128".to_string());
+        env.push("HTTPS_PROXY=http://127.0.0.1:3128".to_string());
+        env.push("http_proxy=http://127.0.0.1:3128".to_string());
+        env.push("https_proxy=http://127.0.0.1:3128".to_string());
+        env.push("NO_PROXY=localhost,127.0.0.1".to_string());
+        env.push("no_proxy=localhost,127.0.0.1".to_string());
+
+        // Add user-specified env vars (already validated). Caller-supplied
+        // entries win — agents or callers that explicitly set *_PROXY (e.g.
+        // a Burp MITM workflow) override the defaults above.
         for (key, value) in &config.env_vars {
             env.push(format!("{}={}", key, value));
         }
@@ -310,32 +331,24 @@ impl SandboxManager {
             cpu_period: Some(100_000),
             cpu_quota: Some(cpu_quota),
             pids_limit: Some(config.pids_limit),
-            readonly_rootfs: Some(true),
+            // readonly_rootfs disabled: tinyproxy needs to write its filter file
+            // to /etc/tinyproxy/ and PID file to /var/run/. Scope enforcement is
+            // still layered: tinyproxy (container) + HttpClient (TypeScript) + safe_to_test (Rust).
+            readonly_rootfs: Some(false),
             tmpfs: Some(HashMap::from([
                 ("/tmp".to_string(), "size=512m,noexec,nosuid".to_string()),
                 (
                     "/home/hunter".to_string(),
-                    "size=256m,noexec,nosuid".to_string(),
-                ),
-                // Squid needs a writable cache dir
-                (
-                    "/var/spool/squid".to_string(),
-                    "size=64m,noexec,nosuid".to_string(),
-                ),
-                // Squid PID/log directories
-                (
-                    "/var/log/squid".to_string(),
-                    "size=16m,noexec,nosuid".to_string(),
-                ),
-                (
-                    "/var/run".to_string(),
-                    "size=8m,noexec,nosuid".to_string(),
+                    "size=256m,noexec,nosuid,uid=1000,gid=1000".to_string(),
                 ),
             ])),
             cap_drop: Some(vec!["ALL".to_string()]),
             cap_add: Some(vec!["NET_RAW".to_string()]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            auto_remove: Some(true),
+            // H21 fix: auto_remove was causing containers to be silently deleted
+            // when the entrypoint exited, producing "No such container" 404 errors
+            // in Hunt #7. Lifecycle is now managed explicitly via destroy_sandbox().
+            auto_remove: Some(false),
             network_mode: Some("bridge".to_string()),
             ..Default::default()
         };
@@ -351,10 +364,15 @@ impl SandboxManager {
             image: Some(config.image.clone()),
             env: Some(env),
             working_dir: Some(config.working_dir.clone()),
+            // Run as hunter (uid 1000) — owns /etc/tinyproxy/ so entrypoint can
+            // write filter file. With cap-drop ALL, root lacks CAP_DAC_OVERRIDE
+            // and cannot write to hunter-owned paths.
             user: Some("hunter".to_string()),
             host_config: Some(host_config),
             labels: Some(labels),
-            // Keep container running — entrypoint handles setup then waits
+            // Keep container running: entrypoint sets up proxy then exec's this
+            // command which sleeps forever. Agent commands use docker exec.
+            cmd: Some(vec!["sleep".to_string(), "infinity".to_string()]),
             tty: Some(true),
             open_stdin: Some(true),
             ..Default::default()
@@ -376,6 +394,63 @@ impl SandboxManager {
         self.docker
             .start_container(&container_id, None::<StartContainerOptions<String>>)
             .await?;
+
+        // H21 fix: wait for container to reach "running" state before returning.
+        // This prevents race conditions where exec is called before the container is ready.
+        let mut ready = false;
+        for attempt in 0..10 {
+            match self.docker.inspect_container(&container_id, None).await {
+                Ok(info) => {
+                    let running = info
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.running)
+                        .unwrap_or(false);
+                    if running {
+                        ready = true;
+                        break;
+                    }
+                    let status = info
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.status.as_ref())
+                        .map(|s| format!("{:?}", s))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    warn!(
+                        container_id = %container_id,
+                        attempt = attempt,
+                        status = %status,
+                        "Container not yet running, waiting..."
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        container_id = %container_id,
+                        attempt = attempt,
+                        error = %e,
+                        "Failed to inspect container, waiting..."
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        if !ready {
+            // Clean up the container that never became ready
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(SandboxError::InvalidConfig(
+                "Container created but never reached 'running' state within 5 seconds".to_string(),
+            ));
+        }
 
         // Track the container
         self.containers
@@ -403,7 +478,48 @@ impl SandboxManager {
         {
             let containers = self.containers.lock().await;
             if !containers.contains_key(sandbox_id) {
-                return Err(SandboxError::ContainerNotFound(sandbox_id.to_string()));
+                return Err(SandboxError::ContainerNotFound(format!(
+                    "{} (not tracked — may have been destroyed or never created)",
+                    sandbox_id
+                )));
+            }
+        }
+
+        // H21 fix: verify the container is actually running in Docker before exec.
+        // The container may have exited or been removed outside our tracking.
+        match self.docker.inspect_container(sandbox_id, None).await {
+            Ok(info) => {
+                let running = info
+                    .state
+                    .as_ref()
+                    .and_then(|s| s.running)
+                    .unwrap_or(false);
+                if !running {
+                    let status = info
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.status.as_ref())
+                        .map(|s| format!("{:?}", s))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    error!(
+                        sandbox_id = %sandbox_id,
+                        status = %status,
+                        "Container exists but is not running"
+                    );
+                    return Err(SandboxError::ContainerNotFound(format!(
+                        "{} (container status: {}, not running)",
+                        sandbox_id, status
+                    )));
+                }
+            }
+            Err(e) => {
+                error!(sandbox_id = %sandbox_id, error = %e, "Container not found in Docker");
+                // Remove stale entry from tracking
+                self.containers.lock().await.remove(sandbox_id);
+                return Err(SandboxError::ContainerNotFound(format!(
+                    "{} (Docker API: {})",
+                    sandbox_id, e
+                )));
             }
         }
 
@@ -501,33 +617,114 @@ impl SandboxManager {
         })
     }
 
+    /// Write a file into the sandbox filesystem via Docker's archive extract API.
+    ///
+    /// Uses `upload_to_container` with a synthesized in-memory tar stream — no
+    /// shell interpretation, so the content is not exposed to heredoc/quote
+    /// injection risk. `path` must be an absolute path; the file is written
+    /// with mode 0600 owned by uid/gid 1000 (the `hunter` user inside the
+    /// attack-machine image).
+    pub async fn write_file(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        content: &[u8],
+    ) -> Result<(), SandboxError> {
+        use std::path::Path;
+
+        // Must be tracked
+        {
+            let containers = self.containers.lock().await;
+            if !containers.contains_key(sandbox_id) {
+                return Err(SandboxError::ContainerNotFound(sandbox_id.to_string()));
+            }
+        }
+
+        if !path.starts_with('/') {
+            return Err(SandboxError::InvalidConfig(format!(
+                "write_file: path must be absolute, got {}", path
+            )));
+        }
+
+        let p = Path::new(path);
+        let parent = p
+            .parent()
+            .and_then(|s| s.to_str())
+            .unwrap_or("/");
+        let filename = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| SandboxError::InvalidConfig(format!(
+                "write_file: path has no file name: {}", path
+            )))?;
+
+        // Build a tar archive containing a single file.
+        let mut buf: Vec<u8> = Vec::with_capacity(content.len() + 1024);
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(filename)
+                .map_err(|e| SandboxError::InvalidConfig(format!("tar path error: {}", e)))?;
+            header.set_size(content.len() as u64);
+            header.set_mode(0o600);
+            header.set_uid(1000);
+            header.set_gid(1000);
+            header.set_mtime(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append(&header, content)
+                .map_err(|e| SandboxError::InvalidConfig(format!("tar write error: {}", e)))?;
+            builder.finish()
+                .map_err(|e| SandboxError::InvalidConfig(format!("tar finalize error: {}", e)))?;
+        }
+
+        let options = bollard::container::UploadToContainerOptions {
+            path: parent.to_string(),
+            no_overwrite_dir_non_dir: "false".to_string(),
+        };
+
+        self.docker
+            .upload_to_container(sandbox_id, Some(options), bytes::Bytes::from(buf))
+            .await?;
+
+        info!(sandbox_id = %sandbox_id, path = %path, size = content.len(), "Wrote file into sandbox");
+        Ok(())
+    }
+
     /// Destroy a specific sandbox container
     pub async fn destroy_sandbox(&self, sandbox_id: &str) -> Result<(), SandboxError> {
         // Remove from tracking
         self.containers.lock().await.remove(sandbox_id);
 
-        // Stop container (auto_remove will delete it)
-        match self
+        // Stop container first, then remove (auto_remove is off since H21 fix)
+        let _ = self
             .docker
             .stop_container(sandbox_id, Some(StopContainerOptions { t: 5 }))
+            .await;
+
+        // Always attempt removal — container may be stopped or already dead
+        match self
+            .docker
+            .remove_container(
+                sandbox_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
             .await
         {
             Ok(_) => {
-                info!(sandbox_id = %sandbox_id, "Sandbox container stopped");
+                info!(sandbox_id = %sandbox_id, "Sandbox container destroyed");
             }
             Err(e) => {
-                // Container might already be stopped, try force remove
-                warn!(sandbox_id = %sandbox_id, error = %e, "Stop failed, attempting force remove");
-                let _ = self
-                    .docker
-                    .remove_container(
-                        sandbox_id,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
+                // Container may already be removed — not an error
+                warn!(sandbox_id = %sandbox_id, error = %e, "Container remove failed (may already be gone)");
             }
         }
 
@@ -583,6 +780,76 @@ impl SandboxManager {
         }
 
         Ok(count)
+    }
+
+    /// I5: Reap orphan containers — huntress-labeled containers that are
+    /// older than `min_age_secs` and NOT in the active tracking map.
+    ///
+    /// This catches containers leaked when an agent crashed before cleanup
+    /// ran. Returns the number of containers force-removed.
+    pub async fn reap_orphans(&self, min_age_secs: u64) -> Result<usize, SandboxError> {
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![format!("{}={}", LABEL_KEY, HUNTRESS_LABEL)],
+        );
+
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await?;
+
+        let active_ids = self.containers.lock().await;
+        let now_secs: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut reaped = 0usize;
+        for container in &containers {
+            let id = match &container.id {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+
+            // Keep anything currently tracked — those are live agent sandboxes.
+            if active_ids.contains_key(&id) {
+                continue;
+            }
+
+            // Age gate: skip containers younger than min_age_secs to avoid
+            // racing a still-initializing sandbox we haven't tracked yet.
+            let created = container.created.unwrap_or(0);
+            let age = now_secs.saturating_sub(created);
+            if (age as u64) < min_age_secs {
+                continue;
+            }
+
+            info!(container_id = %id, age_secs = age, "Reaping orphan sandbox container");
+            match self
+                .docker
+                .remove_container(
+                    &id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(_) => reaped += 1,
+                Err(e) => warn!(container_id = %id, error = %e, "Failed to reap orphan"),
+            }
+        }
+
+        if reaped > 0 {
+            info!(count = reaped, "Reaped orphan sandbox containers");
+        }
+        Ok(reaped)
     }
 
     /// List all active sandbox containers
@@ -683,6 +950,28 @@ pub async fn sandbox_exec(
         .map_err(|e| format!("Failed to execute command: {}", e))
 }
 
+/// Tauri command: Write a file into a sandbox container (Phase 1 / Q1).
+///
+/// Used to materialize `~/.curlrc` with session auth headers so shell-tool
+/// agents inherit auth without the LLM having to paste tokens into commands.
+#[tauri::command]
+pub async fn sandbox_write_file(
+    state: tauri::State<'_, Arc<Mutex<Option<SandboxManager>>>>,
+    sandbox_id: String,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    let guard = state.lock().await;
+    let manager = guard
+        .as_ref()
+        .ok_or_else(|| "Sandbox manager not initialized".to_string())?;
+
+    manager
+        .write_file(&sandbox_id, &path, content.as_bytes())
+        .await
+        .map_err(|e| format!("Failed to write file into sandbox: {}", e))
+}
+
 /// Tauri command: Destroy a sandbox container
 #[tauri::command]
 pub async fn destroy_sandbox(
@@ -714,6 +1003,24 @@ pub async fn list_sandboxes(
         .list_sandboxes()
         .await
         .map_err(|e| format!("Failed to list sandboxes: {}", e))
+}
+
+/// I5: Tauri command — reap orphan containers older than min_age_secs
+/// that aren't in the active tracking map. Call on orchestrator init.
+#[tauri::command]
+pub async fn reap_orphan_sandboxes(
+    state: tauri::State<'_, Arc<Mutex<Option<SandboxManager>>>>,
+    min_age_secs: u64,
+) -> Result<usize, String> {
+    let guard = state.lock().await;
+    let manager = guard
+        .as_ref()
+        .ok_or_else(|| "Sandbox manager not initialized".to_string())?;
+
+    manager
+        .reap_orphans(min_age_secs)
+        .await
+        .map_err(|e| format!("Failed to reap orphan sandboxes: {}", e))
 }
 
 /// Tauri command: Emergency destroy all sandbox containers
@@ -839,5 +1146,53 @@ mod tests {
         let mut env2 = HashMap::new();
         env2.insert("ld_preload".to_string(), "/evil.so".to_string());
         assert!(SandboxManager::validate_env(&env2).is_err());
+    }
+
+    /// I5: End-to-end reaper test. Requires a running Docker/Podman daemon;
+    /// runs only when invoked explicitly with `cargo test -- --ignored`.
+    ///
+    /// Creates three huntress-labeled containers (no image pull), releases
+    /// the manager's tracking of two of them, then calls reap_orphans with
+    /// a 0-second age floor and verifies exactly two are removed.
+    #[tokio::test]
+    #[ignore]
+    async fn test_reap_orphans_removes_untracked() {
+        let manager = match SandboxManager::new().await {
+            Ok(m) => m,
+            Err(_) => return, // No Docker/Podman available — skip silently
+        };
+
+        // Create 2 sandboxes, then "forget" them (untrack) to simulate
+        // orphans left over from a crashed prior hunt.
+        let mut created = Vec::new();
+        for _ in 0..2 {
+            let cfg = SandboxConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                ..SandboxConfig::default()
+            };
+            match manager.create_sandbox(cfg).await {
+                Ok(id) => created.push(id),
+                Err(e) => {
+                    eprintln!("Skipping reaper test — create_sandbox failed: {}", e);
+                    return;
+                }
+            }
+        }
+
+        // Manually remove from the tracking map without destroying
+        {
+            let mut tracked = manager.containers.lock().await;
+            for id in &created {
+                tracked.remove(id);
+            }
+        }
+
+        // Reap with min_age_secs=0 so our just-created orphans qualify
+        let reaped = manager.reap_orphans(0).await.expect("reap_orphans");
+        assert!(
+            reaped >= 2,
+            "expected to reap >=2 orphans, got {}",
+            reaped
+        );
     }
 }

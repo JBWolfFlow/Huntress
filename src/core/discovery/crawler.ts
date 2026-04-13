@@ -56,7 +56,7 @@ export interface DiscoveredForm {
 export interface DiscoveredEndpoint {
   url: string;
   method: string;
-  source: 'html' | 'javascript' | 'robots' | 'sitemap' | 'param_miner';
+  source: 'html' | 'javascript' | 'robots' | 'sitemap' | 'param_miner' | 'openapi' | 'graphql';
   parameters: string[];
   contentType?: string;
 }

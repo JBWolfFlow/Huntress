@@ -83,8 +83,17 @@ describe('classifyTaskComplexity', () => {
     expect(classifyTaskComplexity('race-condition-hunter', 'Test race conditions')).toBe('complex');
   });
 
-  it('upgrades simple to moderate when complex keywords found', () => {
-    expect(classifyTaskComplexity('recon', 'Analyze authentication bypass')).toBe('moderate');
+  it('does NOT upgrade locked simple agents (recon) despite complex keywords', () => {
+    expect(classifyTaskComplexity('recon', 'Analyze authentication bypass')).toBe('simple');
+    expect(classifyTaskComplexity('recon', 'Multi-step chain exploit')).toBe('simple');
+    expect(classifyTaskComplexity('recon', 'Synthesize business logic report')).toBe('simple');
+  });
+
+  it('does NOT upgrade any locked simple agents despite complex keywords', () => {
+    const lockedAgents = ['cors-hunter', 'host-header-hunter', 'crlf-hunter', 'cache-hunter', 'open-redirect-hunter', 'subdomain-takeover-hunter'];
+    for (const agent of lockedAgents) {
+      expect(classifyTaskComplexity(agent, 'authentication chain bypass analyze')).toBe('simple');
+    }
   });
 
   it('upgrades moderate to complex when complex keywords found', () => {

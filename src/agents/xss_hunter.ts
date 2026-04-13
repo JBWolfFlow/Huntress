@@ -23,8 +23,9 @@ import type {
   CommandResult,
   ReactFinding,
 } from '../core/engine/react_loop';
-import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
+import { AGENT_TOOL_SCHEMAS, BROWSER_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const XSS_SYSTEM_PROMPT = `You are an expert Cross-Site Scripting (XSS) security researcher with deep knowledge of browser rendering engines, DOM APIs, Content Security Policy, and WAF bypass techniques. You specialize in finding reflected, stored, DOM-based, and blind XSS vulnerabilities in web applications.
 
@@ -192,8 +193,8 @@ export class XssHunterAgent implements BaseAgent {
         model: this.model,
         systemPrompt: XSS_SYSTEM_PROMPT,
         goal: `Test for Cross-Site Scripting (XSS) vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
-        tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        tools: [...AGENT_TOOL_SCHEMAS, ...BROWSER_TOOL_SCHEMAS],
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -209,6 +210,11 @@ export class XssHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
+        browserEnabled: true,
       });
 
       const result = await loop.execute();
@@ -227,6 +233,7 @@ export class XssHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

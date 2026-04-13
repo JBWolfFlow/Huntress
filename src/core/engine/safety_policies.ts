@@ -266,6 +266,89 @@ export function isCommandSafe(command: string, target: string, category: string)
 }
 
 /**
+ * Auto-approval categories for the approval gate (I3).
+ *
+ * Used by the UI to let the user pre-authorize whole classes of commands
+ * so unattended hunts aren't blocked at the 60-second approval timeout.
+ * `manual_only` means the command MUST go to the approval modal regardless
+ * of any toggles — typically mutations (POST/PUT/DELETE, sqlmap, etc.).
+ */
+export type ApprovalCategory =
+  | 'passive_recon'
+  | 'safe_active_recon'
+  | 'injection_passive'
+  | 'manual_only';
+
+/**
+ * Classify a command into an ApprovalCategory. Deterministic: driven by
+ * the tool name and simple flag/HTTP-verb heuristics, no LLM in the path.
+ *
+ * Conservative by design — unknown tools fall through to `manual_only`
+ * so the approval modal still runs for anything we haven't vetted.
+ */
+export function classifyCommand(command: string): ApprovalCategory {
+  const trimmed = command.trim();
+  if (!trimmed) return 'manual_only';
+
+  const tool = trimmed.split(/\s+/)[0];
+
+  // ─── Passive recon — read-only, no server state change ──────────────────
+  const passiveTools = new Set([
+    'whois', 'dig', 'nslookup', 'host',
+    'subfinder', 'assetfinder', 'findomain', 'dnsx',
+    'httpx', 'wafw00f', 'whatweb',
+    'gau', 'waybackurls', 'getJS', 'jsluice',
+    'searchsploit',
+  ]);
+  if (passiveTools.has(tool)) return 'passive_recon';
+
+  // curl/wget: passive ONLY for GET/HEAD without injection-like payloads.
+  // Injection payload heuristic runs after the HTTP-verb check.
+  if (tool === 'curl' || tool === 'wget') {
+    const verb = extractHttpVerb(trimmed);
+    if (verb && verb !== 'GET' && verb !== 'HEAD') return 'manual_only';
+    // GET with injection-style payloads in query params — still passive,
+    // but we surface it as `injection_passive` so users can opt-in separately.
+    if (hasInjectionPayload(trimmed)) return 'injection_passive';
+    return 'passive_recon';
+  }
+
+  // ─── Safe active recon — enumeration but no exploitation ────────────────
+  const safeActiveTools = new Set([
+    'gobuster', 'ffuf', 'dirb', 'dirsearch', 'feroxbuster',
+    'katana', 'gospider', 'paramspider', 'arjun',
+  ]);
+  if (safeActiveTools.has(tool)) return 'safe_active_recon';
+
+  // nmap without SYN-scan (-sS requires raw sockets / root)
+  if (tool === 'nmap') {
+    return /\s-sS\b/.test(trimmed) ? 'manual_only' : 'safe_active_recon';
+  }
+
+  // nuclei with default templates only — anything with -t custom path is manual
+  if (tool === 'nuclei') {
+    return /\s-t\b/.test(trimmed) ? 'manual_only' : 'safe_active_recon';
+  }
+
+  // ─── Everything else goes through manual approval ───────────────────────
+  return 'manual_only';
+}
+
+function extractHttpVerb(command: string): string | null {
+  // Match `-X VERB` or `--request VERB` for curl; wget has no explicit verb flag.
+  const match = command.match(/(?:^|\s)(?:-X|--request)\s+([A-Z]+)/i);
+  return match ? match[1].toUpperCase() : null;
+}
+
+function hasInjectionPayload(command: string): boolean {
+  // Heuristics for GET-with-injection: SSTI braces, SQLi tick/union,
+  // XSS angle brackets, path traversal, prototype pollution markers.
+  // Deliberately conservative — false negatives route to passive_recon,
+  // which the user has already opted into.
+  return /\{\{.*\}\}|'\s*OR\s*1=1|UNION\s+SELECT|<script\b|\.\.%2f|%2e%2e%2f|\.\.\/\.\.\/|__proto__/i.test(command);
+}
+
+/**
  * Categorize a command's risk level based on the tool being used.
  */
 export function categorizeCommandRisk(

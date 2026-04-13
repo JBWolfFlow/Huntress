@@ -376,6 +376,7 @@ Respond with ONLY the Python code, no markdown fences or explanation.`,
               `Step ${i + 1}: ${f.title} (${f.severity}) at ${f.target}`,
             ),
             confidenceBoost: 10,
+            validated: false, // Creative chains start unvalidated
           };
         });
     } catch {

@@ -26,6 +26,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const COMMAND_INJECTION_SYSTEM_PROMPT = `You are an expert OS command injection security researcher with deep knowledge of shell interpreters (bash, sh, cmd.exe, PowerShell), command chaining operators, input sanitization bypasses, and blind detection techniques. You specialize in finding command injection vulnerabilities in web applications and APIs that pass user input to system commands.
 
@@ -205,7 +206,7 @@ export class CommandInjectionHunterAgent implements BaseAgent {
         systemPrompt: COMMAND_INJECTION_SYSTEM_PROMPT,
         goal: `Test for OS command injection vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -221,6 +222,10 @@ export class CommandInjectionHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -239,6 +244,7 @@ export class CommandInjectionHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

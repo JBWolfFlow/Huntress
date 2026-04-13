@@ -5,6 +5,9 @@
  * Each type has a corresponding renderer in the ChatMessage component.
  */
 
+import type { ValidationStatus, DuplicateCheckResult } from '../../agents/base_agent';
+import type { ValidationEvidence } from '../validation/validator';
+
 /** Severity levels for findings */
 export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
 
@@ -60,6 +63,14 @@ export interface FindingCardMessage extends BaseMessage {
   agent: string;
   evidence: string[];
   isDuplicate: boolean;
+  /** Phase 3: Deterministic validation status */
+  validationStatus: ValidationStatus;
+  /** Phase 3: Evidence from deterministic validation */
+  validationEvidence?: ValidationEvidence[];
+  /** Phase 3: Validator confidence score (0-100) */
+  validationConfidence?: number;
+  /** Phase 3: H1 duplicate check result */
+  duplicateCheck?: DuplicateCheckResult;
 }
 
 /** Clickable attack strategy card */

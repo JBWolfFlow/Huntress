@@ -41,14 +41,22 @@ export interface ReportQualityScore {
     evidence: number;
     impact: number;
     reproducibility: number;
+    /** RQ6: Structured HTTP request/response evidence quality */
+    httpEvidence: number;
+    /** RQ6: Executable PoC (curl/Python commands) */
+    executablePoc: number;
+    /** RQ6: Expected vs Actual behavior section */
+    expectedVsActual: number;
   };
   /** Issues found during scoring. */
   issues: QualityIssue[];
   /** Letter grade derived from `overall`. */
   grade: 'A' | 'B' | 'C' | 'D' | 'F';
+  /** RQ6: Whether the report meets the minimum quality threshold for submission */
+  meetsThreshold: boolean;
 }
 
-export type QualityCategory = 'clarity' | 'completeness' | 'evidence' | 'impact' | 'reproducibility';
+export type QualityCategory = 'clarity' | 'completeness' | 'evidence' | 'impact' | 'reproducibility' | 'httpEvidence' | 'executablePoc' | 'expectedVsActual';
 
 export interface QualityIssue {
   category: QualityCategory;
@@ -59,13 +67,24 @@ export interface QualityIssue {
 
 // ─── Category weights ────────────────────────────────────────────────────────
 
+/**
+ * H16 Recalibrated weights — prioritize what H1 triagers actually check.
+ * HTTP evidence + executable PoC + expected/actual = 50% of total score.
+ * Reports without HTTP pairs cannot exceed 55% even with perfect text.
+ */
 const CATEGORY_WEIGHTS: Record<QualityCategory, number> = {
-  clarity: 0.20,
-  completeness: 0.25,
-  evidence: 0.25,
-  impact: 0.15,
+  clarity: 0.10,
+  completeness: 0.10,
+  evidence: 0.05,
+  impact: 0.10,
   reproducibility: 0.15,
+  httpEvidence: 0.25,
+  executablePoc: 0.15,
+  expectedVsActual: 0.10,
 };
+
+/** Reports scoring below this threshold trigger a warning that the report is not ready for submission */
+const MINIMUM_QUALITY_THRESHOLD = 60;
 
 // ─── Impact keyword set ──────────────────────────────────────────────────────
 
@@ -193,20 +212,61 @@ export class ReportQualityScorer {
     const evidence = this.scoreEvidence(report, issues);
     const impact = this.scoreImpact(report, issues);
     const reproducibility = this.scoreReproducibility(report, issues);
+    const httpEvidence = this.scoreHttpEvidence(report, issues);
+    const executablePoc = this.scoreExecutablePoc(report, issues);
+    const expectedVsActual = this.scoreExpectedVsActual(report, issues);
 
     const overall = Math.round(
       clarity * CATEGORY_WEIGHTS.clarity +
       completeness * CATEGORY_WEIGHTS.completeness +
       evidence * CATEGORY_WEIGHTS.evidence +
       impact * CATEGORY_WEIGHTS.impact +
-      reproducibility * CATEGORY_WEIGHTS.reproducibility,
+      reproducibility * CATEGORY_WEIGHTS.reproducibility +
+      httpEvidence * CATEGORY_WEIGHTS.httpEvidence +
+      executablePoc * CATEGORY_WEIGHTS.executablePoc +
+      expectedVsActual * CATEGORY_WEIGHTS.expectedVsActual,
     );
 
+    // C5: Severity inflation penalty — CRITICAL severity without evidence of
+    // RCE, auth bypass, or full data access gets -15 points. Prevents the
+    // quality scorer from giving false confidence on inflated findings.
+    let severityPenalty = 0;
+    if (report.severity === 'critical') {
+      const allText = `${report.title} ${report.description} ${report.impact}`.toLowerCase();
+      const hasCriticalEvidence = allText.includes('rce') || allText.includes('remote code execution') ||
+        allText.includes('auth bypass') || allText.includes('authentication bypass') ||
+        allText.includes('account takeover') || allText.includes('full database') ||
+        allText.includes('admin access') || allText.includes('arbitrary code') ||
+        allText.includes('command execution') || allText.includes('shell access');
+      if (!hasCriticalEvidence) {
+        severityPenalty = 15;
+        issues.push({
+          category: 'impact',
+          severity: 'major',
+          message: 'CRITICAL severity claimed without RCE, auth bypass, or full data access evidence.',
+          suggestion: 'Downgrade severity to HIGH or provide evidence of critical-tier impact (RCE, account takeover, full database access). H1 triagers will reject inflated severity and reputation drops -5 per N/A.',
+        });
+      }
+    }
+
+    const adjustedOverall = Math.max(0, overall - severityPenalty);
+    const meetsThreshold = adjustedOverall >= MINIMUM_QUALITY_THRESHOLD;
+
+    if (!meetsThreshold) {
+      issues.push({
+        category: 'evidence',
+        severity: 'critical',
+        message: `Report quality score (${adjustedOverall}/100) is below the minimum submission threshold (${MINIMUM_QUALITY_THRESHOLD}/100).`,
+        suggestion: 'This report is not ready for HackerOne submission. Add HTTP request/response evidence, executable reproduction commands, and Expected vs Actual behavior sections.',
+      });
+    }
+
     return {
-      overall,
-      categories: { clarity, completeness, evidence, impact, reproducibility },
+      overall: adjustedOverall,
+      categories: { clarity, completeness, evidence, impact, reproducibility, httpEvidence, executablePoc, expectedVsActual },
       issues,
       grade: this.overallToGrade(overall),
+      meetsThreshold,
     };
   }
 
@@ -221,6 +281,9 @@ export class ReportQualityScorer {
     this.collectEvidenceIssues(report, issues);
     this.collectImpactIssues(report, issues);
     this.collectReproducibilityIssues(report, issues);
+    this.collectHttpEvidenceIssues(report, issues);
+    this.collectExecutablePocIssues(report, issues);
+    this.collectExpectedVsActualIssues(report, issues);
 
     return issues;
   }
@@ -368,39 +431,28 @@ export class ReportQualityScorer {
   }
 
   /**
-   * Evidence (25% weight)
-   *  +30  has screenshots
-   *  +30  has request/response data
-   *  +20  has curl commands or code
-   *  +20  has proof-of-concept output
+   * Evidence (5% weight — H16 recalibrated)
+   * Only scores screenshots/video and PoC output text.
+   * HTTP req/resp and curl/code are scored separately in httpEvidence and executablePoc
+   * to avoid double-counting.
+   *  +50  has screenshots or video
+   *  +50  has proof-of-concept output
    */
   private scoreEvidence(report: H1Report, _issues: QualityIssue[]): number {
     let score = 0;
 
-    // Screenshots
+    // Screenshots or video
     const hasScreenshots =
       (report.proof.screenshots !== undefined && report.proof.screenshots.length > 0) ||
       (report.proof.video !== undefined && report.proof.video.length > 0);
     if (hasScreenshots) {
-      score += 30;
+      score += 50;
     }
 
-    // Combine all textual content for pattern matching
+    // PoC output references in text
     const allText = this.getAllTextContent(report);
-
-    // Request/response data
-    if (REQUEST_RESPONSE_PATTERNS.some((p) => p.test(allText))) {
-      score += 30;
-    }
-
-    // Curl commands or code
-    if (CURL_CODE_PATTERNS.some((p) => p.test(allText))) {
-      score += 20;
-    }
-
-    // PoC output
     if (POC_OUTPUT_PATTERNS.some((p) => p.test(allText))) {
-      score += 20;
+      score += 50;
     }
 
     return Math.min(score, 100);
@@ -484,6 +536,92 @@ export class ReportQualityScorer {
     } else if (avgLength > 15) {
       score += Math.round(25 * (avgLength / 30));
     }
+
+    return Math.min(score, 100);
+  }
+
+  /**
+   * RQ6: HTTP Evidence (15% weight)
+   *  +40  has structured httpEvidence field
+   *  +30  httpEvidence contains HTTP code blocks (```http)
+   *  +30  httpEvidence contains 2+ request/response pairs
+   */
+  private scoreHttpEvidence(report: H1Report, _issues: QualityIssue[]): number {
+    let score = 0;
+
+    if (report.httpEvidence && report.httpEvidence.trim().length > 0) {
+      score += 40;
+
+      // Contains HTTP code blocks
+      const httpCodeBlocks = (report.httpEvidence.match(/```http/g) ?? []).length;
+      if (httpCodeBlocks >= 1) {
+        score += 30;
+      }
+
+      // Contains 2+ request/response pairs (each pair has Request + Response blocks)
+      if (httpCodeBlocks >= 4) {
+        score += 30;
+      } else if (httpCodeBlocks >= 2) {
+        score += 15;
+      }
+    } else {
+      // Fall back to checking all text for HTTP patterns (legacy reports)
+      const allText = this.getAllTextContent(report);
+      const hasHttpPatterns = REQUEST_RESPONSE_PATTERNS.some((p) => p.test(allText));
+      if (hasHttpPatterns) {
+        score += 20; // Partial credit for HTTP patterns in text
+      }
+    }
+
+    return Math.min(score, 100);
+  }
+
+  /**
+   * RQ6: Executable PoC (10% weight)
+   *  +50  has quickReproduction field
+   *  +30  contains curl command
+   *  +20  contains Python script or multi-step reproduction
+   */
+  private scoreExecutablePoc(report: H1Report, _issues: QualityIssue[]): number {
+    let score = 0;
+
+    if (report.quickReproduction && report.quickReproduction.trim().length > 0) {
+      score += 50;
+
+      if (/curl\s+/i.test(report.quickReproduction)) {
+        score += 30;
+      }
+
+      if (/import\s+requests|python/i.test(report.quickReproduction)) {
+        score += 20;
+      }
+    } else {
+      // Fall back to checking all text for executable commands
+      const allText = this.getAllTextContent(report);
+      if (CURL_CODE_PATTERNS.some((p) => p.test(allText))) {
+        score += 25; // Partial credit
+      }
+    }
+
+    return Math.min(score, 100);
+  }
+
+  /**
+   * RQ6: Expected vs Actual Behavior (5% weight)
+   *  +50  has "Expected" keyword in description or sections
+   *  +50  has "Actual" keyword paired with Expected
+   */
+  private scoreExpectedVsActual(report: H1Report, _issues: QualityIssue[]): number {
+    let score = 0;
+    const allText = this.getAllTextContent(report);
+
+    const hasExpected = /\b(expected|should)\b.*\b(behavior|behaviour|result|response)\b/i.test(allText) ||
+      /\*\*Expected(:\*\*| Behavior)/i.test(allText);
+    const hasActual = /\b(actual|instead|however)\b.*\b(behavior|behaviour|result|response)\b/i.test(allText) ||
+      /\*\*Actual(:\*\*| Behavior)/i.test(allText);
+
+    if (hasExpected) score += 50;
+    if (hasActual) score += 50;
 
     return Math.min(score, 100);
   }
@@ -630,25 +768,6 @@ export class ReportQualityScorer {
     }
 
     const allText = this.getAllTextContent(report);
-
-    if (!REQUEST_RESPONSE_PATTERNS.some((p) => p.test(allText))) {
-      issues.push({
-        category: 'evidence',
-        severity: 'major',
-        message: 'No HTTP request/response data found in the report.',
-        suggestion: 'Include the raw HTTP request and response that demonstrates the vulnerability (headers, status codes, body).',
-      });
-    }
-
-    if (!CURL_CODE_PATTERNS.some((p) => p.test(allText))) {
-      issues.push({
-        category: 'evidence',
-        severity: 'minor',
-        message: 'No curl command or code snippet found.',
-        suggestion: 'Add a curl command or code snippet that a triager can copy-paste to reproduce the issue.',
-      });
-    }
-
     if (!POC_OUTPUT_PATTERNS.some((p) => p.test(allText))) {
       issues.push({
         category: 'evidence',
@@ -747,6 +866,64 @@ export class ReportQualityScorer {
         severity: 'major',
         message: `Steps are too brief (average ${Math.round(avgLength)} chars each).`,
         suggestion: 'Add more detail to each step — describe what to do, what to observe, and what the expected result is.',
+      });
+    }
+  }
+
+  private collectHttpEvidenceIssues(report: H1Report, issues: QualityIssue[]): void {
+    if (!report.httpEvidence || report.httpEvidence.trim().length === 0) {
+      const allText = this.getAllTextContent(report);
+      const hasAnyHttpPattern = REQUEST_RESPONSE_PATTERNS.some((p) => p.test(allText));
+      if (!hasAnyHttpPattern) {
+        issues.push({
+          category: 'httpEvidence',
+          severity: 'critical',
+          message: 'No HTTP request/response evidence found in the report.',
+          suggestion: 'Include structured HTTP request/response pairs as code blocks. Show the exact request that triggers the vulnerability and the response that proves exploitation.',
+        });
+      } else {
+        issues.push({
+          category: 'httpEvidence',
+          severity: 'major',
+          message: 'HTTP evidence exists in text but is not formatted as structured code blocks.',
+          suggestion: 'Use the httpEvidence field with ```http code blocks for request/response pairs. This makes evidence easier for triagers to read and reproduce.',
+        });
+      }
+    }
+  }
+
+  private collectExecutablePocIssues(report: H1Report, issues: QualityIssue[]): void {
+    if (!report.quickReproduction || report.quickReproduction.trim().length === 0) {
+      const allText = this.getAllTextContent(report);
+      if (!CURL_CODE_PATTERNS.some((p) => p.test(allText))) {
+        issues.push({
+          category: 'executablePoc',
+          severity: 'critical',
+          message: 'No executable reproduction commands (curl, Python, etc.) found in the report.',
+          suggestion: 'Add a curl command or Python script that a triager can copy-paste to reproduce the vulnerability immediately.',
+        });
+      } else {
+        issues.push({
+          category: 'executablePoc',
+          severity: 'minor',
+          message: 'Executable commands exist in report text but not in the dedicated quickReproduction section.',
+          suggestion: 'Move reproduction commands to the quickReproduction field for better report structure.',
+        });
+      }
+    }
+  }
+
+  private collectExpectedVsActualIssues(report: H1Report, issues: QualityIssue[]): void {
+    const allText = this.getAllTextContent(report);
+    const hasExpected = /\b(expected|should)\b.*\b(behavior|behaviour|result|response)\b/i.test(allText) ||
+      /\*\*Expected(:\*\*| Behavior)/i.test(allText);
+
+    if (!hasExpected) {
+      issues.push({
+        category: 'expectedVsActual',
+        severity: 'major',
+        message: 'Report does not describe Expected vs Actual behavior.',
+        suggestion: 'Add a section showing what the application SHOULD do (expected behavior) vs what it ACTUALLY does (vulnerable behavior). This helps triagers understand the security impact.',
       });
     }
   }

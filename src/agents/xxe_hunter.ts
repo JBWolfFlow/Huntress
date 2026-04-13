@@ -26,6 +26,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const XXE_SYSTEM_PROMPT = `You are an expert XML External Entity (XXE) injection security researcher with deep knowledge of XML parsers, DTD processing, entity expansion, and out-of-band data exfiltration techniques across Java, .NET, PHP, Python, and Ruby ecosystems. You specialize in finding XXE vulnerabilities in web applications, APIs, file upload handlers, and SAML/SOAP endpoints.
 
@@ -161,7 +162,7 @@ export class XxeHunterAgent implements BaseAgent {
         systemPrompt: XXE_SYSTEM_PROMPT,
         goal: `Test for XML External Entity (XXE) injection vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -177,6 +178,10 @@ export class XxeHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -195,6 +200,7 @@ export class XxeHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

@@ -26,6 +26,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const SQLI_SYSTEM_PROMPT = `You are an expert SQL Injection security researcher with deep knowledge of relational database internals (MySQL, PostgreSQL, MSSQL, Oracle, SQLite), query parsing, ORM bypass techniques, and WAF evasion. You specialize in finding error-based, blind, union-based, second-order, and out-of-band SQL injection vulnerabilities in web applications.
 
@@ -197,7 +198,7 @@ export class SqliHunterAgent implements BaseAgent {
         systemPrompt: SQLI_SYSTEM_PROMPT,
         goal: `Test for SQL Injection vulnerabilities on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -213,6 +214,10 @@ export class SqliHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -231,6 +236,7 @@ export class SqliHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

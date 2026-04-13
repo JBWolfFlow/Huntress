@@ -78,7 +78,7 @@ const SECURITY_VOCABULARY: string[] = [
 const VOCAB_INDEX = new Map<string, number>();
 SECURITY_VOCABULARY.forEach((term, idx) => VOCAB_INDEX.set(term, idx));
 
-const VECTOR_DIM = SECURITY_VOCABULARY.length;
+export const VECTOR_DIM = SECURITY_VOCABULARY.length;
 
 // ─── Embedding Service ──────────────────────────────────────────────────────
 
@@ -293,6 +293,48 @@ export class HuntMemory {
     }
 
     return { isDuplicate: false };
+  }
+
+  /** Query past findings for a specific target domain.
+   *  Used at hunt start to seed cross-hunt duplicate detection (H26). */
+  async queryPastFindingsForTarget(
+    target: string,
+    limit: number = 50,
+  ): Promise<Array<{ title: string; vulnType: string; severity: string; similarity: number; sessionId: string }>> {
+    if (!this.qdrant || !this.initialized) return [];
+
+    const text = `finding ${target}`;
+    const vector = this.embedder.embed(text);
+
+    try {
+      const results = await this.qdrant.searchWithFilter(
+        vector,
+        { type: 'finding' },
+        limit,
+      );
+
+      return results
+        .filter(r => {
+          // Only return findings for the same target domain
+          const findingTarget = String(r.payload.target ?? '');
+          try {
+            const targetHost = new URL(target.startsWith('http') ? target : `https://${target}`).hostname;
+            const findingHost = new URL(findingTarget.startsWith('http') ? findingTarget : `https://${findingTarget}`).hostname;
+            return targetHost === findingHost || findingTarget.includes(targetHost) || targetHost.includes(String(r.payload.target ?? ''));
+          } catch {
+            return findingTarget.includes(target) || target.includes(findingTarget);
+          }
+        })
+        .map(r => ({
+          title: String(r.payload.title ?? ''),
+          vulnType: String(r.payload.vulnType ?? ''),
+          severity: String(r.payload.severity ?? ''),
+          similarity: r.score,
+          sessionId: String(r.payload.sessionId ?? ''),
+        }));
+    } catch {
+      return [];
+    }
   }
 
   /** Find targets with similar tech stacks */

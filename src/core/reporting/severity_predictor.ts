@@ -8,8 +8,9 @@
  * - Provides confidence-based recommendations
  */
 
-import { QdrantClient, type SearchResult } from '../memory/qdrant_client';
+import { QdrantClient } from '../memory/qdrant_client';
 import type { Vulnerability } from '../../utils/duplicate_checker';
+import { EmbeddingService, VECTOR_DIM } from '../memory/hunt_memory';
 
 export interface SeverityPrediction {
   severity: 'critical' | 'high' | 'medium' | 'low';
@@ -64,8 +65,12 @@ export interface VulnerabilityFeatures {
 
 export class SeverityPredictor {
   private qdrant: QdrantClient;
+  private embedder: EmbeddingService;
   private programBountyRanges?: ProgramBountyRanges;
   private programName?: string;
+
+  /** Dimension of the TF-IDF embedding vectors used by this predictor */
+  static readonly EMBEDDING_DIM = VECTOR_DIM;
 
   // Vulnerability type to base severity mapping
   private readonly severityWeights = {
@@ -105,6 +110,7 @@ export class SeverityPredictor {
     programName?: string
   ) {
     this.qdrant = qdrant;
+    this.embedder = new EmbeddingService();
     this.programBountyRanges = programBountyRanges;
     this.programName = programName;
   }
@@ -253,8 +259,7 @@ export class SeverityPredictor {
    */
   async updateModel(report: AcceptedReport): Promise<void> {
     try {
-      // Create embedding for the report (simplified - use actual embedding in production)
-      const embedding = await this.createEmbedding(report);
+      const embedding = this.createEmbedding(report);
 
       // Store in Qdrant with metadata
       await this.qdrant.upsertPoint({
@@ -464,8 +469,7 @@ export class SeverityPredictor {
     vuln: Vulnerability
   ): Promise<SeverityPrediction['historicalData']> {
     try {
-      // Create embedding for similarity search
-      const embedding = await this.createEmbedding({
+      const embedding = this.createEmbedding({
         type: vuln.type,
         description: vuln.description,
         impact: vuln.impact,
@@ -513,36 +517,14 @@ export class SeverityPredictor {
   }
 
   /**
-   * Create embedding for text (simplified - use actual embedding model in production)
+   * Create embedding for text using TF-IDF with security-domain vocabulary.
+   * Produces L2-normalized vectors of dimension VECTOR_DIM (~150).
    */
-  private async createEmbedding(data: any): Promise<number[]> {
-    // TODO: Replace with actual embedding model (e.g., OpenAI, Cohere, or local model)
-    // For now, return a dummy embedding
-    const text = JSON.stringify(data).toLowerCase();
-    const hash = this.simpleHash(text);
-    
-    // Create a 1536-dimensional vector (OpenAI embedding size)
-    const embedding = new Array(1536).fill(0);
-    
-    // Fill with pseudo-random values based on hash
-    for (let i = 0; i < 1536; i++) {
-      embedding[i] = Math.sin(hash + i) * 0.5 + 0.5;
-    }
-    
-    return embedding;
-  }
-
-  /**
-   * Simple hash function for text
-   */
-  private simpleHash(text: string): number {
-    let hash = 0;
-    for (let i = 0; i < text.length; i++) {
-      const char = text.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
-    }
-    return Math.abs(hash);
+  private createEmbedding(data: object): number[] {
+    const text = Object.values(data)
+      .filter((v): v is string => typeof v === 'string')
+      .join(' ');
+    return this.embedder.embed(text);
   }
 
   /**

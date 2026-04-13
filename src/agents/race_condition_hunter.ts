@@ -28,6 +28,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const RACE_CONDITION_SYSTEM_PROMPT = `You are an elite race condition security researcher. Your mission is to systematically discover race conditions, TOCTOU (Time-Of-Check-Time-Of-Use) bugs, and double-spend vulnerabilities in the target application. Race conditions are among the highest-value, lowest-competition bug classes — most automated tools cannot detect them, making this a prime hunting ground.
 
@@ -113,6 +114,29 @@ Use the \`race_test\` tool to send N identical requests simultaneously:
 1. Identify a rate-limited endpoint (e.g., login, OTP verification)
 2. Use race_test with concurrency=20 sending different OTP values
 3. Check: did more requests get through than the rate limit allows?
+
+**TOCTOU: Cart Modification During Payment:**
+1. Add items to cart, initiate checkout/payment
+2. While payment is processing, send a concurrent request to modify the cart (add expensive items or change quantities)
+3. Check: does the final order contain items not included in the original payment amount?
+4. This exploits the gap between "check cart total" and "charge card" operations
+
+**TOCTOU: Simultaneous Withdrawal/Transfer:**
+1. Check account balance (e.g., $100)
+2. Send 5+ concurrent withdrawal requests for the full balance ($100 each)
+3. Check: did more than one withdrawal succeed? Is the balance negative?
+4. This exploits the gap between "check sufficient balance" and "deduct balance"
+
+**TOCTOU: Address/Details Change After Payment:**
+1. Complete a payment/order
+2. Immediately send a concurrent request to change shipping address or order details
+3. Check: can you redirect shipment to a different address after payment is confirmed?
+
+**TOCTOU: Permission Check Bypass:**
+1. Identify an endpoint that checks permissions before performing an action
+2. Start a privileged session, then simultaneously revoke permissions and execute the action
+3. Check: does the action complete even after permission revocation?
+4. This exploits the gap between "check permission" and "execute operation"
 
 ### Step 5: Response Analysis
 
@@ -275,7 +299,7 @@ export class RaceConditionHunterAgent implements BaseAgent {
           `Scope: ${task.scope.join(', ')}\n\n${task.description}\n\n` +
           `IMPORTANT: Use the race_test tool to send concurrent requests. Start with concurrency=2 and escalate if signals are found.`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -291,6 +315,10 @@ export class RaceConditionHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -308,6 +336,7 @@ export class RaceConditionHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

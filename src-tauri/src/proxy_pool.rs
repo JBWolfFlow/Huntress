@@ -12,7 +12,7 @@
 //!
 //! # Security Guarantees
 //!
-//! - Health check proxies with httpbin.org before use
+//! - Health check proxies with configurable URL (default: httpbin.org) before use
 //! - Mark proxies as failed after consecutive failures
 //! - Support authentication with username/password
 //! - Persist proxy pool state across restarts
@@ -132,6 +132,8 @@ pub struct ProxyPool {
     _health_check_interval: Duration,
     /// Path to proxy config file
     config_file: Option<PathBuf>,
+    /// URL used for proxy health checks (must return 2xx)
+    health_check_url: String,
 }
 
 impl ProxyPool {
@@ -143,6 +145,7 @@ impl ProxyPool {
             max_failures: 3,
             _health_check_interval: Duration::from_secs(300), // 5 minutes
             config_file: None,
+            health_check_url: "https://httpbin.org/ip".to_string(),
         }
     }
 
@@ -300,7 +303,13 @@ impl ProxyPool {
         }
     }
 
-    /// Health check proxy (test with httpbin.org)
+    /// Set a custom URL for proxy health checks.
+    /// The URL must return a 2xx status code for the proxy to be considered healthy.
+    pub fn set_health_check_url(&mut self, url: String) {
+        self.health_check_url = url;
+    }
+
+    /// Health check proxy against the configured health check URL
     pub async fn health_check(&mut self, proxy: &ProxyConfig) -> HealthStatus {
         info!("Health checking proxy: {}", proxy.url);
 
@@ -317,7 +326,7 @@ impl ProxyPool {
         let start = std::time::Instant::now();
         
         match client
-            .get("https://httpbin.org/ip")
+            .get(&self.health_check_url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -658,6 +667,15 @@ mod tests {
 
         let stats = pool.get_stats().unwrap();
         assert_eq!(stats.failed, 1);
+    }
+
+    #[test]
+    fn test_health_check_url_default_and_setter() {
+        let mut pool = ProxyPool::new(RotationStrategy::RoundRobin);
+        assert_eq!(pool.health_check_url, "https://httpbin.org/ip");
+
+        pool.set_health_check_url("https://example.com/health".to_string());
+        assert_eq!(pool.health_check_url, "https://example.com/health");
     }
 
     #[test]

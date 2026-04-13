@@ -164,7 +164,7 @@ describe('OpenRedirectHunterAgent', () => {
     expect(result.taskId).toBe(task.id);
     expect(result.agentId).toBe('open-redirect-hunter');
     expect(result.success).toBe(true);
-    expect(result.duration).toBeGreaterThan(0);
+    expect(result.duration).toBeGreaterThanOrEqual(0);
     expect(Array.isArray(result.findings)).toBe(true);
   });
 

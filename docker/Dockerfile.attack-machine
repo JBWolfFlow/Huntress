@@ -1,0 +1,91 @@
+# Huntress Attack Machine
+# Isolated container for running security tools against in-scope targets.
+# Squid proxy enforces scope at the network level — tools can only reach
+# domains listed in HUNTRESS_ALLOWED_DOMAINS.
+#
+# Build:  docker build -t huntress-attack-machine:latest -f docker/Dockerfile.attack-machine docker/
+# Run:    docker run --rm -e HUNTRESS_ALLOWED_DOMAINS=example.com huntress-attack-machine:latest nuclei -version
+
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base packages + Squid proxy in a single layer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl wget jq git unzip ca-certificates \
+    dnsutils iputils-ping net-tools \
+    python3 python3-pip python3-venv \
+    tinyproxy nmap \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install all Go-based security tools in a single layer to minimize image size.
+# Pin versions for reproducibility. Clean up all temp files in the same layer.
+RUN set -eux; \
+    ARCH="amd64"; \
+    # nuclei — vulnerability scanner
+    NUCLEI_VER="3.3.7"; \
+    curl -sSL "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VER}/nuclei_${NUCLEI_VER}_linux_${ARCH}.zip" -o /tmp/nuclei.zip \
+    && unzip -q /tmp/nuclei.zip -d /usr/local/bin/ && rm /tmp/nuclei.zip; \
+    # subfinder — subdomain discovery
+    SUBFINDER_VER="2.7.1"; \
+    curl -sSL "https://github.com/projectdiscovery/subfinder/releases/download/v${SUBFINDER_VER}/subfinder_${SUBFINDER_VER}_linux_${ARCH}.zip" -o /tmp/sf.zip \
+    && unzip -q /tmp/sf.zip -d /usr/local/bin/ && rm /tmp/sf.zip; \
+    # httpx — HTTP probe
+    HTTPX_VER="1.6.10"; \
+    curl -sSL "https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VER}/httpx_${HTTPX_VER}_linux_${ARCH}.zip" -o /tmp/hx.zip \
+    && unzip -q /tmp/hx.zip -d /usr/local/bin/ && rm /tmp/hx.zip; \
+    # katana — web crawler
+    KATANA_VER="1.1.2"; \
+    curl -sSL "https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VER}/katana_${KATANA_VER}_linux_${ARCH}.zip" -o /tmp/kat.zip \
+    && unzip -q /tmp/kat.zip -d /usr/local/bin/ && rm /tmp/kat.zip; \
+    # interactsh-client — OOB interaction detection
+    INTERACTSH_VER="1.2.2"; \
+    curl -sSL "https://github.com/projectdiscovery/interactsh/releases/download/v${INTERACTSH_VER}/interactsh-client_${INTERACTSH_VER}_linux_${ARCH}.zip" -o /tmp/ia.zip \
+    && unzip -q /tmp/ia.zip -d /usr/local/bin/ && rm /tmp/ia.zip; \
+    # ffuf — web fuzzer
+    FFUF_VER="2.1.0"; \
+    curl -sSL "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VER}/ffuf_${FFUF_VER}_linux_${ARCH}.tar.gz" -o /tmp/ffuf.tar.gz \
+    && tar -xzf /tmp/ffuf.tar.gz -C /usr/local/bin/ ffuf && rm /tmp/ffuf.tar.gz; \
+    # dalfox — XSS scanner
+    DALFOX_VER="2.9.3"; \
+    curl -sSL "https://github.com/hahwul/dalfox/releases/download/v${DALFOX_VER}/dalfox_${DALFOX_VER}_linux_${ARCH}.tar.gz" -o /tmp/dalfox.tar.gz \
+    && tar -xzf /tmp/dalfox.tar.gz -C /usr/local/bin/ dalfox && rm /tmp/dalfox.tar.gz; \
+    # Set permissions
+    chmod +x /usr/local/bin/nuclei /usr/local/bin/subfinder /usr/local/bin/httpx \
+             /usr/local/bin/katana /usr/local/bin/interactsh-client \
+             /usr/local/bin/ffuf /usr/local/bin/dalfox
+
+# Python-based security tools in a venv (Debian bookworm requires PEP 668 compliance)
+RUN python3 -m venv /opt/tools \
+    && /opt/tools/bin/pip install --no-cache-dir sqlmap \
+    && /opt/tools/bin/pip install --no-cache-dir "git+https://github.com/r0oth3x49/ghauri.git" || true \
+    && /opt/tools/bin/pip install --no-cache-dir "git+https://github.com/commixproject/commix.git" || true \
+    && for bin in sqlmap ghauri commix; do \
+         [ -f "/opt/tools/bin/$bin" ] && ln -sf "/opt/tools/bin/$bin" "/usr/local/bin/$bin"; \
+       done; true
+
+# Tinyproxy configuration (lightweight scope-enforcing proxy)
+COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+RUN mkdir -p /var/log/tinyproxy /var/run \
+    && touch /etc/tinyproxy/filter
+
+# Create non-root hunter user
+RUN useradd -m -s /bin/bash -u 1000 hunter \
+    && mkdir -p /home/hunter/.config /home/hunter/results \
+    && chown -R hunter:hunter /home/hunter
+
+# Tinyproxy writable directories (tmpfs mounts in production)
+RUN chown -R hunter:hunter /var/log/tinyproxy /etc/tinyproxy
+
+# Entrypoint configures Squid from HUNTRESS_ALLOWED_DOMAINS then exec's command
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+WORKDIR /home/hunter
+
+LABEL maintainer="huntress" \
+      description="Huntress attack machine with scope-enforcing Squid proxy" \
+      version="1.0"
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]

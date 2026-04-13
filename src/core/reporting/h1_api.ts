@@ -45,7 +45,13 @@ export interface H1Report {
   duplicateCheck?: DuplicateScore;
   severityJustification?: string[];
   cvssScore?: number;
+  /** S3: CVSS 3.1 vector string (e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N) */
+  cvssVector?: string;
   weaknessId?: string;
+  /** RQ3: Formatted HTTP evidence markdown (request/response code blocks) */
+  httpEvidence?: string;
+  /** RQ5: Executable reproduction commands (curl, Python) */
+  quickReproduction?: string;
 }
 
 export interface Attachment {

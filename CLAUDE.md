@@ -1,302 +1,120 @@
-# CLAUDE.md — Huntress AI Bug Bounty Platform
+# CLAUDE.md — Huntress
 
-## Identity
+Huntress is a Tauri 2.0 desktop app (React 19 + TypeScript frontend, Rust backend) that automates HackerOne bug bounty hunting. An AI orchestrator (Claude Opus 4.6) coordinates 29 specialized vulnerability-hunting agents (on Haiku/Sonnet) through real ReAct loops with native tool use. Battle-tested through 9 hunts (6 Juice Shop + 3 real-world HackerOne). Score: 7.5/10 — platform infrastructure solid, report output quality blocks first submission.
 
-You are the lead engineer on Huntress, an AI-powered bug bounty automation desktop application built by NeuroForge Technologies. This is a security-critical, production-grade product that interacts with live systems, executes real commands against real targets, and submits real reports to HackerOne for real bounties. Every line of code you write must reflect the rigor of a senior security engineer shipping software that handles live offensive operations.
+## Build & Verify
 
----
+```bash
+npx tsc --noEmit --skipLibCheck     # TypeScript lint — must be zero errors
+npx vitest run                       # 1,825 tests, 64 files — must all pass
+cd src-tauri && cargo test           # 101 Rust tests — must all pass
+cargo clippy -- -D warnings          # Rust lint — must be clean
+npm run tauri dev                    # Launch dev build
+docker compose --profile testing up -d  # Start Qdrant (:6333) + Juice Shop (:3001)
+```
 
-## Product Vision
+## Architecture Invariants
 
-Huntress is a **double-click-to-launch desktop application** that puts an AI-powered bug bounty team at the user's fingertips. The user opens the app, selects their preferred AI model (Claude Opus 4.6, Sonnet 4.5, GPT-4o, etc.), pastes their API key, imports a HackerOne bounty program, and begins a **conversational workflow** where the AI orchestrator reads the full bounty scope, analyzes the target, recommends attack strategies, and then coordinates a team of smaller specialized agents to execute the actual hunting — all with the user in the driver's seat.
+These are load-bearing decisions. Violating them breaks the system.
 
-**This is not a CLI tool or a developer utility.** This is a polished desktop product that a bug bounty hunter launches like any other app, with a clean UI, real-time feedback, and an intuitive conversational interface.
+**HttpClient is the single HTTP chokepoint.** Every agent HTTP request goes through `src/core/http/request_engine.ts` which enforces — in order — kill switch, scope validation, rate limiting, stealth headers, and WAF detection. Never create alternative HTTP paths. Never let agents make requests that bypass this chain.
 
----
+**Agents use fire-and-forget dispatch.** The orchestrator dispatches agents via `dispatchAgent()` and continues without waiting. Results arrive asynchronously via `handleAgentResult()`. This is intentional — it enables concurrent agent execution (5 parallel, rest queued). Validation and duplicate checking also fire-and-forget. Never make the dispatch loop synchronous.
 
-## Core User Flow
+**Scope validation is default-deny.** `safe_to_test.rs` blocks everything not explicitly in scope. The Rust validator handles wildcards, CIDR, ports, and IP ranges. It has 25+ tests and is production-ready. Changes here require both positive and negative test cases because a bug means out-of-scope testing, which gets users banned from H1 programs.
 
-### 1. Launch & Setup (First Run)
-- User double-clicks the Huntress desktop icon → Tauri app launches
-- First-run setup wizard: select primary AI model from dropdown (Claude Opus 4.6, Sonnet 4.5, GPT-4o, Gemini, Llama local, etc.)
-- User pastes their API key for the selected provider
-- Optional: configure agent models (cheaper/faster models for sub-tasks) or accept smart defaults
-- Optional: paste HackerOne API token for direct submission integration
-- Settings persist across sessions
+**Tiered model routing is locked.** Haiku for simple agents (recon, CORS, headers, CRLF, cache, open-redirect, subdomain-takeover). Sonnet for moderate/complex (SQLi, XSS, SSRF, IDOR, OAuth, JWT). `COMPLEXITY_LOCKED_AGENTS` in `cost_router.ts` prevents keyword-based upgrades for 7 agent types. Budget enforcement lives at `TracedModelProvider` level: 90% soft warning, 100% hard stop. The user only uses Anthropic models — do not add OpenAI/Google/local model defaults.
 
-### 2. Import Bounty Program
-- User clicks "New Hunt" → import modal appears
-- Import options: paste HackerOne program URL, upload scope JSON, or manual entry
-- The **orchestrator model** (user's chosen primary model) ingests the full bounty program: scope, rules, asset types, bounty table, exclusions, program policy, and historical payouts
-- Orchestrator presents a **structured briefing** back to the user:
-  - Target summary (what's in scope, what's out)
-  - Asset breakdown (domains, APIs, mobile apps, etc.)
-  - Bounty ranges by severity
-  - Known program quirks or restrictions
-  - **Recommended attack strategies ranked by expected value** (probability of finding × likely bounty)
-- Each recommendation is presented as a **clickable option card** the user can select
+**Validation pipeline is non-blocking.** Every finding goes through `validateFinding()` (18 deterministic validators in `validation/validator.ts`) and `runH1DuplicateCheck()`, both fire-and-forget. Findings display immediately with `pending` status, then update asynchronously. The validators are real (not stubs) — XSS uses Playwright dialog detection, SQLi re-executes payloads, SSRF checks OOB callbacks.
 
-### 3. Interactive Hunting Session
-- User either selects a recommended strategy OR types a custom instruction in the chat interface
-- The orchestrator acknowledges the choice, creates an execution plan, and explains what it will do
-- Orchestrator delegates tasks to **specialized sub-agents** (smaller, cheaper models running in parallel):
-  - OAuth Hunter Agent → tests redirect_uri manipulation, state issues, PKCE bypass, scope escalation
-  - SSRF Hunter Agent → probes for open redirects chained to SSRF
-  - GraphQL Hunter Agent → introspection, batching, nested query attacks
-  - IDOR Hunter Agent → parameter fuzzing, access control testing
-  - Recon Agent → subdomain enumeration, tech stack fingerprinting, endpoint discovery
-  - And others as the agent library grows
-- Sub-agents report findings back to the orchestrator in real-time
-- The orchestrator **synthesizes results**, filters noise, checks for duplicates, and presents findings to the user in the chat with clear severity ratings
-- User can drill into any finding, ask follow-up questions, request deeper testing, or move to the next target
-- At any point the user can type new instructions and the orchestrator adjusts the plan
+**Finding types carry validation state.** `AgentFinding` (in `base_agent.ts`) has `validationStatus: 'pending' | 'confirmed' | 'unverified' | 'validation_failed'` and `duplicateCheck: DuplicateCheckResult`. `FindingCardMessage` (in `conversation/types.ts`) mirrors these fields. Both `FindingsPanel.tsx` and `ChatMessage.tsx` render validation badges.
 
-### 4. Approval Gates
-- Before any command executes against a live target, the **approval modal** appears showing: the exact command, which agent requested it, which target it hits, and why
-- User approves, denies, or modifies before execution
-- Auto-approve can be enabled per command category (e.g., auto-approve passive recon, require approval for active testing)
+## Safety Rules
 
-### 5. Reporting & Submission
-- When a valid vulnerability is confirmed, the orchestrator generates a **professional PoC report** with: vulnerability description, CVSS score, reproduction steps, impact analysis, and remediation recommendations
-- Duplicate detection runs automatically against HackerOne, GitHub advisories, and the local Qdrant database
-- Severity prediction estimates the likely bounty payout
-- User reviews the report in a formatted preview pane, edits if needed, and clicks "Submit to HackerOne"
-- Submission happens via HackerOne API with attachment upload, targeting <2 minute turnaround
+Every rule has a reason. The reason helps you judge edge cases.
 
-### 6. Learning & Improvement
-- All hunting sessions feed into the local training pipeline
-- Successful findings become training examples for LoRA fine-tuning
-- Failed attempts with reasoning traces help the model learn what doesn't work
-- The A/B testing framework validates that new model versions outperform the baseline before deployment
+**Always use argv arrays for command execution, never shell string interpolation.** `pty_manager.rs` uses `CommandBuilder` with explicit args. Shell injection through string concatenation is the #1 risk in offensive tooling. The PTY manager validates against dangerous characters (`|`, `&`, `;`, `$`) and sanitizes environment variables.
 
----
+**Never bypass the approval gate.** The flow is: agent requests command → `onApprovalRequest` callback → CustomEvent → `ApproveDenyModal` → user approves/denies → Promise resolves. The only bypass is `autoApprove` settings, which require explicit user opt-in and a confirmation dialog. Approval promises have a 60-second timeout with audit trail logging.
 
-## Tech Stack
+**Kill switch must survive restarts.** `kill_switch.rs` uses atomic state + file persistence with fsync. On activation, it broadcasts to all subscribers and calls `Sandbox::destroy_all()`. The fail-safe on corrupted state files defaults to ACTIVE (safest).
 
-### Backend (Rust — `src-tauri/src/`)
-- **Tauri 2.0** for native desktop packaging, IPC bridge, and system integration
-- `safe_to_test.rs` — Scope validation engine (HackerOne JSON format, wildcard matching, default-deny)
-- `pty_manager.rs` — Secure subprocess execution with asciinema recording
-- `kill_switch.rs` — Emergency shutdown with atomic state management and persistence across restarts
-- `proxy_pool.rs` — HTTP/HTTPS/SOCKS5 proxy rotation with health checking
-- `lib.rs` — Module integration and Tauri command registration
-- All Tauri commands exposed to the frontend must validate inputs and enforce scope
+**API keys go through secure storage only.** `secure_storage.rs` uses AES-256-GCM with HKDF key derivation and per-encryption random nonces. `SettingsContext` explicitly strips `apiKeys` before `localStorage.setItem()`. Never log, print, or include API keys in error messages.
 
-### Frontend (React + TypeScript — `src/`)
-- `src/components/` — UI components:
-  - **ChatInterface** — The primary user interaction surface. Conversational message thread with the orchestrator. Supports rich message types: text, code blocks, finding cards, strategy option cards, approval modals, report previews
-  - **SetupWizard** — First-run model selection, API key entry, provider configuration
-  - **BountyImporter** — Import modal for HackerOne programs (URL, JSON upload, manual)
-  - **BriefingView** — Structured bounty analysis display with clickable strategy cards
-  - **ApprovalModal** — Command approval gate with full context display
-  - **AgentStatusPanel** — Real-time status of all running sub-agents (active, waiting, completed, failed)
-  - **FindingsPanel** — Discovered vulnerabilities with severity, duplicate status, and drill-down
-  - **ReportEditor** — PoC report preview and edit before submission
-  - **TerminalView** — Raw terminal output via xterm.js for users who want to see command execution
-  - **SettingsPanel** — Model configuration, API keys, agent preferences, auto-approve rules
-  - **TrainingDashboard** — Performance metrics, success rates, model comparison
-- Tailwind CSS with dark theme as default
-- All components are functional React with hooks, fully typed with strict TypeScript
+**Every finding must go through validation before the user acts on it.** The pipeline: agent finding → dedup → `validateFinding()` (async) → `runH1DuplicateCheck()` (async) → display with status badge. Never skip validation. Never discard a finding — mark it `unverified` or `validation_failed` instead.
 
-### AI Orchestration Layer (TypeScript — `src/core/`)
-- **OrchestratorEngine** — The brain. Takes the user's selected model + API key, maintains conversation context, creates execution plans, delegates to sub-agents, synthesizes results, and manages the hunting session state
-- **AgentRouter** — Routes tasks to the appropriate sub-agent based on vulnerability class and target characteristics. Manages agent lifecycle (spawn, monitor, collect results, terminate)
-- **ModelProvider** — Abstraction layer for multiple AI providers. Handles API key management, request formatting, response parsing, and rate limiting across Anthropic, OpenAI, Google, local models, etc.
-- **ConversationManager** — Maintains the full chat history between user and orchestrator. Handles context windowing, summarization for long sessions, and message threading
-- **PlanExecutor** — Takes an execution plan from the orchestrator and coordinates the sub-agents to carry it out, managing dependencies between tasks and aggregating results
+## Current System State
 
-### Sub-Agent Layer (TypeScript — `src/agents/`)
-- Each agent is a self-contained module that:
-  - Receives a task assignment from the orchestrator via the AgentRouter
-  - Generates commands using its assigned model (can be a cheaper/faster model than the orchestrator)
-  - Submits commands through scope validation and the approval pipeline
-  - Executes approved commands via the Rust PTY manager
-  - Parses results and reports findings back to the orchestrator
-- Current agents: OAuthHunter, SSRFHunter, GraphQLHunter, IDORHunter, PrototypePollutionHunter, HostHeaderHunter, SSTIHunter, ReconAgent
-- Agent interface contract: `initialize()`, `execute(task)`, `validate(target)`, `reportFindings()`, `cleanup()`
+What's production-ready (verified by 9 live hunts + code audit):
+- Scope validation (42+ tests), kill switch, secure storage, command execution — all 10/10
+- Training allowlist hardened: bash/sh/nc/ncat removed, python3 arg-validated (Session 9)
+- PTY writer: eager init, poison recovery, health checks, diagnostic logging (Session 9)
+- 27 finding validators (18 original + 9 OAuth validators added Session 11)
+- Hallucination gate: agents must make >= 3 HTTP interactions before findings accepted (Session 11)
+- Evidence normalization: `normalizeEvidence()` at pipeline boundary — never crashes on LLM output (Session 11)
+- Global API limit detection: first "usage limits" error pauses entire hunt (Session 11)
+- Docker sandbox: `auto_remove: false`, readiness wait, health check before exec (Session 11)
+- Cross-hunt duplicate detection: flags findings matching previous sessions via hunt_memory (Session 11)
+- Cross-agent knowledge sharing: Blackboard auto-enriched, SharedFinding[] in agent system prompts, all 27 agents wired (Session 19)
+- Auth context management: Settings UI (Auth tab), profile CRUD (bearer/form/API key/custom), secure credential storage, auto-injection at ReactLoop HTTP layer, hunt init creates live sessions (Session 14)
+- Token refresh: JWT exp parsing, 4-strategy RefreshConfig (initdata/OAuth2/custom/re-login), 401 auto-retry via authenticatedRequest(), proactive refresh (90s threshold), rate-limited (1/30s/session), onRefreshFailed callback (Session 16 + Session 17 S8)
+- Mid-hunt budget adjustment: `adjust_budget` orchestrator tool, increase-only (Session 11)
+- Headless browser (real Playwright), OOB server (interactsh + Burp + DNS canary)
+- Browser tools in hunt flow: 4 agent tools (navigate, evaluate JS, click, get content), scope-enforced, lazy-init, enabled for XSS/SSTI/prototype-pollution/business-logic agents (Session 21)
+- Rate controller (per-domain adaptive), stealth (19 UAs), WAF detection
+- Tiered model routing, budget enforcement (90% warn, 100% hard stop)
+- Docker attack machine (640MB, 15 tools, tinyproxy scope enforcement)
+- H1 duplicate check verified against live /hacktivity API (3 programs tested)
+- Retry with backoff, dead-letter queue, sliding window circuit breaker
+- Approval gate with 60s timeout, confirmation dialog, audit trail
+- Duplicate scoring uses 3 sources: H1 hacktivity, GitHub advisories, internal Qdrant memory (Session 12)
+- Chain detection produces `validated: boolean` — title-match chains marked "Potential", validator-confirmed marked "Confirmed" (Session 12)
+- Real CVSS 3.1 calculator wired into PoC generator with vector strings in reports (Session 12)
+- Dispatch guard: tasks with undefined targets caught and logged, not dispatched (Session 12)
 
-### Data Layer
-- **Qdrant** (Docker, port 6333) — Vector memory for vulnerability patterns, duplicate detection, semantic search across historical findings
-- **Local storage** — User settings, API keys (encrypted via OS keychain), session history, scope files
-- **Asciinema recordings** — Full PTY session audit trail in `recordings/`
-
-### Training Pipeline (Python — `scripts/`)
-- HackTheBox automated training via `htb_runner.py`
-- Data sanitization (strip API keys, tokens, PII) via `format_training_data.py`
-- LoRA fine-tuning on Llama-3.1-70B via Axolotl
-- A/B testing framework for model comparison
-- Gradual deployment with rollback capability
-
----
-
-## Architecture Principles
-
-1. **The user is always in control.** The orchestrator recommends, the user decides. The chat interface is the primary control surface. The user can override, redirect, pause, or stop any operation at any time.
-
-2. **Conversational-first UX.** The chat interface is not a secondary feature — it IS the product. Every interaction between the user and Huntress flows through the conversational interface. Strategy selection, finding review, report editing, and even settings changes should be accessible through natural language when possible.
-
-3. **Multi-model by design.** The orchestrator model and sub-agent models are independently configurable. Users should be able to run Opus 4.6 as the orchestrator with Haiku or a local model running the sub-agents. The ModelProvider abstraction must make model-swapping seamless with zero code changes in the agents.
-
-4. **Security is non-negotiable.** Every target interaction must pass scope validation. Every command must go through the approval gate. Never bypass the kill switch. Never execute commands with shell string interpolation — always use explicit argv parsing.
-
-5. **Default-deny everything.** If a target is not explicitly in-scope, it is blocked. If a command is not validated, it is denied. If a proxy fails health check, it is removed from rotation.
-
-6. **Desktop-native polish.** This ships as a double-click-to-launch app, not a dev tool. The setup wizard must be intuitive. Error messages must be human-readable. Loading states must be clear. The app must feel professional and trustworthy — users are trusting it with their API keys and their HackerOne reputation.
-
-7. **Type safety is mandatory.** TypeScript strict mode, no `any` types except wrapped third-party adapters. Rust must handle all error variants exhaustively — no `unwrap()` in production paths.
-
-8. **Every failure must be recoverable.** Kill switch persists across restarts. Sessions can be resumed. Agents that crash are restarted or gracefully degraded. The user never loses work.
-
----
+What needs work — honest assessment after Session 18 audit:
+- **Cross-agent knowledge sharing (I7).** ✅ RESOLVED (Session 19). Blackboard auto-enriched with findings. SharedFinding[] injected into agent system prompts via ReactLoopConfig. All 27 agents wired. 17 tests.
+- **Agents are WAF-aware (I8).** ✅ RESOLVED (Session 19). WafContext with vendor-specific bypass strategies injected into agent system prompts. Dynamic per-domain detection, all 27 agents wired. 18 tests.
+- **28 vuln types use pass-through validators** (agent confidence only) — not deterministic. High false positive risk on uncommon types.
+- **Report quality scorer not validated against real H1 acceptance criteria** — gives false confidence. Reports themselves improved (Session 13 RQ1-RQ6: HTTP exchanges, H1 templates, CVSS vectors), but scorer was never checked against actual H1 triage outcomes.
+- **localStorage session data encrypted (I2).** ✅ RESOLVED (Session 19). Session persistence uses Tauri secure storage (AES-256-GCM) with auto-migration from plaintext. 12 tests.
+- **Crawler is HTTP-only.** No JS rendering — misses SPA endpoints (most modern targets).
+- Training pipeline not connected (requires GPU, future phase).
 
 ## Coding Standards
 
-### Rust (`src-tauri/`)
-- `thiserror` for error types, `anyhow` only in binary entry points
-- All public functions have doc comments with `# Examples` where applicable
-- Exhaustive pattern matching on enums — no wildcard `_` on enums that may grow
-- `#[cfg(test)]` modules in each source file for unit tests
-- `Arc<Mutex<T>>` for shared state with minimal lock duration
-- All Tauri commands validate inputs before processing
-- `tracing` crate for structured logging, not `println!`
-- `cargo clippy -- -D warnings` and `cargo fmt` before any commit
+**TypeScript:** Strict mode, no `any`. Interfaces for extensible shapes. `async/await` only. Functional React with hooks. Tauri `invoke()` calls must have typed command/response pairs.
 
-### TypeScript (`src/`)
-- Strict mode, no implicit any
-- Interfaces over type aliases for extensible object shapes
-- Agent classes implement the base agent interface: `initialize()`, `execute()`, `validate()`, `reportFindings()`, `cleanup()`
-- All API calls have typed error handling
-- `async/await` exclusively, no raw Promise chains
-- Functional React components with hooks only, no class components
-- Tauri `invoke()` calls must have typed command/response pairs
-- `npm run lint` and `npm run format` before any commit
+**Rust:** `thiserror` for errors, `anyhow` only in binary entry points. Exhaustive pattern matching (no wildcard `_` on growable enums). `Arc<Mutex<T>>` with minimal lock duration. `tracing` crate for logging.
 
-### Python (`scripts/`)
-- Type hints on all function signatures
-- `pathlib.Path` for file operations
-- Training data must be sanitized — strip API keys, tokens, PII before storage
-- HackTheBox interactions must respect rate limits
-- `logging` module with structured output, not print statements
+**Testing:** Every change needs tests. Scope validation changes need positive AND negative cases. Security-critical changes need explicit deny-path tests. Run the full suite before committing.
 
----
+## Key Paths
 
-## Multi-Model Architecture
-
-### How Model Selection Works
-
-The ModelProvider abstraction must support:
-
-```
-ModelProvider
-├── AnthropicProvider (Claude Opus 4.6, Sonnet 4.5, Haiku 4.5)
-├── OpenAIProvider (GPT-4o, GPT-4o-mini, o3)
-├── GoogleProvider (Gemini 2.5 Pro, Flash)
-├── LocalProvider (Ollama — Llama, Mistral, etc.)
-└── OpenRouterProvider (any model via OpenRouter API)
-```
-
-Each provider implements a common interface:
-- `sendMessage(messages, options)` → response
-- `streamMessage(messages, options)` → async iterator
-- `getAvailableModels()` → model list with capabilities
-- `validateApiKey(key)` → boolean
-- `estimateCost(tokens)` → cost estimate
-
-### Orchestrator vs Sub-Agent Model Assignment
-
-The user selects their **orchestrator model** during setup — this is the "brain" that reads bounty programs, creates plans, synthesizes findings, and talks to the user. It should be the most capable model they have access to.
-
-**Sub-agent models** can be configured per-agent or use a global default. These handle the actual execution tasks (running recon, testing endpoints, parsing responses). They can be cheaper/faster models because their tasks are more focused and structured.
-
-Example configuration:
-- Orchestrator: Claude Opus 4.6 (maximum reasoning for strategy and synthesis)
-- OAuth Hunter: Claude Sonnet 4.5 (good reasoning at lower cost)
-- Recon Agent: Haiku 4.5 or GPT-4o-mini (fast, cheap, structured tasks)
-- SSRF Hunter: Claude Sonnet 4.5
-
-This tiered approach keeps costs manageable while maintaining quality where it matters most.
-
----
-
-## Critical Files — Handle With Care
-
-- `src-tauri/src/safe_to_test.rs` — Scope validation. A bug here could cause out-of-scope testing, which can get the user banned from HackerOne programs. Always add positive and negative test cases.
-- `src-tauri/src/kill_switch.rs` — Emergency shutdown. Must maintain atomic state and survive restarts. Never remove persistence logic.
-- `src-tauri/src/pty_manager.rs` — Where commands actually execute. Never allow shell expansion. Always use explicit argv.
-- `src/core/OrchestratorEngine` — The main AI brain. Changes here affect the entire user experience and all agent coordination.
-- `src/core/ModelProvider` — The model abstraction layer. Must remain provider-agnostic. Never add provider-specific logic outside of the individual provider implementations.
-- `src/core/ConversationManager` — Chat history and context. Must handle long sessions gracefully with summarization and context windowing.
-- `src/components/ChatInterface` — The primary UI surface. Must handle all message types (text, cards, modals, code, findings) cleanly.
-- `scripts/format_training_data.py` — Data sanitization. A failure here could leak sensitive data into training sets.
-
----
+| Path | What It Does |
+|------|-------------|
+| `src/core/orchestrator/orchestrator_engine.ts` | Orchestrator brain — dispatch loop, finding pipeline, agent coordination |
+| `src/core/http/request_engine.ts` | HTTP chokepoint — scope, kill switch, rate limiting, stealth, WAF |
+| `src/core/validation/validator.ts` | 18 deterministic validators dispatched by vulnerability type |
+| `src/agents/base_agent.ts` | Agent interface + finding types (ValidationStatus, DuplicateCheckResult) |
+| `src/core/conversation/types.ts` | All chat message types (discriminated union) |
+| `src/core/orchestrator/cost_router.ts` | Tiered routing + complexity lock |
+| `src-tauri/src/safe_to_test.rs` | Scope validation — default-deny, wildcards, CIDR |
+| `src-tauri/src/kill_switch.rs` | Emergency shutdown — atomic, persistent, fail-safe |
+| `src-tauri/src/pty_manager.rs` | Command execution — argv-only, env sanitized, redacted |
+| `src/core/auth/session_manager.ts` | Auth sessions — login, bearer, API key, CSRF, IDOR pairs, auto-refresh |
+| `src/core/auth/token_refresher.ts` | Token lifecycle — JWT exp parsing, Telegram initData re-exchange, rate limiting |
+| `src/core/reporting/h1_api.ts` | HackerOne API client (14 mock + 10 live tests) |
+| `src/core/reporting/severity_predictor.ts` | TF-IDF embeddings + bounty prediction |
+| `src/core/discovery/api_schema_parser.ts` | OpenAPI/Swagger/GraphQL → endpoint catalog + task generation |
+| `src/core/orchestrator/program_selector.ts` | H1 program scoring + VDP selection + hunt checklist |
+| `src/core/orchestrator/hunt_metrics.ts` | Hunt metrics tracking + Phase 5 target evaluation |
+| `docker/Dockerfile.attack-machine` | Attack machine with 15 security tools + tinyproxy scope enforcement |
 
 ## Common Tasks
 
-### Adding a new AI model provider
-1. Create a new provider class in `src/core/providers/` implementing the ModelProvider interface
-2. Register it in the provider factory with its display name and supported models
-3. Add it to the SetupWizard model selection dropdown
-4. Add API key validation logic
-5. Test with the orchestrator role and at least one sub-agent role
-6. Ensure streaming works correctly for real-time chat display
+**Adding a vulnerability hunter agent:** Create in `src/agents/` implementing BaseAgent interface. Register in `agent_catalog.ts`. Map complexity in `cost_router.ts` AGENT_COMPLEXITY. Add to `standardized_agents.ts` for self-registration. Write tests for the full task → execution → findings pipeline.
 
-### Adding a new vulnerability hunter agent
-1. Create the agent class in `src/agents/` implementing the base agent interface
-2. Register with the AgentRouter with its vulnerability class and capability description
-3. Add it to the orchestrator's agent catalog so it knows when to delegate to the new agent
-4. Add scope validation rules if the agent targets a new asset type
-5. Add duplicate detection patterns to the Qdrant collection
-6. Write integration tests covering the full task assignment → execution → findings pipeline
-7. Add the agent to the AgentStatusPanel UI
+**Modifying the finding pipeline:** Changes go in `orchestrator_engine.ts` `handleAgentResult()` (~line 1890). Finding flow: dedup → emit with `pending` → async validation → async H1 duplicate check → knowledge graph + hunt memory + reward system recording. All post-dedup steps are fire-and-forget.
 
-### Modifying the chat interface
-1. All message types must be defined as discriminated unions in TypeScript
-2. New message types need a corresponding renderer component
-3. Interactive elements (option cards, approval buttons) must dispatch actions through the ConversationManager
-4. Chat must remain scrollable and performant with 1000+ messages in a session
-5. Messages from agents must be visually distinct from orchestrator messages and user messages
-
-### Modifying scope validation
-1. Changes go in `src-tauri/src/safe_to_test.rs`
-2. Add comprehensive test cases (in-scope, out-of-scope, edge cases, wildcard patterns)
-3. Run `cargo test` and verify all existing tests still pass
-4. Test with a real HackerOne scope JSON before committing
-
----
-
-## Testing Requirements
-
-- **Rust:** `cargo test` — zero failures. New Tauri commands require integration tests. Scope validation changes require positive and negative test cases.
-- **TypeScript:** `npm test` — zero failures. New agents require coverage for: initialization, task execution, scope validation handoff, result parsing, error recovery. New UI components require rendering tests.
-- **Integration:** `npm run test:integration` — end-to-end flows. Any change touching the approval pipeline, chat interface, or agent coordination must be integration tested.
-- **Security:** Any change to scope validation, command execution, or the kill switch requires explicit tests that verify the deny/block path works correctly.
-- **Model provider tests:** Each provider must have tests that verify: API key validation, message sending, streaming, error handling, and graceful degradation when the API is unavailable.
-
----
-
-## Environment
-
-- **OS:** Linux (Kali recommended for security tooling)
-- **Required:** Qdrant via Docker on port 6333
-- **Required API keys (user-provided at runtime):** At minimum one AI provider key (Anthropic, OpenAI, Google, or local model)
-- **Optional:** `HACKERONE_API_TOKEN` for direct submission, `HTB_API_TOKEN` for training, `HUGGINGFACE_TOKEN` for model downloads
-- **GPU:** NVIDIA 24GB+ VRAM for local LoRA training (not needed for API-only usage)
-- **Build:** `npm run tauri dev` for development, `npm run tauri build` for production desktop binary
-
----
-
-## What NOT To Do
-
-- Never bypass scope validation for any reason
-- Never execute shell commands with string interpolation — always explicit argv arrays
-- Never store API keys unencrypted — use the OS keychain via Tauri's secure storage
-- Never use `unwrap()` on Results in production Rust code
-- Never auto-approve commands without explicit user opt-in
-- Never submit a HackerOne report without duplicate checking
-- Never deploy a LoRA model without A/B testing against baseline
-- Never disable the kill switch or audit logging
-- Never commit recordings or logs containing target-specific data to git
-- Never hardcode model names or provider logic outside of the ModelProvider abstraction
-- Never send conversation history to a different provider than the user selected
-- Never make the chat interface feel like a terminal — it should feel like talking to an expert teammate
+**Modifying scope validation:** Changes in `safe_to_test.rs`. Always add positive AND negative test cases. Run `cargo test`. Test with a real HackerOne scope JSON.

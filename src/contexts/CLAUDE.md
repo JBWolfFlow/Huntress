@@ -18,4 +18,18 @@
 | #551 | " | 🔵 | OrchestratorEngine Initialization With 19 Dependency Injections | ~715 |
 | #550 | " | 🔴 | Added Tauri Invoke and CommandResult Imports to HuntSessionContext | ~165 |
 | #547 | 2:55 AM | 🔵 | OrchestratorEngine Initialization Located in HuntSessionContext | ~545 |
+
+### Apr 7, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #726 | 10:09 PM | 🟣 | Wired hunt-specific budget override through import flow | ~405 |
+| #706 | 9:45 PM | 🔵 | Budget UI flow architecture mapped via Explore agent | ~528 |
+
+### Apr 10, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #986 | 7:11 AM | 🔵 | Auth wizard supports 4 general auth types with optional Telegram initData addon | ~507 |
+| #923 | 12:35 AM | 🔵 | Auth Detection Feasibility Research via Explore Agent | ~765 |
 </claude-mem-context>

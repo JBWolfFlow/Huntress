@@ -19,6 +19,8 @@ export interface VulnerabilityChain {
   impact: string;
   chainSteps: string[];
   confidenceBoost: number;
+  /** S2: Whether the chain has been validated end-to-end (not just title-matched) */
+  validated: boolean;
 }
 
 interface ChainRule {
@@ -279,6 +281,7 @@ export function detectChains(findings: AgentFinding[]): VulnerabilityChain[] {
           `Step ${i + 1}: ${f.title} (${f.severity}) at ${f.target}`
         ),
         confidenceBoost: 15, // Chain detection adds confidence
+        validated: false, // S2: Title-match only — needs validation
       });
     }
   }

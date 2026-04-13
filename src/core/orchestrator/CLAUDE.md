@@ -19,4 +19,17 @@
 | #505 | 2:36 AM | 🔵 | Scope Validation Logic Located in Orchestrator Engine | ~498 |
 | #506 | " | 🔵 | Generic Error Status Generated When Agent Tasks Complete With Errors | ~546 |
 | #471 | 12:57 AM | 🔵 | Huntress TypeScript AI Orchestration System | ~1636 |
+
+### Apr 7, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #699 | 5:33 AM | 🔄 | Removed duplicate target scoring in startHunt method | ~328 |
+
+### Apr 12, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #1249 | 2:33 AM | ⚖️ | External observability tool selection for Huntress platform | ~1097 |
+| #1240 | 2:31 AM | 🔵 | Huntress internal observability stack and external tool evaluation | ~859 |
 </claude-mem-context>

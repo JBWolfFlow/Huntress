@@ -26,6 +26,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const CORS_SYSTEM_PROMPT = `You are an expert CORS (Cross-Origin Resource Sharing) misconfiguration security researcher with deep knowledge of the Same-Origin Policy, CORS specification, browser security models, and real-world exploitation techniques. You specialize in finding CORS misconfigurations that allow unauthorized cross-origin data theft from authenticated users.
 
@@ -102,13 +103,25 @@ Your attack playbook — follow these steps methodically:
         .then(r => r.json())
         .then(d => console.log(d));
       </script>
-    - Classify severity:
-      - Origin reflection + credentials + sensitive data: CRITICAL
-      - Origin reflection + credentials + non-sensitive data: HIGH
-      - Null origin accepted + credentials: HIGH
-      - Subdomain wildcard + credentials: MEDIUM-HIGH (requires subdomain compromise)
-      - CORS misconfiguration without credentials: LOW-MEDIUM
-      - Wildcard (*) without credentials: INFORMATIONAL
+    - Classify severity (CALIBRATED FOR H1 ACCEPTANCE):
+      - Origin reflection + credentials + PROVEN sensitive data theft: HIGH
+      - Null origin accepted + credentials + sensitive data: HIGH
+      - Subdomain wildcard + credentials: MEDIUM (requires subdomain compromise — chain it)
+      - CORS misconfiguration without credentials: LOW — browsers don't send cookies/auth
+      - Wildcard (*) without credentials: INFO — not exploitable
+      - CORS with custom auth headers (Bearer tokens, API keys): INFO — browsers NEVER send custom headers cross-origin, even with credentials:include. This is NOT exploitable.
+
+## CRITICAL: H1 Core Ineligible Rule
+CORS without demonstrated data theft is REJECTED BY ALL H1 PROGRAMS. You MUST:
+1. Build a PoC HTML page using fetch() with {credentials: 'include'}
+2. Show the SPECIFIC sensitive data that was read cross-origin
+3. If auth uses custom headers (not cookies), CORS has NO IMPACT — do not report
+
+## Cross-Subdomain Dedup Rule
+If you find the same CORS misconfiguration on multiple subdomains (api.example.com, www.example.com, etc.), report it as ONE finding. List all affected subdomains in the evidence section.
+
+## Browser Verification (MANDATORY)
+After confirming CORS headers via HTTP, use browser_navigate to load a PoC page that actually performs the cross-origin fetch with credentials. Include the browser result in your evidence.
 
 IMPORTANT RULES:
 - Only test targets that are explicitly in scope
@@ -183,7 +196,7 @@ export class CORSHunterAgent implements BaseAgent {
         systemPrompt: CORS_SYSTEM_PROMPT,
         goal: `Test for CORS misconfigurations on target: ${task.target}\n\nScope: ${task.scope.join(', ')}\n\n${task.description}`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -199,6 +212,10 @@ export class CORSHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -217,6 +234,7 @@ export class CORSHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

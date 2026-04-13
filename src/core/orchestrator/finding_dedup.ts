@@ -136,19 +136,57 @@ export function groupBySimHash(
 
 // ─── Finding Deduplication ───────────────────────────────────────────────────
 
-/** Key used for cross-agent dedup: (hostname, vuln_type, parameter) */
+/**
+ * Extract the root domain (eTLD+1) from a hostname.
+ * Handles common multi-part TLDs (.co.uk, .com.au, etc.) and falls back
+ * to last-two-labels for standard TLDs.
+ *
+ * Examples:
+ *   api.walletbot.me → walletbot.me
+ *   www.example.co.uk → example.co.uk
+ *   example.com → example.com
+ *   localhost → localhost
+ */
+export function extractRootDomain(hostname: string): string {
+  // IP addresses or localhost pass through unchanged
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) || hostname === 'localhost') {
+    return hostname;
+  }
+
+  const parts = hostname.split('.');
+  if (parts.length <= 2) return hostname;
+
+  // Common multi-part TLDs — extend as needed
+  const multiPartTlds = new Set([
+    'co.uk', 'co.jp', 'co.kr', 'co.in', 'co.nz', 'co.za', 'co.id',
+    'com.au', 'com.br', 'com.cn', 'com.mx', 'com.ar', 'com.tw', 'com.hk',
+    'org.uk', 'net.au', 'ac.uk', 'gov.uk',
+  ]);
+
+  const lastTwo = parts.slice(-2).join('.');
+  if (multiPartTlds.has(lastTwo) && parts.length > 2) {
+    return parts.slice(-3).join('.');
+  }
+
+  return lastTwo;
+}
+
+/** Key used for cross-agent dedup: (rootDomain, vuln_type, parameter)
+ *  Phase C3: Uses root domain instead of hostname so that the same vuln
+ *  on api.example.com and www.example.com deduplicates to one finding. */
 function findingDedupKey(finding: AgentFinding): string {
-  let hostname = '';
+  let rootDomain = '';
   try {
-    hostname = new URL(finding.target).hostname;
+    const hostname = new URL(finding.target).hostname;
+    rootDomain = extractRootDomain(hostname);
   } catch {
-    hostname = finding.target;
+    rootDomain = finding.target;
   }
 
   // Extract affected parameter from evidence or description
   const param = extractParameter(finding);
 
-  return `${hostname}|${finding.type}|${param}`.toLowerCase();
+  return `${rootDomain}|${finding.type}|${param}`.toLowerCase();
 }
 
 /** Try to extract the affected parameter from a finding */

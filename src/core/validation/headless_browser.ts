@@ -142,6 +142,11 @@ export class HeadlessBrowser {
     };
   }
 
+  /** Get the underlying Playwright browser instance (must call launch() first) */
+  getBrowser(): Browser | null {
+    return this.browser;
+  }
+
   /** Launch the shared browser instance (reused across validations) */
   async launch(): Promise<void> {
     if (this.browser) return;

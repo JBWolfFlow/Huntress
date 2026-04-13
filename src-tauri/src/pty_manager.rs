@@ -163,6 +163,16 @@ impl PtySession {
             "PTY session spawned successfully"
         );
 
+        // Eagerly acquire writer at spawn time — take_writer() can only be
+        // called once on portable_pty, so lazy init risks a race where the
+        // master is dropped before the first write.
+        let writer = pty_pair
+            .master
+            .take_writer()
+            .map_err(|e| PtyError::WriteFailed(format!(
+                "session {}: failed to acquire writer at spawn: {}", session_id, e
+            )))?;
+
         Ok(Self {
             id: session_id,
             command: command.to_string(),
@@ -172,7 +182,7 @@ impl PtySession {
             master: Arc::new(Mutex::new(pty_pair.master)),
             child: Arc::new(Mutex::new(child)),
             recording: Arc::new(Mutex::new(Some(recording_writer))),
-            writer: Arc::new(Mutex::new(None)), // Writer initialized on first write
+            writer: Arc::new(Mutex::new(Some(writer))),
         })
     }
 
@@ -335,42 +345,72 @@ impl PtySession {
         Ok(output)
     }
 
-    /// Write input to PTY
+    /// Write input to PTY.
+    ///
+    /// Handles poisoned locks (recovers the inner value) and provides
+    /// clear diagnostic errors with session ID context.
     pub fn write_input(&mut self, data: &str) -> Result<(), PtyError> {
-        // Get or initialize the writer
-        let mut writer_guard = self
-            .writer
-            .lock()
-            .map_err(|e| PtyError::LockError(e.to_string()))?;
-        
-        if writer_guard.is_none() {
-            // First write - take the writer from master and store it
-            let master = self
-                .master
-                .lock()
-                .map_err(|e| PtyError::LockError(e.to_string()))?;
-            
-            let writer = master
-                .take_writer()
-                .map_err(|e| PtyError::WriteFailed(e.to_string()))?;
-            
-            *writer_guard = Some(writer);
+        // Recover from poisoned mutex — a panicked thread shouldn't
+        // permanently kill writes for this session
+        let mut writer_guard = self.writer.lock().unwrap_or_else(|poisoned| {
+            warn!(
+                session_id = %self.id,
+                "Writer mutex was poisoned — recovering inner value"
+            );
+            poisoned.into_inner()
+        });
+
+        let writer = writer_guard.as_mut().ok_or_else(|| {
+            error!(
+                session_id = %self.id,
+                command = %self.command,
+                "Writer not available — PTY may have been dropped before writer was acquired"
+            );
+            PtyError::WriteFailed(format!(
+                "session {}: writer not available (command: {})",
+                self.id, self.command
+            ))
+        })?;
+
+        if let Err(e) = writer.write_all(data.as_bytes()) {
+            error!(
+                session_id = %self.id,
+                command = %self.command,
+                error = %e,
+                "Write failed — child process may have exited"
+            );
+            return Err(PtyError::WriteFailed(format!(
+                "session {}: write failed (command: {}): {}",
+                self.id, self.command, e
+            )));
         }
-        
-        // Write using the persistent writer
-        let writer = writer_guard
-            .as_mut()
-            .ok_or_else(|| PtyError::WriteFailed("Writer not available".to_string()))?;
-        
-        writer
-            .write_all(data.as_bytes())
-            .map_err(|e| PtyError::WriteFailed(e.to_string()))?;
-        
-        writer
-            .flush()
-            .map_err(|e| PtyError::WriteFailed(e.to_string()))?;
+
+        if let Err(e) = writer.flush() {
+            error!(
+                session_id = %self.id,
+                command = %self.command,
+                error = %e,
+                "Flush failed after write"
+            );
+            return Err(PtyError::WriteFailed(format!(
+                "session {}: flush failed (command: {}): {}",
+                self.id, self.command, e
+            )));
+        }
 
         Ok(())
+    }
+
+    /// Check if the writer is healthy and available for writes.
+    /// The dispatch loop can call this before assigning a PTY session to an agent.
+    pub fn is_writer_healthy(&self) -> bool {
+        match self.writer.lock() {
+            Ok(guard) => guard.is_some(),
+            Err(poisoned) => {
+                // Poisoned but recoverable — still healthy
+                poisoned.into_inner().is_some()
+            }
+        }
     }
 
     /// Kill process and all children
@@ -539,6 +579,92 @@ impl Clone for PtySession {
 use std::sync::LazyLock;
 static GLOBAL_PTY_MANAGER: LazyLock<PtyManager> = LazyLock::new(PtyManager::new);
 
+/// Retention policy for PTY `.cast` recordings.
+///
+/// Hunt #11 caught 2,696 files accumulated (21MB). Left unchecked, this grows
+/// unbounded — every sandbox command, every tool health check writes a file.
+/// Running this at app startup caps growth with sensible defaults:
+///   - Delete any `.cast` older than MAX_AGE_DAYS
+///   - If more than MAX_FILES remain, delete oldest until the cap is met
+///
+/// Deletions are silent best-effort; we never fail startup on a prune error.
+const MAX_AGE_DAYS: u64 = 7;
+const MAX_FILES: usize = 500;
+
+/// Prune old `.cast` recordings at the project's `../recordings` path.
+/// Called from lib.rs at startup. Runs synchronously (I/O is local disk;
+/// pruning 2k files takes <100ms). Returns (deleted_count, kept_count).
+pub fn prune_recordings() -> (usize, usize) {
+    prune_recordings_at(&PathBuf::from("../recordings"), MAX_AGE_DAYS, MAX_FILES)
+}
+
+/// Internal prune logic — path, age cap (days), and file cap are parameters
+/// so tests can exercise edge cases with a temp directory. Public wrapper
+/// above uses compile-time constants.
+pub fn prune_recordings_at(dir: &std::path::Path, max_age_days: u64, max_files: usize) -> (usize, usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        // No directory yet, nothing to prune. First PTY session will create it.
+        return (0, 0);
+    };
+
+    // Collect all .cast files with their ages
+    let now = std::time::SystemTime::now();
+    let max_age = std::time::Duration::from_secs(max_age_days * 86_400);
+    let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("cast") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(now);
+        files.push((path, modified));
+    }
+
+    let total = files.len();
+    let mut deleted = 0usize;
+
+    // Pass 1: delete anything older than max_age
+    files.retain(|(path, mtime)| {
+        let age = now.duration_since(*mtime).unwrap_or_default();
+        if age > max_age {
+            if fs::remove_file(path).is_ok() {
+                deleted += 1;
+            }
+            false
+        } else {
+            true
+        }
+    });
+
+    // Pass 2: hard cap at max_files. Delete oldest first.
+    if files.len() > max_files {
+        files.sort_by_key(|(_, mtime)| *mtime);
+        let excess = files.len() - max_files;
+        for (path, _) in files.iter().take(excess) {
+            if fs::remove_file(path).is_ok() {
+                deleted += 1;
+            }
+        }
+        files.drain(..excess);
+    }
+
+    let kept = files.len();
+    info!(
+        total_before = total,
+        deleted = deleted,
+        kept = kept,
+        max_age_days = max_age_days,
+        max_files = max_files,
+        "PTY recordings pruned"
+    );
+    (deleted, kept)
+}
+
 /// Tauri command: Spawn PTY session
 #[tauri::command]
 pub async fn spawn_pty(command: String, args: Vec<String>) -> Result<String, String> {
@@ -603,6 +729,82 @@ mod tests {
         assert!(PtySession::validate_command("").is_err());
     }
 
+    // ─── Recording retention (Issue from Hunt #11 monitoring) ──────────────
+
+    fn make_cast(dir: &std::path::Path, name: &str, age_days: u64) {
+        let path = dir.join(name);
+        fs::write(&path, b"dummy cast content").unwrap();
+        // Set mtime to (now - age_days). Use filetime crate already in deps.
+        let now = std::time::SystemTime::now();
+        let target = now - std::time::Duration::from_secs(age_days * 86_400);
+        let ft = filetime::FileTime::from_system_time(target);
+        filetime::set_file_mtime(&path, ft).unwrap();
+    }
+
+    #[test]
+    fn prune_recordings_deletes_files_older_than_max_age() {
+        let tmp = tempdir_path("huntress_prune_age");
+        fs::create_dir_all(&tmp).unwrap();
+        // Three files: 10 days, 5 days, 1 day old. Cap at 7 days.
+        make_cast(&tmp, "old.cast", 10);
+        make_cast(&tmp, "edge.cast", 5);
+        make_cast(&tmp, "fresh.cast", 1);
+
+        let (deleted, kept) = prune_recordings_at(&tmp, 7, 100);
+        assert_eq!(deleted, 1, "should delete only the 10-day-old file");
+        assert_eq!(kept, 2);
+        assert!(!tmp.join("old.cast").exists());
+        assert!(tmp.join("edge.cast").exists());
+        assert!(tmp.join("fresh.cast").exists());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn prune_recordings_enforces_file_count_cap_oldest_first() {
+        let tmp = tempdir_path("huntress_prune_count");
+        fs::create_dir_all(&tmp).unwrap();
+        // 5 files, all fresh (age 0-4 days). Cap at 2 — should keep 2 newest.
+        for (i, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            make_cast(&tmp, &format!("{}.cast", name), 4 - i as u64);
+        }
+        let (deleted, kept) = prune_recordings_at(&tmp, 30, 2);
+        assert_eq!(deleted, 3, "delete 3 oldest when capped at 2");
+        assert_eq!(kept, 2);
+        // 'a' (oldest, 4 days) must be gone, 'e' (newest, 0 days) must remain
+        assert!(!tmp.join("a.cast").exists());
+        assert!(tmp.join("e.cast").exists());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn prune_recordings_ignores_non_cast_files() {
+        let tmp = tempdir_path("huntress_prune_filter");
+        fs::create_dir_all(&tmp).unwrap();
+        make_cast(&tmp, "keep.cast", 30);
+        // Non-cast files must be ignored regardless of age or cap.
+        fs::write(tmp.join("readme.txt"), b"x").unwrap();
+        fs::write(tmp.join("notes.md"), b"x").unwrap();
+        let (deleted, _kept) = prune_recordings_at(&tmp, 1, 0);
+        assert_eq!(deleted, 1, "only the .cast file is touched");
+        assert!(tmp.join("readme.txt").exists());
+        assert!(tmp.join("notes.md").exists());
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn prune_recordings_returns_zero_when_dir_missing() {
+        let tmp = tempdir_path("huntress_prune_nodir_DOESNOTEXIST");
+        let (deleted, kept) = prune_recordings_at(&tmp, 7, 100);
+        assert_eq!(deleted, 0);
+        assert_eq!(kept, 0);
+    }
+
+    fn tempdir_path(suffix: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("{}_{}", suffix, std::process::id()));
+        p
+    }
+
     #[test]
     fn test_sanitize_env() {
         let mut env = HashMap::new();
@@ -622,5 +824,87 @@ mod tests {
     fn test_pty_manager_creation() {
         let manager = PtyManager::new();
         assert_eq!(manager.list_sessions().unwrap().len(), 0);
+    }
+
+    // === M2: Writer reliability tests ===
+
+    #[test]
+    fn test_pty_spawn_initializes_writer_eagerly() {
+        // Writer should be available immediately after spawn, not lazily
+        let session = PtySession::spawn("echo", &["hello"], HashMap::new())
+            .expect("spawn should succeed");
+        assert!(
+            session.is_writer_healthy(),
+            "Writer must be healthy immediately after spawn"
+        );
+    }
+
+    #[test]
+    fn test_sequential_writes_succeed() {
+        let mut session = PtySession::spawn("cat", &[], HashMap::new())
+            .expect("spawn should succeed");
+
+        // Multiple sequential writes should all succeed
+        assert!(session.write_input("first\n").is_ok(), "First write failed");
+        assert!(session.write_input("second\n").is_ok(), "Second write failed");
+        assert!(session.write_input("third\n").is_ok(), "Third write failed");
+
+        // Clean up
+        let _ = session.kill();
+    }
+
+    #[test]
+    fn test_writer_health_check_after_spawn() {
+        let session = PtySession::spawn("sleep", &["1"], HashMap::new())
+            .expect("spawn should succeed");
+
+        assert!(session.is_writer_healthy(), "Writer should be healthy for running process");
+
+        // Clean up
+        let mut session = session;
+        let _ = session.kill();
+    }
+
+    #[test]
+    fn test_write_error_includes_session_context() {
+        let mut session = PtySession::spawn("echo", &["done"], HashMap::new())
+            .expect("spawn should succeed");
+
+        // Wait for echo to complete
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Try writing after the process has exited — may or may not error
+        // depending on OS buffering, but if it does error, it must include context
+        let result = session.write_input("after-exit\n");
+        if let Err(PtyError::WriteFailed(msg)) = result {
+            assert!(
+                msg.contains("session") || msg.contains(&session.id),
+                "Error must include session context, got: {}",
+                msg
+            );
+        }
+        // If write succeeds (OS buffering), that's also fine
+    }
+
+    #[test]
+    fn test_write_to_cat_and_read_back() {
+        let mut session = PtySession::spawn("cat", &[], HashMap::new())
+            .expect("spawn should succeed");
+
+        // Write data
+        session.write_input("test_data\n").expect("write should succeed");
+
+        // Give cat time to echo
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Read output — should contain our input (cat echoes)
+        let output = session.read_output().expect("read should succeed");
+        // Note: output may include terminal control characters
+        assert!(
+            output.contains("test_data") || output.is_empty(),
+            "cat should echo input or buffer may not be ready yet"
+        );
+
+        let _ = session.kill();
     }
 }

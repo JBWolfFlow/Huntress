@@ -24,6 +24,7 @@ import type {
 } from '../core/engine/react_loop';
 import { AGENT_TOOL_SCHEMAS } from '../core/engine/tool_schemas';
 import type { HttpClient } from '../core/http/request_engine';
+import type { SessionManager } from '../core/auth/session_manager';
 
 const JWT_SYSTEM_PROMPT = `You are an elite JWT (JSON Web Token) security researcher. Your mission is to systematically discover JWT implementation vulnerabilities that allow authentication bypass, privilege escalation, or token forgery.
 
@@ -270,7 +271,7 @@ export class JWTHunterAgent implements BaseAgent {
           `Scope: ${task.scope.join(', ')}\n\n${task.description}\n\n` +
           `Start by discovering JWT tokens in cookies/headers, then attempt algorithm confusion and alg:none attacks.`,
         tools: AGENT_TOOL_SCHEMAS,
-        maxIterations: 30,
+        agentType: this.metadata.id,
         target: task.target,
         scope: task.scope,
         autoApproveSafe: this.autoApproveSafe,
@@ -286,6 +287,10 @@ export class JWTHunterAgent implements BaseAgent {
         },
         httpClient: task.parameters.httpClient as HttpClient | undefined,
         availableTools: task.parameters.availableTools as string[] | undefined,
+        sessionManager: task.parameters.sessionManager as SessionManager | undefined,
+        authSessionId: (task.parameters.authSessionIds as string[] | undefined)?.[0],
+        sharedFindings: task.sharedFindings,
+        wafContext: task.wafContext,
       });
 
       const result = await loop.execute();
@@ -303,6 +308,7 @@ export class JWTHunterAgent implements BaseAgent {
         agentId: this.metadata.id,
         success: result.success,
         findings: this.findings,
+        httpExchanges: result.httpExchanges,
         toolsExecuted: result.toolCallCount,
         duration: Date.now() - startTime,
         error: result.success ? undefined : (result.summary || `Agent stopped: ${result.stopReason}`),

@@ -148,6 +148,42 @@ export const ChatMessageComponent: React.FC<ChatMessageProps> = ({
                     <span className="text-yellow-500">[POSSIBLE DUPLICATE]</span>
                   </>
                 )}
+                {/* Phase 3: Validation status */}
+                {message.validationStatus && (
+                  <>
+                    <span className={`${t.dimText} mx-2`}>|</span>
+                    <span className={
+                      message.validationStatus === 'confirmed' ? 'text-green-400' :
+                      message.validationStatus === 'unverified' ? 'text-yellow-400' :
+                      message.validationStatus === 'pending' ? 'text-gray-400' :
+                      'text-gray-500'
+                    }>
+                      [{message.validationStatus === 'confirmed' ? 'VERIFIED' :
+                        message.validationStatus === 'unverified' ? 'UNVERIFIED' :
+                        message.validationStatus === 'pending' ? 'VALIDATING...' :
+                        'CHECK FAILED'}]
+                    </span>
+                    {message.validationEvidence && message.validationEvidence.length > 0 && (
+                      <span className="text-green-400 ml-1">({message.validationEvidence.length} evidence)</span>
+                    )}
+                  </>
+                )}
+                {/* Phase 3: Duplicate check status */}
+                {message.duplicateCheck && message.duplicateCheck.status !== 'not_checked' && (
+                  <>
+                    <span className={`${t.dimText} mx-2`}>|</span>
+                    <span className={
+                      message.duplicateCheck.status === 'likely_duplicate' ? 'text-red-400' :
+                      message.duplicateCheck.status === 'possible_duplicate' ? 'text-yellow-400' :
+                      'text-green-400'
+                    }>
+                      [{message.duplicateCheck.status === 'likely_duplicate' ? 'LIKELY DUP' :
+                        message.duplicateCheck.status === 'possible_duplicate' ? 'REVIEW DUP' :
+                        'NO DUPS'}
+                      {message.duplicateCheck.score ? ` ${message.duplicateCheck.score.overall}%` : ''}]
+                    </span>
+                  </>
+                )}
               </div>
             </div>
           </div>
