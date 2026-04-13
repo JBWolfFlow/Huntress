@@ -38,17 +38,24 @@ const RECON_SYSTEM_PROMPT = `You are an expert reconnaissance agent for bug boun
 
 ## Your Methodology (execute in order)
 
+## Sandbox environment constraints
+
+- Commands run through argv — NOT through a shell. Do NOT use shell pipes (\`|\`), redirects (\`>\`), process substitution (\`<(...)\`), or chained commands (\`&&\`). Use tool flags for filtering (e.g. \`httpx -path\` instead of \`httpx | grep\`). If you need to capture response headers, use \`curl -s -D /tmp/headers.txt -o /tmp/body.txt\` then read the file.
+- Installed in the sandbox image: subfinder, assetfinder, dnsx, naabu, gau, waybackurls, httpx, katana, wafw00f, whatweb, paramspider, nuclei, testssl.sh, dalfox, interactsh-client, ffuf, sqlmap, ghauri, commix, curl, wget, jq, nmap, python3, git.
+- NOT installed — do NOT attempt: findomain, getJS, gowitness.
+
 ### Phase 1: Subdomain Enumeration
 - Run subfinder with JSON output: \`subfinder -d TARGET -json -silent\`
-- Deduplicate results. Do NOT attempt assetfinder/findomain — they are not installed in the sandbox.
+- Complement with assetfinder: \`assetfinder --subs-only TARGET\`
+- Deduplicate results. Note any potential-takeover CNAMEs.
 
 ### Phase 2: DNS Resolution
 - Resolve discovered subdomains: \`dnsx -l subdomains.txt -resp -json\`
 - Note any CNAME records (potential subdomain takeover)
-- Identify cloud-hosted assets (AWS, Azure, GCP patterns)
+- Identify cloud-hosted assets (AWS, Azure, GCP patterns) from IPs/CNAMEs
 
 ### Phase 3: HTTP Probing
-- Probe all resolved hosts: \`httpx -l resolved.txt -json -td -sc -title -server -follow-redirects\`
+- Probe all resolved hosts: \`httpx -l resolved.txt -json -td -sc -title -server -follow-redirects -silent\`
 - Record status codes, technologies, server headers
 - Flag interesting status codes: 401, 403 (potential bypasses), 500 (error-based info leak)
 
@@ -57,29 +64,25 @@ const RECON_SYSTEM_PROMPT = `You are an expert reconnaissance agent for bug boun
 - Record WAF type — this changes the entire strategy for active testing
 
 ### Phase 5: Port Scanning
-- Scan top ports: \`naabu -host TARGET -top-ports 1000 -json -rate 500\`
+- Scan top ports: \`naabu -host TARGET -top-ports 1000 -json -rate 500 -silent\`
 - Focus on non-standard ports (8080, 8443, 9090, etc.)
 
 ### Phase 6: Web Crawling & URL Collection
-- Crawl discovered sites: \`katana -u TARGET -jc -json -d 3 -rl 5\`
+- Crawl discovered sites: \`katana -u https://TARGET -jc -json -d 3 -rl 5 -silent\`
 - Collect historical URLs: \`gau --subs TARGET\` and \`waybackurls TARGET\`
 - Look for API endpoints, admin panels, upload functionality
 
-### Phase 7: JavaScript Analysis
-- Extract JS files and analyze for endpoints, secrets, and API keys
-- Look for internal API paths, hardcoded credentials, debug endpoints
-
-### Phase 8: Parameter Mining
+### Phase 7: Parameter Mining
 - Discover parameters: \`paramspider -d TARGET\`
-- Focus on parameters that accept URLs, IDs, or user input
+- Focus on parameters that accept URLs, IDs, or user input (often reflected)
 
-### Phase 9: Technology Fingerprinting
-- Detailed fingerprint: \`whatweb -a 1 --log-json TARGET\`
+### Phase 8: Technology Fingerprinting
+- Detailed fingerprint: \`whatweb -a 1 --log-json=- https://TARGET\`
 - Identify frameworks, CMS versions, server software
 
-### Phase 10: Evidence Collection
-- Screenshot interesting pages: \`gowitness scan single -u TARGET --json\`
-- SSL/TLS analysis: \`testssl.sh --json TARGET:443\`
+### Phase 9: Vulnerability Scanning & SSL
+- Nuclei CVE templates: \`nuclei -u https://TARGET -json -silent -rl 5\`
+- SSL/TLS analysis: \`testssl.sh --jsonfile-pretty=- https://TARGET:443\`
 
 ## Key Principles
 - Always use JSON output flags when available for structured data
@@ -125,7 +128,7 @@ Tool call: execute_command { command: "wafw00f api.[redacted].com", target: "api
 Result: No WAF detected on api subdomain (only admin has CloudFlare)
 
 **Step 4 — Tech fingerprint:**
-Tool call: execute_command { command: "whatweb -a 1 --log-json=- api.[redacted].com", target: "api.[redacted].com", category: "recon" }
+Tool call: execute_command { command: "whatweb -a 1 --log-json=- https://api.[redacted].com", target: "api.[redacted].com", category: "recon" }
 Result: Node.js, Express, GraphQL, Apollo Server
 
 **Step 5 — Dispatch specialists:**
@@ -275,6 +278,34 @@ export class ReconAgent implements BaseAgent {
             relevantTo: relevantTo.length > 0 ? relevantTo : undefined,
           };
         });
+
+      // Session 25 Issue #10 — emit category:'endpoint' observations so
+      // orchestrator_engine.generateSolverTasks (at ~:2668) can extract them
+      // and fan out per-endpoint specialist tasks (xss/sqli/ssrf/ssti), not
+      // just broad domain tasks. Source URLs from HTTP exchanges the loop
+      // made + any URLs surfaced in tool-call stdout (subfinder/httpx/katana).
+      const urlRegex = /https?:\/\/[^\s"'<>)]+/g;
+      const discoveredUrls = new Set<string>();
+      for (const ex of result.httpExchanges) {
+        if (ex.request?.url) discoveredUrls.add(ex.request.url);
+      }
+      for (const entry of result.iterationLog) {
+        if (!entry.toolResult) continue;
+        const matches = entry.toolResult.match(urlRegex);
+        if (matches) for (const u of matches) discoveredUrls.add(u);
+      }
+      for (const f of this.findings) {
+        const scanText = `${f.description} ${f.evidence.join(' ')}`;
+        const matches = scanText.match(urlRegex);
+        if (matches) for (const u of matches) discoveredUrls.add(u);
+      }
+      // Cap at 50 to avoid blackboard blowup on large recons.
+      const endpointObservations = [...discoveredUrls].slice(0, 50).map(url => ({
+        category: 'endpoint' as const,
+        detail: url,
+        relevantTo: undefined,
+      }));
+      observations.push(...endpointObservations);
 
       return {
         taskId: task.id,

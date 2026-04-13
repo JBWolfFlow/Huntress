@@ -20,6 +20,7 @@ import {
   BROWSER_NAVIGATE_SCHEMA,
   BROWSER_EVALUATE_SCHEMA,
   BROWSER_CLICK_SCHEMA,
+  BROWSER_FILL_SCHEMA,
   BROWSER_GET_CONTENT_SCHEMA,
   BROWSER_TOOL_SCHEMAS,
   BROWSER_ENABLED_AGENTS,
@@ -31,8 +32,8 @@ import type { ReactLoopConfig } from './react_loop';
 // ─── Tool Schema Definitions ──────────────────────────────────────────────────
 
 describe('Browser Tool Schemas', () => {
-  it('should export 4 browser tool schemas', () => {
-    expect(BROWSER_TOOL_SCHEMAS).toHaveLength(4);
+  it('should export 5 browser tool schemas', () => {
+    expect(BROWSER_TOOL_SCHEMAS).toHaveLength(5);
   });
 
   it('browser_navigate schema has required fields', () => {
@@ -55,6 +56,14 @@ describe('Browser Tool Schemas', () => {
     expect(BROWSER_CLICK_SCHEMA.input_schema.properties).toHaveProperty('wait_ms');
   });
 
+  it('browser_fill schema has required selector and value fields', () => {
+    expect(BROWSER_FILL_SCHEMA.name).toBe('browser_fill');
+    expect(BROWSER_FILL_SCHEMA.input_schema.required).toEqual(['selector', 'value']);
+    expect(BROWSER_FILL_SCHEMA.input_schema.properties).toHaveProperty('selector');
+    expect(BROWSER_FILL_SCHEMA.input_schema.properties).toHaveProperty('value');
+    expect(BROWSER_FILL_SCHEMA.input_schema.properties).toHaveProperty('wait_ms');
+  });
+
   it('browser_get_content schema has optional include_cookies', () => {
     expect(BROWSER_GET_CONTENT_SCHEMA.name).toBe('browser_get_content');
     expect(BROWSER_GET_CONTENT_SCHEMA.input_schema.properties).toHaveProperty('include_cookies');
@@ -75,6 +84,7 @@ describe('Browser Tool Schemas', () => {
       'browser_navigate',
       'browser_evaluate',
       'browser_click',
+      'browser_fill',
       'browser_get_content',
     ]);
   });
@@ -139,10 +149,10 @@ describe('getToolSchemasForAgent — browser tools (Phase A)', () => {
     expect(names).toContain('dispatch_agent');
   });
 
-  it('browserEnabled=false removes exactly 4 schemas vs default', () => {
+  it('browserEnabled=false removes exactly 5 schemas vs default', () => {
     const withBrowser = getToolSchemasForAgent('xss-hunter');
     const withoutBrowser = getToolSchemasForAgent('xss-hunter', false);
-    expect(withBrowser.length).toBe(withoutBrowser.length + 4);
+    expect(withBrowser.length).toBe(withoutBrowser.length + 5);
   });
 
   it('browser schemas appear after standard agent schemas', () => {
@@ -154,7 +164,8 @@ describe('getToolSchemasForAgent — browser tools (Phase A)', () => {
     expect(schemas[standardCount].name).toBe('browser_navigate');
     expect(schemas[standardCount + 1].name).toBe('browser_evaluate');
     expect(schemas[standardCount + 2].name).toBe('browser_click');
-    expect(schemas[standardCount + 3].name).toBe('browser_get_content');
+    expect(schemas[standardCount + 3].name).toBe('browser_fill');
+    expect(schemas[standardCount + 4].name).toBe('browser_get_content');
   });
 
   it('all non-recon non-orchestrator agents get browser tools by default', () => {

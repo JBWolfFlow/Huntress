@@ -30,12 +30,21 @@ done
 
 echo "[huntress] Scope-enforcing proxy configured for: $HUNTRESS_ALLOWED_DOMAINS"
 
-# Start tinyproxy in the background
-tinyproxy -c /etc/tinyproxy/tinyproxy.conf 2>/dev/null &
+# Start tinyproxy in the background — do NOT swallow stderr; we need failures to be visible.
+tinyproxy -c /etc/tinyproxy/tinyproxy.conf &
 PROXY_PID=$!
 
 # Wait briefly for proxy to start
 sleep 0.5
+
+# Fail-fast startup probe. If tinyproxy can't bind 3128, every curl through the
+# proxy will fail with exit 7 later — much harder to diagnose. Refuse to start.
+# Uses bash's built-in /dev/tcp — no netcat/curl dependency.
+if ! (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null; then
+    echo "[huntress] FATAL: tinyproxy did not bind 127.0.0.1:3128 — curl through proxy will fail" >&2
+    exit 1
+fi
+exec 3<&- 2>/dev/null || true
 
 # Set proxy env vars so all tools route through tinyproxy
 export http_proxy="http://127.0.0.1:3128"

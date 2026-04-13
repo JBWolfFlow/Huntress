@@ -26,6 +26,7 @@ import './xss_hunter';
 import './sqli_hunter';
 import './cors_hunter';
 import './subdomain_takeover_hunter';
+import './auth_worker_agent';
 
 export interface RouterConfig {
   provider: ModelProvider;

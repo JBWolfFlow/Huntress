@@ -31,6 +31,7 @@ import { parseToolOutput, extractFindings, extractTargets } from './output_parse
 import { ModelAlloy } from './model_alloy';
 import type { HttpClient, HttpRequestOptions, HttpResponse } from '../http/request_engine';
 import type { HttpExchange, SharedFinding, WafContext } from '../../agents/base_agent';
+import type { CapturedAuth } from '../auth/auth_browser_capture';
 import { ParamFuzzer } from '../fuzzer/param_fuzzer';
 import type { VulnType } from '../fuzzer/payload_db';
 import { getIterationBudget } from '../orchestrator/cost_router';
@@ -199,6 +200,10 @@ export interface ReactLoopResult {
   continuationContext?: string;
   /** Structured handoff data for the next agent */
   continuationHandoff?: ContinuationHandoff;
+  /** Present only for AuthWorkerAgent runs — terminal state from capture_complete/capture_failed. */
+  captureTerminal?: { kind: 'complete' | 'failed'; input: Record<string, unknown> };
+  /** Present only when browser_finish_auth_capture succeeded during the run. */
+  capturedAuth?: CapturedAuth;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -261,6 +266,10 @@ export class ReactLoop {
   private killed = false;
   /** Set when the agent calls stop_hunting — distinct from killed (emergency stop) */
   private stopped = false;
+  /** Set when AuthWorkerAgent calls capture_complete or capture_failed. Consumed via the ReactLoopResult. */
+  private captureTerminal: { kind: 'complete' | 'failed'; input: Record<string, unknown> } | null = null;
+  /** Stashed by browser_finish_auth_capture — survives browser cleanup so the ReactLoopResult can carry it out. */
+  private capturedAuth: CapturedAuth | null = null;
   private maxIterations: number;
   /** Lazy-initialized Node subprocess client — Playwright runs out-of-WebView (I2). */
   private browserClient: AgentBrowserClient | null = null;
@@ -434,6 +443,38 @@ export class ReactLoop {
             this.stopped = true;
             break;
           }
+
+          // AuthWorkerAgent terminals. Both halt the loop; capture_complete
+          // marks success, capture_failed marks failure. Actual CapturedAuth
+          // payload is fetched separately via the agent's browser client.
+          if (toolCall.name === 'capture_complete') {
+            const input = toolCall.input as { summary?: string };
+            stopReason = 'task_complete';
+            summary = input.summary || 'Auth capture complete';
+            this.captureTerminal = { kind: 'complete', input: toolCall.input as Record<string, unknown> };
+            this.conversationHistory.push({
+              role: 'user',
+              content: '',
+              toolResults,
+            });
+            this.iterationLog.push(logEntry);
+            this.stopped = true;
+            break;
+          }
+          if (toolCall.name === 'capture_failed') {
+            const input = toolCall.input as { reason?: string; detail?: string };
+            stopReason = 'blocker';
+            summary = `Auth capture failed (${input.reason || 'unknown'}): ${input.detail || ''}`;
+            this.captureTerminal = { kind: 'failed', input: toolCall.input as Record<string, unknown> };
+            this.conversationHistory.push({
+              role: 'user',
+              content: '',
+              toolResults,
+            });
+            this.iterationLog.push(logEntry);
+            this.stopped = true;
+            break;
+          }
         }
 
         if (this.killed || this.stopped) break;
@@ -491,8 +532,26 @@ export class ReactLoop {
     // Clean up browser resources if any browser tools were used
     await this.cleanupBrowser();
 
+    // Recon agents rarely emit findings — they build an attack-surface map for
+    // specialists to consume. If recon burned its iteration budget but produced
+    // meaningful work (≥3 tool calls), treat that as success so the orchestrator
+    // gate (orchestrator_engine.ts:2358) fires and generateSolverTasks runs.
+    // Threshold is 3 (not 5) because sparse targets still yield useful observations.
+    // We intentionally do NOT mutate stopReason — keep 'iteration_limit' as
+    // accurate log ground truth for debugging.
+    const reconSuccess =
+      this.config.agentType === 'recon'
+      && this.toolCallCount >= 3
+      && stopReason === 'iteration_limit';
+
     return {
-      success: this.findings.length > 0 || stopReason === 'task_complete' || stopReason === 'no_vulnerabilities',
+      success:
+        this.findings.length > 0
+        || stopReason === 'task_complete'
+        || stopReason === 'no_vulnerabilities'
+        || reconSuccess,
+      captureTerminal: this.captureTerminal ?? undefined,
+      capturedAuth: this.capturedAuth ?? undefined,
       findings: this.findings,
       totalIterations: this.iterationLog.length,
       toolCallCount: this.toolCallCount,
@@ -608,16 +667,45 @@ export class ReactLoop {
           wait_ms?: number;
         });
 
+      case 'browser_fill':
+        return this.handleBrowserFill(id, input as {
+          selector: string;
+          value: string;
+          wait_ms?: number;
+        });
+
       case 'browser_get_content':
         return this.handleBrowserGetContent(id, input as {
           include_cookies?: boolean;
         });
+
+      case 'browser_start_auth_capture':
+        return this.handleBrowserStartAuthCapture(id, input as {
+          scope_domains: string[];
+        });
+
+      case 'browser_finish_auth_capture':
+        return this.handleBrowserFinishAuthCapture(id);
 
       case 'stop_hunting':
         return {
           type: 'tool_result',
           tool_use_id: id,
           content: 'Acknowledged. Stopping hunting.',
+        };
+
+      case 'capture_complete':
+        return {
+          type: 'tool_result',
+          tool_use_id: id,
+          content: 'Acknowledged. Auth capture complete — halting loop.',
+        };
+
+      case 'capture_failed':
+        return {
+          type: 'tool_result',
+          tool_use_id: id,
+          content: 'Acknowledged. Auth capture failed — halting loop.',
         };
 
       default:
@@ -1725,6 +1813,159 @@ export class ReactLoop {
         type: 'tool_result',
         tool_use_id: toolUseId,
         content: `Browser click failed: ${error instanceof Error ? error.message : String(error)}. Verify the CSS selector matches an element on the page.`,
+        is_error: true,
+      };
+    }
+  }
+
+  /** Handle browser_fill — fill a form input with synthetic events (React/Vue/Angular-safe) */
+  private async handleBrowserFill(
+    toolUseId: string,
+    input: { selector: string; value: string; wait_ms?: number }
+  ): Promise<ToolResultBlock> {
+    if (!this.config.browserEnabled) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'Browser tools are not enabled for this agent.',
+        is_error: true,
+      };
+    }
+
+    if (!this.browserClient) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'No browser page active. Use browser_navigate first to load a page.',
+        is_error: true,
+      };
+    }
+
+    try {
+      const result = await this.browserClient.fill(input.selector, input.value, input.wait_ms);
+      // Never echo the filled value back in the tool result — it may be a
+      // credential. The scrubAuthSecrets layer also masks on log output.
+      const valueLen = input.value.length;
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Filled: ${result.selector} (${valueLen} char${valueLen === 1 ? '' : 's'})`,
+      };
+    } catch (error) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Browser fill failed: ${error instanceof Error ? error.message : String(error)}. Verify the CSS selector matches a fillable input on the page.`,
+        is_error: true,
+      };
+    }
+  }
+
+  /** Handle browser_start_auth_capture — begin intercepting auth headers on in-scope requests */
+  private async handleBrowserStartAuthCapture(
+    toolUseId: string,
+    input: { scope_domains: string[] }
+  ): Promise<ToolResultBlock> {
+    if (!this.config.browserEnabled) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'Browser tools are not enabled for this agent.',
+        is_error: true,
+      };
+    }
+    if (!this.browserClient) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'No browser page active. Use browser_navigate first to load a page.',
+        is_error: true,
+      };
+    }
+    if (!Array.isArray(input.scope_domains) || input.scope_domains.length === 0) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'scope_domains is required and must contain at least one domain.',
+        is_error: true,
+      };
+    }
+    // Intersect requested domains with the loop's configured scope so the
+    // LLM cannot widen capture beyond the hunt's authorized targets.
+    const allowed = input.scope_domains.filter(d => {
+      const check = this.isUrlInScope(`https://${d}`);
+      return check.inScope;
+    });
+    if (allowed.length === 0) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `None of the requested scope_domains are in the hunt's scope (${this.config.scope.join(', ')}). Refusing to start capture.`,
+        is_error: true,
+      };
+    }
+    try {
+      await this.browserClient.startAuthCapture(allowed);
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Auth header interception started for: ${allowed.join(', ')}. Now submit the login form — captured headers will be returned by browser_finish_auth_capture.`,
+      };
+    } catch (error) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Start auth capture failed: ${error instanceof Error ? error.message : String(error)}`,
+        is_error: true,
+      };
+    }
+  }
+
+  /** Handle browser_finish_auth_capture — stop interception, dump storage/cookies, stash payload */
+  private async handleBrowserFinishAuthCapture(toolUseId: string): Promise<ToolResultBlock> {
+    if (!this.config.browserEnabled) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'Browser tools are not enabled for this agent.',
+        is_error: true,
+      };
+    }
+    if (!this.browserClient) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: 'No browser page active. Use browser_navigate first to load a page.',
+        is_error: true,
+      };
+    }
+    try {
+      const captured = await this.browserClient.finishAuthCapture();
+      // Stash for the AuthWorkerAgent to pick up via ReactLoopResult.
+      this.capturedAuth = captured;
+      // Summarize for the LLM WITHOUT echoing secret values back into its context.
+      const bearerLen = captured.bearerToken?.length ?? 0;
+      const customHeaderCount = Object.keys(captured.customHeaders ?? {}).length;
+      const lsCount = Object.keys(captured.localStorage ?? {}).length;
+      const ssCount = Object.keys(captured.sessionStorage ?? {}).length;
+      const cookieCount = (captured.cookies ?? []).length;
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content:
+          `Auth capture finished (page at ${captured.finalUrl}).\n` +
+          `  • bearer token: ${bearerLen > 0 ? `yes (${bearerLen} chars, stored)` : 'no'}\n` +
+          `  • custom auth headers: ${customHeaderCount}${customHeaderCount > 0 ? ` (${Object.keys(captured.customHeaders).join(', ')})` : ''}\n` +
+          `  • cookies: ${cookieCount}\n` +
+          `  • localStorage keys: ${lsCount}${lsCount > 0 ? ` (${Object.keys(captured.localStorage).slice(0, 5).join(', ')}${lsCount > 5 ? '…' : ''})` : ''}\n` +
+          `  • sessionStorage keys: ${ssCount}\n` +
+          `If this looks right, call capture_complete. If nothing useful was captured, navigate again and retry, or call capture_failed.`,
+      };
+    } catch (error) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `Finish auth capture failed: ${error instanceof Error ? error.message : String(error)}`,
         is_error: true,
       };
     }

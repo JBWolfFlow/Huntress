@@ -102,20 +102,21 @@ export interface PipelineResult {
 // ─── Pipeline Definition ─────────────────────────────────────────────────────
 
 function buildStages(target: string, config: PipelineConfig): PipelineStage[] {
+  // All tools listed here are installed in docker/Dockerfile.attack-machine.
+  // If a tool is added/removed from the image, keep this function in sync.
+  // Verified present: subfinder, assetfinder, dnsx, naabu, gau, waybackurls,
+  // httpx, katana, wafw00f, whatweb, paramspider, nuclei, testssl.sh.
+  // (getJS and gowitness remain uninstalled — katana -jc and the agent's
+  // Playwright browser cover those use cases.)
   const stages: PipelineStage[] = [
     {
       id: 'subdomain_enum',
       name: 'Subdomain Enumeration',
-      description: 'Discover subdomains via subfinder',
+      description: 'Discover subdomains via subfinder + assetfinder',
       dependencies: [],
-      // assetfinder was removed from the pipeline because it's not shipped
-      // in huntress-attack-machine:latest (Issue #3 from Hunt #11 monitoring
-      // — exit 126 on every call, wasted ~40ms per dispatch). subfinder's
-      // passive-source coverage overlaps ~95% with assetfinder, so dropping
-      // it costs little recall. Re-add alongside a Dockerfile update if we
-      // later observe subdomains being missed in live hunts.
       commands: [
         { tool: 'subfinder', command: `subfinder -d ${target} -json -silent`, placeholders: {} },
+        { tool: 'assetfinder', command: `assetfinder --subs-only ${target}`, placeholders: {} },
       ],
       status: 'pending',
     },
@@ -136,7 +137,7 @@ function buildStages(target: string, config: PipelineConfig): PipelineStage[] {
       dependencies: [],
       commands: [
         { tool: 'gau', command: `gau --subs ${target}`, placeholders: {} },
-        { tool: 'waybackurls', command: `echo ${target} | waybackurls`, placeholders: {} },
+        { tool: 'waybackurls', command: `waybackurls ${target}`, placeholders: {} },
       ],
       status: 'pending',
     },
@@ -147,16 +148,6 @@ function buildStages(target: string, config: PipelineConfig): PipelineStage[] {
       dependencies: ['subdomain_enum'],
       commands: [
         { tool: 'dnsx', command: 'dnsx -resp -json -silent', placeholders: { stdin: 'subdomain_enum.output' } },
-      ],
-      status: 'pending',
-    },
-    {
-      id: 'js_analysis',
-      name: 'JavaScript Analysis',
-      description: 'Extract endpoints and secrets from JS files',
-      dependencies: ['wayback_urls'],
-      commands: [
-        { tool: 'getJS', command: `getJS --url https://${target} --complete`, placeholders: {} },
       ],
       status: 'pending',
     },
@@ -212,13 +203,12 @@ function buildStages(target: string, config: PipelineConfig): PipelineStage[] {
     },
     {
       id: 'final_scan',
-      name: 'Nuclei Scan + Evidence Collection',
-      description: 'Run Nuclei templates and collect screenshots/SSL info',
+      name: 'Nuclei Scan + SSL',
+      description: 'Run Nuclei templates and collect SSL info',
       dependencies: ['param_mining'],
       commands: [
         { tool: 'nuclei', command: `nuclei -u https://${target} -json -silent -rl 5`, placeholders: {} },
-        { tool: 'gowitness', command: `gowitness scan single -u https://${target} --json`, placeholders: {} },
-        { tool: 'testssl.sh', command: `testssl.sh --json https://${target}:443`, placeholders: {} },
+        { tool: 'testssl.sh', command: `testssl.sh --jsonfile-pretty=- https://${target}:443`, placeholders: {} },
       ],
       status: 'pending',
     },

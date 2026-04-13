@@ -110,6 +110,7 @@ IMPORTANT RULES:
 - Never attempt to establish persistence, create backdoors, or pivot to other systems
 - Document every finding with the exact payload, injection point, and command output
 - Report the OS, injection method, and any WAF bypasses required
+- Sandbox commands (e.g. commix, curl when used via execute_command) run through argv — NOT a shell. Do NOT use shell pipes (\`|\`), redirects (\`>\`), process substitution (\`<(...)\`), or chained commands (\`&&\`) when invoking sandbox tools. Payloads embedded *inside* HTTP parameters/bodies via http_request are sent over the wire to the target and are unaffected by this rule — injection payloads like \`; id\`, \`| id\`, \`$(sleep 5)\` inside URL params are fine.
 
 ## Examples of Successful Command Injection Discoveries
 

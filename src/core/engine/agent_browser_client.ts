@@ -12,6 +12,7 @@
  */
 
 import { invoke } from '@tauri-apps/api/core';
+import type { CapturedAuth } from '../auth/auth_browser_capture';
 
 export interface BrowserDialog {
   message: string;
@@ -53,6 +54,11 @@ export interface ClickResult {
   title: string;
   dialogs: BrowserDialog[];
   consoleLogs: BrowserConsoleLog[];
+}
+
+export interface FillResult {
+  filled: boolean;
+  selector: string;
 }
 
 export interface GetContentResult {
@@ -132,6 +138,18 @@ export class AgentBrowserClient {
 
   async click(selector: string, waitMs?: number): Promise<ClickResult> {
     return this.send<ClickResult>('click', { selector, waitMs });
+  }
+
+  async fill(selector: string, value: string, waitMs?: number): Promise<FillResult> {
+    return this.send<FillResult>('fill', { selector, value, waitMs });
+  }
+
+  async startAuthCapture(scopeDomains: string[]): Promise<{ captureStarted: boolean; scopeDomains: string[] }> {
+    return this.send<{ captureStarted: boolean; scopeDomains: string[] }>('start_auth_capture', { scopeDomains });
+  }
+
+  async finishAuthCapture(): Promise<CapturedAuth> {
+    return this.send<CapturedAuth>('finish_auth_capture', {});
   }
 
   async getContent(includeCookies?: boolean): Promise<GetContentResult> {

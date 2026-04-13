@@ -11,11 +11,14 @@
  *   Response: {"id":"r1","ok":true,"data":{...}}  |  {"id":"r1","ok":false,"error":"..."}
  *
  * Actions:
- *   navigate    { url, waitMs? }              -> { url, title, content, dialogs, consoleLogs }
- *   evaluate    { expression }                -> { value }  |  { error }
- *   click       { selector, waitMs? }         -> { url, title, dialogs, consoleLogs }
- *   get_content { includeCookies? }           -> { url, title, content, cookies? }
- *   close       {}                            -> { ok: true }  (exits process)
+ *   navigate             { url, waitMs? }              -> { url, title, content, dialogs, consoleLogs }
+ *   evaluate             { expression }                -> { value }  |  { error }
+ *   click                { selector, waitMs? }         -> { url, title, dialogs, consoleLogs }
+ *   fill                 { selector, value, waitMs? }  -> { filled: true, selector }
+ *   get_content          { includeCookies? }           -> { url, title, content, cookies? }
+ *   start_auth_capture   { scopeDomains: string[] }    -> { captureStarted: true }
+ *   finish_auth_capture  {}                            -> CapturedAuth-shaped payload
+ *   close                {}                            -> { ok: true }  (exits process)
  *
  * evaluate runs the expression inside the Chromium renderer sandbox (via
  * page.evaluate + eval). This is isolated from the Node host process. The
@@ -30,6 +33,24 @@ import readline from 'readline';
 
 const MAX_PAGE_CONTENT = 50_000;
 const MAX_EVAL_RESULT = 10_000;
+
+// Headers we treat as auth material. Mirrors scripts/auth_capture.mjs so the
+// CapturedAuth payload shape is consistent regardless of capture mechanism.
+const AUTH_HEADER_NAMES = new Set([
+  'authorization',
+  'x-api-key',
+  'x-csrf-token',
+  'x-xsrf-token',
+  'wallet-authorization',
+  'x-access-token',
+  'x-auth-token',
+  'x-session-token',
+]);
+
+// Auth-capture state. Active only between start_auth_capture / finish_auth_capture.
+let authCaptureActive = false;
+let authScopeDomains = new Set();
+let authCapturedHeaders = new Map();
 
 function findChrome() {
   const paths = [
@@ -154,6 +175,143 @@ async function doClick(req) {
   };
 }
 
+async function doStartAuthCapture(req) {
+  if (!Array.isArray(req.scopeDomains) || req.scopeDomains.length === 0) {
+    throw new Error('start_auth_capture requires scopeDomains: string[]');
+  }
+  const p = await ensurePage();
+  authScopeDomains = new Set(req.scopeDomains.map(d => String(d).trim().toLowerCase()).filter(Boolean));
+  authCapturedHeaders = new Map();
+  if (authCaptureActive) {
+    // Already capturing — reset headers and scope, re-arm the route handler.
+    try { await p.unroute('**/*'); } catch { /* ignore */ }
+  }
+  authCaptureActive = true;
+  await p.route('**/*', async (route) => {
+    const request = route.request();
+    let hostname = '';
+    try {
+      hostname = new URL(request.url()).hostname.toLowerCase();
+    } catch {
+      await route.continue();
+      return;
+    }
+    const inScope = authScopeDomains.has(hostname)
+      || [...authScopeDomains].some(d => hostname.endsWith(`.${d}`));
+    if (inScope) {
+      const headers = request.headers();
+      for (const [key, value] of Object.entries(headers)) {
+        if (AUTH_HEADER_NAMES.has(key.toLowerCase())) {
+          authCapturedHeaders.set(key, value);
+        }
+      }
+    }
+    await route.continue();
+  });
+  return { captureStarted: true, scopeDomains: [...authScopeDomains] };
+}
+
+async function doFinishAuthCapture() {
+  if (!authCaptureActive) {
+    throw new Error('finish_auth_capture called but capture was never started. Call start_auth_capture first.');
+  }
+  if (!page || page.isClosed()) {
+    authCaptureActive = false;
+    throw new Error('No browser page active — cannot read storage. Was the page closed before capture finished?');
+  }
+
+  // Stop intercepting before reading storage so route handler can't race.
+  try { await page.unroute('**/*'); } catch { /* ignore */ }
+
+  // Cookies — only keep in-scope ones.
+  const cookies = [];
+  try {
+    const allCookies = context ? await context.cookies() : [];
+    for (const c of allCookies) {
+      const bareDomain = c.domain.replace(/^\./, '').toLowerCase();
+      const inScope = authScopeDomains.has(bareDomain)
+        || [...authScopeDomains].some(d => c.domain.endsWith(`.${d}`) || c.domain === `.${d}`);
+      if (inScope) {
+        cookies.push({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path,
+          httpOnly: c.httpOnly,
+          secure: c.secure,
+        });
+      }
+    }
+  } catch { /* ignore — return what we have */ }
+
+  // localStorage + sessionStorage — from the active page origin.
+  let localStorage = {};
+  let sessionStorage = {};
+  try {
+    localStorage = await page.evaluate(() => {
+      const items = {};
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const k = window.localStorage.key(i);
+        if (k) items[k] = window.localStorage.getItem(k) || '';
+      }
+      return items;
+    });
+    sessionStorage = await page.evaluate(() => {
+      const items = {};
+      for (let i = 0; i < window.sessionStorage.length; i++) {
+        const k = window.sessionStorage.key(i);
+        if (k) items[k] = window.sessionStorage.getItem(k) || '';
+      }
+      return items;
+    });
+  } catch { /* page navigated away or CSP blocked — return what we have */ }
+
+  // Split out Authorization into bearerToken, everything else into customHeaders.
+  const customHeaders = {};
+  let bearerToken;
+  for (const [key, value] of authCapturedHeaders) {
+    if (key.toLowerCase() === 'authorization') {
+      bearerToken = value.replace(/^Bearer\s+/i, '');
+    } else {
+      customHeaders[key] = value;
+    }
+  }
+
+  const finalUrl = page.url();
+
+  // Reset capture state — safe to start a fresh capture afterward.
+  authCaptureActive = false;
+  authCapturedHeaders = new Map();
+
+  return {
+    bearerToken,
+    cookies,
+    customHeaders,
+    finalUrl,
+    localStorage,
+    sessionStorage,
+  };
+}
+
+async function doFill(req) {
+  if (!page || page.isClosed()) {
+    throw new Error('No browser page active. Use navigate first.');
+  }
+  if (typeof req.selector !== 'string' || !req.selector) {
+    throw new Error('fill requires a string selector');
+  }
+  if (typeof req.value !== 'string') {
+    throw new Error('fill requires a string value');
+  }
+  // page.fill() dispatches input/change/blur synthetic events — required for
+  // React/Vue/Angular-controlled inputs. Setting .value directly via evaluate()
+  // won't update framework state.
+  await page.fill(req.selector, req.value, { timeout: 5_000 });
+  const waitMs = Math.min(Math.max(req.waitMs ?? 0, 0), 10_000);
+  if (waitMs > 0) await page.waitForTimeout(waitMs);
+  return { filled: true, selector: req.selector };
+}
+
 async function doGetContent(req) {
   if (!page || page.isClosed()) {
     throw new Error('No browser page active. Use navigate first.');
@@ -177,10 +335,13 @@ async function doGetContent(req) {
 
 async function handle(request) {
   switch (request.action) {
-    case 'navigate':    return doNavigate(request);
-    case 'evaluate':    return doEvaluate(request);
-    case 'click':       return doClick(request);
-    case 'get_content': return doGetContent(request);
+    case 'navigate':             return doNavigate(request);
+    case 'evaluate':             return doEvaluate(request);
+    case 'click':                return doClick(request);
+    case 'fill':                 return doFill(request);
+    case 'get_content':          return doGetContent(request);
+    case 'start_auth_capture':   return doStartAuthCapture(request);
+    case 'finish_auth_capture':  return doFinishAuthCapture();
     case 'close':
       await shutdown();
       return { closed: true };
@@ -195,6 +356,9 @@ async function shutdown() {
   context = null;
   browser = null;
   page = null;
+  authCaptureActive = false;
+  authScopeDomains = new Set();
+  authCapturedHeaders = new Map();
 }
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });

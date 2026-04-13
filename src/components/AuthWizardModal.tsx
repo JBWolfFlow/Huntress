@@ -13,6 +13,8 @@ import type { AuthProfileConfig } from '../contexts/SettingsContext';
 import type { AuthDetectionResult, TargetProbeResult } from '../core/auth/auth_detector';
 import type { ProgramGuidelines } from './GuidelinesImporter';
 import { HttpClient } from '../core/http/request_engine';
+import { getProviderFactory } from '../core/providers/provider_factory';
+import { getAnthropicModelForComplexity } from '../core/orchestrator/cost_router';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -48,7 +50,7 @@ export const AuthWizardModal: React.FC<AuthWizardModalProps> = ({
   onComplete,
   onSkip,
 }) => {
-  const { addAuthProfile } = useSettings();
+  const { addAuthProfile, getApiKey, settings } = useSettings();
 
   const [step, setStep] = useState<WizardStep>(1);
   const [savedProfiles, setSavedProfiles] = useState<SavedProfile[]>([]);
@@ -83,6 +85,11 @@ export const AuthWizardModal: React.FC<AuthWizardModalProps> = ({
   // Browser capture state (Phase B)
   const [captureStatus, setCaptureStatus] = useState<'idle' | 'capturing' | 'done' | 'error'>('idle');
   const [captureMessage, setCaptureMessage] = useState('');
+
+  // AuthWorkerAgent (Session 25 Part B) — "Let Huntress log in"
+  const [workerStatus, setWorkerStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [workerMessage, setWorkerMessage] = useState('');
+  const [totpSeed, setTotpSeed] = useState('');
 
   // S8: Generic token refresh config for auto-refresh (all auth types)
   const isTelegramDetected = detectionResult.detectedAuthTypes.some(d => d.type === 'telegram_webapp');
@@ -201,6 +208,108 @@ export const AuthWizardModal: React.FC<AuthWizardModalProps> = ({
       setCaptureMessage(err instanceof Error ? err.message : 'Browser capture failed');
     }
   }, [authUrl, authLabel, guidelines.scope.inScope]);
+
+  // ── "Let Huntress log in" — AuthWorkerAgent (Session 25 Part B) ──
+
+  const handleRunAuthWorker = useCallback(async () => {
+    setWorkerStatus('running');
+    setWorkerMessage('Starting auth worker…');
+
+    try {
+      const loginUrl = authUrl || guidelines.scope.inScope[0] || '';
+      if (!loginUrl) {
+        setWorkerStatus('error');
+        setWorkerMessage('Enter a login URL first.');
+        return;
+      }
+      if (!authUsername || !authPassword) {
+        setWorkerStatus('error');
+        setWorkerMessage('Enter a username and password first.');
+        return;
+      }
+
+      const normalizedUrl = /^https?:\/\//i.test(loginUrl) ? loginUrl : `https://${loginUrl}`;
+      const scopeDomains = guidelines.scope.inScope
+        .map(s => { try { return new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`).hostname; } catch { return s; } })
+        .filter(Boolean);
+
+      // Use the default agent model from settings; fall back to the moderate-tier mapping.
+      const providerId = settings.defaultAgentModel.providerId;
+      const modelId = settings.defaultAgentModel.modelId || getAnthropicModelForComplexity('moderate');
+      const apiKey = getApiKey(providerId);
+      if (!apiKey && providerId !== 'local') {
+        setWorkerStatus('error');
+        setWorkerMessage(`No API key set for ${providerId}. Add one in Settings.`);
+        return;
+      }
+
+      const factory = getProviderFactory();
+      const provider = factory.create(providerId, { apiKey });
+
+      // Dynamic import to stay aligned with the pattern used elsewhere for
+      // browser-adjacent code (same as handleBrowserCapture above).
+      const { AuthWorkerAgent } = await import('../agents/auth_worker_agent');
+      const agent = new AuthWorkerAgent();
+      await agent.initialize(provider, modelId);
+
+      setWorkerMessage('Navigating to login page…');
+      const result = await agent.execute({
+        id: `auth_worker_${Date.now()}`,
+        target: normalizedUrl,
+        scope: scopeDomains,
+        description: 'Automated login via AuthWorkerAgent',
+        parameters: {
+          loginUrl: normalizedUrl,
+          scopeDomains,
+          username: authUsername,
+          password: authPassword,
+          totpSeed: totpSeed || undefined,
+        } as Record<string, unknown>,
+      });
+
+      const outcome = agent.getLastOutcome();
+      if (!result.success || !outcome || outcome.kind !== 'succeeded') {
+        setWorkerStatus('error');
+        setWorkerMessage(
+          outcome?.kind === 'failed'
+            ? `${outcome.reason}: ${outcome.detail}`
+            : (result.error || 'Auth worker did not complete successfully.')
+        );
+        return;
+      }
+
+      // Auto-fill form fields from captured payload — same precedence as
+      // handleBrowserCapture so downstream auth test / save flow is identical.
+      const captured = outcome.captured;
+      if (captured.bearerToken) {
+        setAuthType('bearer');
+        setAuthToken(captured.bearerToken);
+        if (!authLabel) setAuthLabel('Auto-login captured');
+      } else if (Object.keys(captured.customHeaders).length > 0) {
+        setAuthType('custom_header');
+        const headers = Object.entries(captured.customHeaders).map(([key, value]) => ({ key, value }));
+        setAuthCustomHeaders(headers.length > 0 ? headers : [{ key: '', value: '' }]);
+        if (!authLabel) setAuthLabel('Auto-login captured');
+      } else if (captured.cookies.length > 0) {
+        setAuthType('cookie');
+        if (!authLabel) setAuthLabel('Auto-login captured');
+      }
+
+      const parts: string[] = [];
+      if (captured.bearerToken) parts.push('bearer token');
+      if (captured.cookies.length > 0) parts.push(`${captured.cookies.length} cookies`);
+      const customHeaderCount = Object.keys(captured.customHeaders).length;
+      if (customHeaderCount > 0) parts.push(`${customHeaderCount} custom headers`);
+
+      setWorkerStatus('done');
+      setWorkerMessage(parts.length > 0
+        ? `Logged in. Captured: ${parts.join(', ')}. Review below, then continue.`
+        : 'Logged in but nothing useful was captured. Try supervised capture instead.');
+    } catch (err) {
+      setWorkerStatus('error');
+      setWorkerMessage(err instanceof Error ? err.message : 'Auth worker failed unexpectedly');
+    }
+  }, [authUrl, authUsername, authPassword, totpSeed, authLabel, guidelines.scope.inScope, settings.defaultAgentModel, getApiKey]);
 
   // ── Test Auth ──
 
@@ -611,7 +720,104 @@ export const AuthWizardModal: React.FC<AuthWizardModalProps> = ({
               </div>
             )}
 
-            {/* Auto-Capture from Browser (Phase B) */}
+            {/* Let Huntress log in (Session 25 Part B) — primary automated path.
+                Hidden when Telegram detected since Telegram Mini Apps are not
+                automatable (documented in session 25 plan / Part B feasibility). */}
+            {!isTelegramDetected && (
+              <div
+                data-testid="auth-worker-panel"
+                style={{
+                  padding: '12px',
+                  backgroundColor: 'rgba(168, 85, 247, 0.06)',
+                  border: '1px solid #7e22ce',
+                  borderRadius: '6px',
+                }}
+              >
+                <div style={{ fontSize: '11px', color: '#c084fc', fontWeight: 'bold', marginBottom: '6px' }}>
+                  LET HUNTRESS LOG IN FOR YOU
+                </div>
+                <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '10px', lineHeight: '1.5' }}>
+                  Huntress drives a headless browser through the login flow for you — no DevTools, no
+                  copy-paste. Enter your credentials (used once, never stored in plaintext), then run.
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '8px' }}>
+                  <label style={{ fontSize: '10px', color: '#6b7280' }}>USERNAME</label>
+                  <input
+                    type="text"
+                    value={authUsername}
+                    onChange={(e) => setAuthUsername(e.target.value)}
+                    placeholder="user@example.com"
+                    style={{
+                      padding: '6px 8px', backgroundColor: '#0b0b0d', border: '1px solid #1f2937',
+                      borderRadius: '4px', color: '#e5e7eb', fontFamily: 'monospace', fontSize: '12px',
+                    }}
+                  />
+                  <label style={{ fontSize: '10px', color: '#6b7280' }}>PASSWORD</label>
+                  <input
+                    type="password"
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    placeholder="••••••••"
+                    style={{
+                      padding: '6px 8px', backgroundColor: '#0b0b0d', border: '1px solid #1f2937',
+                      borderRadius: '4px', color: '#e5e7eb', fontFamily: 'monospace', fontSize: '12px',
+                    }}
+                  />
+                  <label style={{ fontSize: '10px', color: '#6b7280' }}>TOTP SEED (OPTIONAL, FOR 2FA)</label>
+                  <input
+                    type="text"
+                    value={totpSeed}
+                    onChange={(e) => setTotpSeed(e.target.value)}
+                    placeholder="base32 seed — leave empty if no 2FA"
+                    style={{
+                      padding: '6px 8px', backgroundColor: '#0b0b0d', border: '1px solid #1f2937',
+                      borderRadius: '4px', color: '#e5e7eb', fontFamily: 'monospace', fontSize: '12px',
+                    }}
+                  />
+                </div>
+
+                <button
+                  onClick={handleRunAuthWorker}
+                  disabled={workerStatus === 'running'}
+                  style={{
+                    ...primaryButtonStyle,
+                    fontSize: '11px',
+                    backgroundColor: workerStatus === 'running' ? '#374151' : '#7e22ce',
+                    borderColor: workerStatus === 'running' ? '#374151' : '#7e22ce',
+                    opacity: workerStatus === 'running' ? 0.7 : 1,
+                  }}
+                >
+                  {workerStatus === 'running' ? '[RUNNING AUTOMATED LOGIN...]' : '[\u25B6 RUN AUTOMATED LOGIN]'}
+                </button>
+
+                {workerMessage && (
+                  <div style={{
+                    fontSize: '11px',
+                    marginTop: '8px',
+                    color: workerStatus === 'error' ? '#ef4444'
+                      : workerStatus === 'done' ? '#4ade80'
+                      : '#9ca3af',
+                    fontFamily: 'monospace',
+                    whiteSpace: 'pre-wrap',
+                  }}>
+                    {workerMessage}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Or divider */}
+            {!isTelegramDetected && (
+              <div style={{
+                textAlign: 'center', fontSize: '10px', color: '#4b5563',
+                textTransform: 'uppercase', letterSpacing: '2px',
+              }}>
+                — or —
+              </div>
+            )}
+
+            {/* Supervised Capture from Browser (fallback) */}
             <div style={{
               padding: '12px',
               backgroundColor: 'rgba(59, 130, 246, 0.05)',
@@ -619,10 +825,11 @@ export const AuthWizardModal: React.FC<AuthWizardModalProps> = ({
               borderRadius: '6px',
             }}>
               <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '8px' }}>
-                AUTO-CAPTURE
+                SUPERVISED CAPTURE — YOU DRIVE THE BROWSER
               </div>
               <div style={{ fontSize: '11px', color: '#9ca3af', marginBottom: '8px' }}>
                 Opens a browser window. Log in normally — tokens and cookies are captured automatically.
+                Use this when automated login can't handle the target (captcha, SMS 2FA, unusual flow).
               </div>
               <button
                 onClick={handleBrowserCapture}
@@ -634,7 +841,7 @@ export const AuthWizardModal: React.FC<AuthWizardModalProps> = ({
                   color: captureStatus === 'capturing' ? '#6b7280' : '#60a5fa',
                 }}
               >
-                {captureStatus === 'capturing' ? '[CAPTURING...]' : '[AUTO-CAPTURE FROM BROWSER]'}
+                {captureStatus === 'capturing' ? '[CAPTURING...]' : '[SUPERVISED CAPTURE FROM BROWSER]'}
               </button>
               {captureMessage && (
                 <div style={{

@@ -51,6 +51,11 @@ const AGENT_COMPLEXITY: Record<string, TaskComplexity> = {
   'orchestrator': 'complex',
   'chain_detection': 'complex',
   'report_generation': 'complex',
+
+  // Auth capture — drives a browser through a login flow. Needs reasoning to
+  // handle variant login UIs (modal vs page, redirect vs popup, 2FA) but
+  // Sonnet handles this well — it's not chain-of-exploits complexity.
+  'auth-worker': 'moderate',
 };
 
 // ─── Anthropic Model Tier Configuration ─────────────────────────────────────

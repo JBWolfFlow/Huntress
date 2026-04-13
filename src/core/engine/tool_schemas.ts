@@ -394,6 +394,100 @@ export const BROWSER_CLICK_SCHEMA: ToolDefinition = {
   },
 };
 
+// ─── Auth Capture Tools (AuthWorkerAgent only) ───────────────────────────────
+
+export const BROWSER_START_AUTH_CAPTURE_SCHEMA: ToolDefinition = {
+  name: 'browser_start_auth_capture',
+  description: `Begin intercepting auth-bearing HTTP headers (Authorization, X-API-Key, X-CSRF-Token, wallet-authorization, etc.) from all in-scope requests the browser makes. Call BEFORE submitting the login form — not after. The interceptor will continue until browser_finish_auth_capture is called. Scope is enforced: only requests to the listed domains have their headers captured.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      scope_domains: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Domains (apex + any known subdomains) whose request headers should be captured. Example: ["juice-shop.example.com", "api.juice-shop.example.com"]',
+      },
+    },
+    required: ['scope_domains'],
+  },
+};
+
+export const BROWSER_FINISH_AUTH_CAPTURE_SCHEMA: ToolDefinition = {
+  name: 'browser_finish_auth_capture',
+  description: `Finalize auth capture. Stops the header interceptor, dumps cookies + localStorage + sessionStorage from the current page, and records everything as the captured auth payload. Call AFTER login succeeds (verify with browser_get_content first). The tool result will summarize what was captured without echoing secret values back.`,
+  input_schema: {
+    type: 'object',
+    properties: {},
+    required: [],
+  },
+};
+
+export const CAPTURE_COMPLETE_SCHEMA: ToolDefinition = {
+  name: 'capture_complete',
+  description: `Signal that authentication capture succeeded. Call this AFTER you have (1) logged in via browser_fill + browser_click, (2) called start_auth_capture before submitting credentials, and (3) confirmed via browser_get_content or browser_evaluate that the page is in a logged-in state. The orchestrator will read the captured auth material from the active browser session. Do NOT call this before a login attempt succeeds.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      summary: {
+        type: 'string',
+        description: 'Brief description of the login flow that was completed (e.g., "Logged in via /login with user@example.com; bearer token captured from /api/me XHR")',
+      },
+      login_url: {
+        type: 'string',
+        description: 'The URL where the login was performed',
+      },
+      post_login_url: {
+        type: 'string',
+        description: 'The URL the browser settled on after successful login (usually a dashboard or profile page)',
+      },
+    },
+    required: ['summary', 'login_url', 'post_login_url'],
+  },
+};
+
+export const CAPTURE_FAILED_SCHEMA: ToolDefinition = {
+  name: 'capture_failed',
+  description: `Signal that authentication capture failed. Call this when you cannot complete the login flow: wrong credentials, captcha wall, unexpected redirect, 2FA that wasn't provided, or any state you can't recover from. Be specific in the reason so the user can retry with correct inputs.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      reason: {
+        type: 'string',
+        description: 'Category of the failure',
+        enum: ['wrong_credentials', 'captcha', 'unknown_2fa', 'unexpected_redirect', 'page_error', 'selector_not_found', 'timeout', 'other'],
+      },
+      detail: {
+        type: 'string',
+        description: 'Human-readable explanation of what went wrong and where (e.g., "Password field input[type=password] not found on /login page — layout may have changed")',
+      },
+    },
+    required: ['reason', 'detail'],
+  },
+};
+
+export const BROWSER_FILL_SCHEMA: ToolDefinition = {
+  name: 'browser_fill',
+  description: `Fill a form input (or any element with a value property) in the current browser page by CSS selector. Preferred over browser_evaluate for form fields on React/Vue/Angular apps — Playwright's fill dispatches synthetic input/change/blur events that framework state binding requires. Use this for login forms, search boxes, credential/token inputs, and any controlled component. The browser must have navigated to a page first via browser_navigate.`,
+  input_schema: {
+    type: 'object',
+    properties: {
+      selector: {
+        type: 'string',
+        description: 'CSS selector for the input element (e.g., "input[type=email]", "#password", "input[name=username]")',
+      },
+      value: {
+        type: 'string',
+        description: 'String value to type into the input. Gets the field focus, clears any existing value, then types the new one, firing input/change events.',
+      },
+      wait_ms: {
+        type: 'number',
+        description: 'Milliseconds to wait after filling before returning (default: 0). Useful when async validators run on input.',
+      },
+    },
+    required: ['selector', 'value'],
+  },
+};
+
 export const BROWSER_GET_CONTENT_SCHEMA: ToolDefinition = {
   name: 'browser_get_content',
   description: `Get the current page HTML content, URL, title, and cookies from the headless browser. Use this to inspect the DOM after a sequence of browser_navigate and browser_click actions. Returns truncated HTML (max 50KB) plus metadata. The browser must have navigated to a page first via browser_navigate.`,
@@ -448,6 +542,7 @@ export const BROWSER_TOOL_SCHEMAS: ToolDefinition[] = [
   BROWSER_NAVIGATE_SCHEMA,
   BROWSER_EVALUATE_SCHEMA,
   BROWSER_CLICK_SCHEMA,
+  BROWSER_FILL_SCHEMA,
   BROWSER_GET_CONTENT_SCHEMA,
 ];
 
@@ -470,6 +565,19 @@ export const RECON_TOOL_SCHEMAS: ToolDefinition[] = [
   REQUEST_SPECIALIST_SCHEMA,
   ANALYZE_RESPONSE_SCHEMA,
   STOP_HUNTING_SCHEMA,
+];
+
+/** Schemas for the AuthWorkerAgent — browser + auth capture lifecycle + terminals. */
+export const AUTH_WORKER_TOOL_SCHEMAS: ToolDefinition[] = [
+  BROWSER_NAVIGATE_SCHEMA,
+  BROWSER_EVALUATE_SCHEMA,
+  BROWSER_CLICK_SCHEMA,
+  BROWSER_FILL_SCHEMA,
+  BROWSER_GET_CONTENT_SCHEMA,
+  BROWSER_START_AUTH_CAPTURE_SCHEMA,
+  BROWSER_FINISH_AUTH_CAPTURE_SCHEMA,
+  CAPTURE_COMPLETE_SCHEMA,
+  CAPTURE_FAILED_SCHEMA,
 ];
 
 /** Schemas for the orchestrator/coordinator */
@@ -607,6 +715,11 @@ export function getToolSchemasForAgent(agentType: string, browserEnabled?: boole
       return RECON_TOOL_SCHEMAS;
     case 'orchestrator':
       return ORCHESTRATOR_TOOL_SCHEMAS;
+    case 'auth-worker':
+      // Auth worker is NOT a hunting agent — it must not receive http_request,
+      // report_finding, execute_command, etc. It drives a browser through a
+      // login flow and returns CapturedAuth.
+      return AUTH_WORKER_TOOL_SCHEMAS;
     default:
       if (browserEnabled === false) {
         return AGENT_TOOL_SCHEMAS;

@@ -34,8 +34,11 @@ const HOST_HEADER_SYSTEM_PROMPT = `You are an expert Host header injection secur
 Execute these steps methodically. Adapt based on responses — if basic injections are blocked, escalate to advanced techniques.
 
 ### Step 1: Baseline Request
-First, establish a baseline by sending a normal request and recording the response:
-\`curl -s -D - "TARGET" | head -50\`
+First, establish a baseline by sending a normal request and recording the response.
+
+IMPORTANT: The sandbox runs commands via argv (no shell). Do NOT use shell pipes (\`|\`), redirects (\`>\`), process substitution (\`<(...)\`), or chained commands (\`&&\`). To capture response headers, write them to a file with \`-D\` and read the file in a separate command. Example:
+\`curl -s -D /tmp/headers.txt -o /tmp/body.txt "TARGET"\` then \`head -50 /tmp/headers.txt\`.
+
 Note the expected Host header behavior, response headers (especially cache-related), and any URLs in the response body that reference the Host.
 
 ### Step 2: Test Host Header Reflection
