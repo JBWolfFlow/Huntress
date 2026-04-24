@@ -2477,7 +2477,14 @@ What is your next action?`;
     // reach auth-gated endpoints. The 2026-04-23 Pug SSTI on POST
     // /api/BasketItems was the motivating case — without auth, curl probes
     // hit 401 and the {{7*7}} → 49 check never fires.
-    const primarySession = this.sessionManager?.listSessions()[0];
+    //
+    // When a second session is also configured we pass it as the secondary
+    // identity — idor/bola validators use it for data-ownership differential
+    // checks (attacker sees victim's data ⇒ broken access, no 200-vs-401
+    // guesswork).
+    const sessions = this.sessionManager?.listSessions() ?? [];
+    const primarySession = sessions[0];
+    const secondarySession = sessions[1];
 
     // Build ValidatorConfig with executeCommand routed through Tauri PTY
     const config: ValidatorConfig = {
@@ -2515,6 +2522,10 @@ What is your next action?`;
       timeout: 30_000, // 30s per finding validation
       authHeaders: primarySession?.headers,
       authCookies: primarySession?.cookies,
+      secondaryAuthHeaders: secondarySession?.headers,
+      secondaryAuthCookies: secondarySession?.cookies,
+      primaryAuthLabel: primarySession?.label,
+      secondaryAuthLabel: secondarySession?.label,
     };
 
     try {

