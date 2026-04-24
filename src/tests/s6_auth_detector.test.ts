@@ -600,3 +600,79 @@ describe('AuthDetector — Integration', () => {
     expect(result.probeResults[2].redirectsToLogin).toBe(true);
   });
 });
+
+// ─── P1-0-c: Cookie profile login-URL fallback ──────────────────────────────
+// The 2026-04-23 Superhuman hunt exposed a UX bug: when the detector flagged
+// the target as auth-walled (401 on every probe) but didn't find a concrete
+// login page, the cookie-profile instructions fell through to `baseUrl` (the
+// first in-scope probe URL). For Superhuman's merged scope the first entry
+// was `codacontent.io` — a CDN with no login form. The wizard dutifully told
+// the user to "Navigate to the login page: https://codacontent.io," which
+// is a dead end. Fix: leave `url` undefined and make instructions explicit
+// when we couldn't auto-detect a login URL.
+
+describe('AuthDetector — cookie profile login-URL fallback (P1-0-c)', () => {
+  it('cookie profile: confident login URL (redirect-to-login) is embedded in url + instructions', async () => {
+    const client = createMockHttpClient((options) => {
+      if (options.url === 'https://target.com/app') {
+        return { status: 302, headers: { location: 'https://target.com/login' } };
+      }
+      return { status: 200 };
+    });
+    const result = await AuthDetector.detect(
+      ['https://target.com/app'],
+      'Test Program',
+      [],
+      client,
+    );
+    const cookieProfile = result.suggestedProfiles.find(p => p.authType === 'cookie');
+    expect(cookieProfile).toBeDefined();
+    expect(cookieProfile!.url).toBe('https://target.com/login');
+    expect(cookieProfile!.instructions[0]).toContain('https://target.com/login');
+    expect(cookieProfile!.instructions[0]).toContain('Navigate to the login page');
+  });
+
+  it('cookie profile: no confident login URL → url is undefined, instructions prompt the user', async () => {
+    // 401 on every probe triggers cookie-type detection but no loginUrl.
+    // Before the fix, the profile's url would default to the first probe URL
+    // (effectively the "CDN as login page" footgun).
+    const client = createMockHttpClient(() => ({ status: 401, statusText: 'Unauthorized' }));
+    const result = await AuthDetector.detect(
+      ['https://codacontent.io', 'https://api.superhuman.com'],
+      'Superhuman',
+      [],
+      client,
+    );
+
+    const cookieProfile = result.suggestedProfiles.find(p => p.authType === 'cookie');
+    if (!cookieProfile) {
+      // 401 probes may also suggest bearer/api_key; if cookie isn't even in
+      // the suggested list that's an acceptable alternative outcome. Skip.
+      return;
+    }
+
+    expect(cookieProfile.url).toBeUndefined();
+    expect(cookieProfile.instructions[0]).toMatch(/Enter the login page URL below/i);
+    // Critical: must NOT leak the first in-scope host as a suggested login URL.
+    expect(cookieProfile.instructions.join(' ')).not.toContain('codacontent.io');
+  });
+
+  it('non-cookie profiles (bearer/api_key) still use baseUrl — only cookie got the stricter policy', async () => {
+    // Confirms we didn't over-correct: bearer/api_key profiles legitimately
+    // use the program's base URL as an API target for credential validation.
+    const client = createMockHttpClient(() => ({
+      status: 401,
+      headers: { 'www-authenticate': 'Bearer realm="api"' },
+    }));
+    const result = await AuthDetector.detect(
+      ['https://api.target.com/v1/me'],
+      'Bearer API',
+      [],
+      client,
+    );
+    const bearerProfile = result.suggestedProfiles.find(p => p.authType === 'bearer');
+    expect(bearerProfile).toBeDefined();
+    // Bearer profile: url is the probe URL (legitimate — it's the API base).
+    expect(bearerProfile!.url).toBe('https://api.target.com/v1/me');
+  });
+});

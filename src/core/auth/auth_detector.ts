@@ -571,13 +571,27 @@ export class AuthDetector {
         return {
           label: `${programName} \u2014 Login Session`,
           authType: 'cookie',
-          url: detection.loginUrl ?? baseUrl,
-          instructions: [
-            `1. Navigate to the login page: ${detection.loginUrl ?? baseUrl ?? '(detected URL)'}`,
-            '2. Enter your test account credentials below',
-            '3. Huntress will perform the login and capture session cookies',
-            '4. Use the "Test Auth" button to verify the session works',
-          ],
+          // Only embed the URL in the profile + instructions when we actually
+          // detected a login page. Falling through to `baseUrl` (the first
+          // in-scope probe URL) leads users to a dead end when the first
+          // in-scope asset is a CDN or API endpoint with no login form --
+          // see the 2026-04-23 Superhuman hunt where detection pointed at
+          // codacontent.io. When unsure, leave `url` undefined and make the
+          // wizard prompt for it explicitly.
+          url: detection.loginUrl,
+          instructions: detection.loginUrl
+            ? [
+                `1. Navigate to the login page: ${detection.loginUrl}`,
+                '2. Enter your test account credentials below',
+                '3. Huntress will perform the login and capture session cookies',
+                '4. Use the "Test Auth" button to verify the session works',
+              ]
+            : [
+                '1. Enter the login page URL below -- Huntress could not auto-detect one',
+                '2. Enter your test account credentials',
+                '3. Huntress will perform the login and capture session cookies',
+                '4. Use the "Test Auth" button to verify the session works',
+              ],
           automationLevel: 'full',
         };
 

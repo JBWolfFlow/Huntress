@@ -162,10 +162,15 @@ export const AuthWizardModal: React.FC<AuthWizardModalProps> = ({
       const { AuthBrowserCapture } = await import('../core/auth/auth_browser_capture');
       const capture = new AuthBrowserCapture();
 
-      const loginUrl = authUrl || guidelines.scope.inScope[0] || '';
+      // Require an explicit login URL. Do NOT silently fall back to
+      // guidelines.scope.inScope[0] — for multi-asset programs (Superhuman's
+      // merged Grammarly + Coda + Superhuman scope) the first in-scope entry
+      // is often a CDN/asset host with no login page, and "auto-capture"
+      // against it is just waiting at a dead end.
+      const loginUrl = authUrl.trim();
       if (!loginUrl) {
         setCaptureStatus('error');
-        setCaptureMessage('No URL to open — enter a login URL first');
+        setCaptureMessage('Enter the login-page URL above before capturing.');
         return;
       }
 
@@ -216,10 +221,14 @@ export const AuthWizardModal: React.FC<AuthWizardModalProps> = ({
     setWorkerMessage('Starting auth worker…');
 
     try {
-      const loginUrl = authUrl || guidelines.scope.inScope[0] || '';
+      // Same policy as auto-capture: require an explicit login URL instead
+      // of silently using scope.inScope[0]. The 2026-04-23 Superhuman run
+      // made this concrete -- auto-filling with a CDN host leads the
+      // AuthWorker to a dead-end page that has no login form.
+      const loginUrl = authUrl.trim();
       if (!loginUrl) {
         setWorkerStatus('error');
-        setWorkerMessage('Enter a login URL first.');
+        setWorkerMessage('Enter the login-page URL above before running automated login.');
         return;
       }
       if (!authUsername || !authPassword) {
