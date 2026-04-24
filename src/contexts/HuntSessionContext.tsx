@@ -8,6 +8,7 @@
 
 import React, { createContext, useContext, useState, useRef, useCallback, useEffect, useMemo, ReactNode } from 'react';
 import { OrchestratorEngine } from '../core/orchestrator/orchestrator_engine';
+import { resolveEconomyMode } from '../core/orchestrator/economy_mode';
 import type { ConversationMessage, SessionPhase, FindingCardMessage, StrategyOption, BriefingMessage } from '../core/conversation/types';
 import type { ModelProvider } from '../core/providers/types';
 import { getProviderFactory } from '../core/providers/provider_factory';
@@ -268,10 +269,15 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
         targets: [],
       });
 
+      // Resolve economy-mode dispatch configuration. When enabled, this
+      // widens per-agent budget claim so the slower serialized hunt has
+      // the funds to complete; see `src/core/orchestrator/economy_mode.ts`.
+      const economyConfig = resolveEconomyMode(settings.economyMode ?? false);
+
       // Set session budget in cost tracker
       costTrackerRef.current.setSessionBudget(sessionId, {
         maxSessionCostUsd: budgetLimit,
-        maxAgentCostUsd: budgetLimit * 0.2, // 20% per agent
+        maxAgentCostUsd: budgetLimit * economyConfig.maxAgentCostFraction,
         warningThreshold: 0.8,
         hardStop: true,
       });
@@ -286,7 +292,7 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
           callerType: 'orchestrator',
           budget: {
             maxSessionCostUsd: budgetLimit,
-            maxAgentCostUsd: budgetLimit * 0.2,
+            maxAgentCostUsd: budgetLimit * economyConfig.maxAgentCostFraction,
             warningThreshold: 0.8,
             hardStop: true,
           },
@@ -582,6 +588,8 @@ export const HuntSessionProvider: React.FC<{ children: ReactNode }> = ({ childre
         availableTools: availableSecurityTools.length > 0 ? availableSecurityTools : undefined,
         getBudgetStatus: () => tracedProvider.getBudgetStatus(),
         budgetLimitUsd: budgetLimit,
+        maxConcurrentAgents: economyConfig.maxConcurrentAgents,
+        maxSpecialistsPerRecon: economyConfig.maxSpecialistsPerRecon,
       });
 
       engine.setMessageCallback(addMessage);

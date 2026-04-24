@@ -90,6 +90,7 @@ import type { H1DuplicateChecker } from '../reporting/h1_duplicate_check';
 import type { ReportQualityScorer } from '../reporting/report_quality';
 import type { ContinuousMonitor } from '../discovery/continuous_monitor';
 import { classifyTaskComplexity, getAnthropicModelForComplexity } from './cost_router';
+import { selectSolverAgents } from './economy_mode';
 import type { BudgetStatus } from '../tracing/types';
 
 // ─── Callback Types ───────────────────────────────────────────────────────────
@@ -199,6 +200,15 @@ export interface OrchestratorConfig {
   systemPrompt?: string;
   /** Maximum agents that can run concurrently */
   maxConcurrentAgents?: number;
+  /**
+   * Maximum specialist agents dispatched per recon-completion fan-out.
+   * Defaults to `Infinity` (every catalog agent runs). Economy mode sets
+   * this to 3 to comply with "no automated scanning at scale" program
+   * restrictions — only the top-yield specialists (sqli/xss/idor by hit
+   * rate in recent hunts) fire per recon. See
+   * `src/core/orchestrator/economy_mode.ts`.
+   */
+  maxSpecialistsPerRecon?: number;
   /** Whether to auto-approve passive recon commands */
   autoApproveSafe?: boolean;
   /** Callback when a command needs user approval */
@@ -439,6 +449,7 @@ export class OrchestratorEngine {
   private guidelines?: ProgramGuidelines;
   private systemPrompt: string;
   private maxConcurrentAgents: number;
+  private maxSpecialistsPerRecon: number;
   private autoApproveSafe: boolean;
   private onApprovalRequest?: (request: ApprovalRequest) => Promise<boolean>;
   private onExecuteCommand?: (command: string, target: string) => Promise<CommandResult>;
@@ -523,6 +534,7 @@ export class OrchestratorEngine {
     });
     this.systemPrompt = config.systemPrompt ?? this.defaultSystemPrompt();
     this.maxConcurrentAgents = config.maxConcurrentAgents ?? 5;
+    this.maxSpecialistsPerRecon = config.maxSpecialistsPerRecon ?? Infinity;
     this.autoApproveSafe = config.autoApproveSafe ?? false;
     this.onApprovalRequest = config.onApprovalRequest;
     this.onExecuteCommand = config.onExecuteCommand;
@@ -2736,21 +2748,21 @@ What is your next action?`;
     const techStackLower = techStack.join(' ').toLowerCase();
     const skippedAgents = getSkippedAgentsForTechStack(techStackLower);
 
-    // Create targeted solver tasks for each relevant agent
-    const availableAgents = getAllAgents();
+    // Select specialist agents to dispatch. In economy mode (finite cap),
+    // `selectSolverAgents` sorts by historical yield rank and takes the
+    // top N so sqli/xss/idor run before obscure types. When the cap is
+    // Infinity, catalog order is preserved for stable non-economy dispatch.
+    const rawAgents = getAllAgents();
+    const selectedAgents = selectSolverAgents(rawAgents, skippedAgents, this.maxSpecialistsPerRecon);
+    const skippedCount = rawAgents.filter(a =>
+      a.metadata.id !== 'recon' && skippedAgents.has(a.metadata.id),
+    ).length;
+    const cappedCount = Number.isFinite(this.maxSpecialistsPerRecon)
+      ? Math.max(0, (rawAgents.length - 1 - skippedCount) - selectedAgents.length)
+      : 0;
     let dispatched = 0;
-    let skipped = 0;
 
-    for (const agentEntry of availableAgents) {
-      // Skip recon — it just completed
-      if (agentEntry.metadata.id === 'recon') continue;
-
-      // Tech-stack-aware filtering
-      if (skippedAgents.has(agentEntry.metadata.id)) {
-        skipped++;
-        continue;
-      }
-
+    for (const agentEntry of selectedAgents) {
       const budget = agentBudgets[agentEntry.metadata.id] ?? 40;
 
       // For agents with specific endpoint targets, create per-endpoint tasks
@@ -2785,11 +2797,11 @@ What is your next action?`;
       dispatched++;
     }
 
-    if (skipped > 0) {
-      this.emitSystemMessage(
-        `Tech-stack filter: dispatched ${dispatched} agents, skipped ${skipped} irrelevant agents`,
-        'info'
-      );
+    if (skippedCount > 0 || cappedCount > 0) {
+      const parts: string[] = [`dispatched ${dispatched} agents`];
+      if (skippedCount > 0) parts.push(`skipped ${skippedCount} irrelevant`);
+      if (cappedCount > 0) parts.push(`capped ${cappedCount} by economy mode`);
+      this.emitSystemMessage(`Tech-stack filter: ${parts.join(', ')}`, 'info');
     }
 
     return tasks;

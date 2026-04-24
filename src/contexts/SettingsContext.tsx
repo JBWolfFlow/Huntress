@@ -183,6 +183,14 @@ export interface AppSettings {
   budgetLimitUsd: number;
   /** Stealth and rate limiting configuration for live targets */
   stealth: StealthSettings;
+  /**
+   * Economy Mode — conservative dispatch defaults for live HackerOne programs.
+   * Off preserves historical behavior (5 parallel agents, unlimited fan-out).
+   * On drops concurrency to 2, caps specialist fan-out at 3 per recon, and
+   * widens per-agent budget claim so slower hunts complete. Details in
+   * `src/core/orchestrator/economy_mode.ts`.
+   */
+  economyMode: boolean;
   /** Auth profiles for authenticated testing (metadata only — credentials in secure storage) */
   authProfiles: AuthProfileConfig[];
   /** Uploaded API schema specs (OpenAPI/Swagger/GraphQL) for targeted testing */
@@ -231,6 +239,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     maxDelayMs: 2000,
     proxyEnabled: false,
   },
+  economyMode: false,
   authProfiles: [],
   apiSchemas: [],
 };

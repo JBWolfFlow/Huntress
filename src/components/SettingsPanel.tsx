@@ -1197,6 +1197,18 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose })
           {/* ─── ADVANCED TAB ─── */}
           {activeTab === 'advanced' && (
             <>
+              <Section
+                title="Hunt Behavior"
+                subtitle="Defaults assume local testing. Enable economy mode before running against real HackerOne programs — most forbid automated scanning at scale."
+              >
+                <CheckboxRow
+                  label="Economy mode (live HackerOne programs)"
+                  description="Drops concurrent specialists from 5 to 2, caps fan-out at 3 top-yield agents per recon (sqli, xss, idor prioritized), and widens per-agent budget so slower hunts still finish. Off by default — local test hunts see no change."
+                  checked={settings.economyMode ?? false}
+                  onChange={(val) => updateSettings({ economyMode: val })}
+                />
+              </Section>
+
               <Section title="Storage Info">
                 <div style={{ backgroundColor: '#000000', border: '1px solid #1f2937', borderRadius: '6px', padding: '12px' }}>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '12px' }}>
