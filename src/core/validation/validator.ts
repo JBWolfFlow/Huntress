@@ -12,6 +12,7 @@
 import type { ReactFinding } from '../engine/react_loop';
 import type { HeadlessBrowser } from './headless_browser';
 import { OOBServer } from './oob_server';
+import type { Cookie } from '../http/request_engine';
 // Web Crypto API — available in all modern browsers and Node.js 19+
 // No Node.js crypto import needed; globalThis.crypto works everywhere.
 
@@ -78,6 +79,75 @@ export interface ValidatorConfig {
   timeout?: number;
   /** interactsh server URL for OOB testing */
   interactshServer?: string;
+  /**
+   * Auth headers attached to every curl invocation the validator builds via
+   * `buildCurlArgv`. Populated from the active hunt's AuthenticatedSession
+   * when available so validators can reach auth-gated endpoints (the 2026-04-23
+   * Pug SSTI on POST `/api/BasketItems` was the motivating case — the GET
+   * probe hit 401 without this). Keep these as the resolved header map; the
+   * validator never sees the SessionManager itself.
+   */
+  authHeaders?: Record<string, string>;
+  /** Auth cookies attached to every curl invocation the validator builds. */
+  authCookies?: Cookie[];
+}
+
+/**
+ * Build a null-joined curl argv string for `ValidatorConfig.executeCommand`.
+ * Matches the convention every existing validator uses — the PTY layer on the
+ * Rust side splits on `\x00` so argv stays intact (no shell interpolation).
+ *
+ * Auth headers/cookies from `ValidatorConfig` are attached automatically when
+ * passed, so validators that call `buildCurlArgv` inherit the active hunt's
+ * credentials without each one re-implementing the plumbing.
+ */
+export function buildCurlArgv(opts: {
+  url: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
+  body?: string;
+  contentType?: string;
+  headers?: Record<string, string>;
+  cookies?: Cookie[];
+  authHeaders?: Record<string, string>;
+  authCookies?: Cookie[];
+  dumpHeaders?: boolean;
+  followRedirects?: boolean;
+}): string {
+  const argv: string[] = ['curl', '-s'];
+  if (opts.dumpHeaders) argv.push('-D', '-');
+  argv.push('-o', '-');
+  if (opts.followRedirects) argv.push('-L', '--max-redirs', '5');
+
+  const method = opts.method ?? 'GET';
+  if (method !== 'GET') argv.push('-X', method);
+
+  // Auth headers first, then explicit headers (explicit wins — caller can
+  // override e.g. Authorization if they need to).
+  const allHeaders: Record<string, string> = {
+    ...(opts.authHeaders ?? {}),
+    ...(opts.headers ?? {}),
+  };
+
+  // Cookies merge with the same precedence: auth cookies first, then explicit.
+  const cookieParts: string[] = [];
+  for (const c of opts.authCookies ?? []) cookieParts.push(`${c.name}=${c.value}`);
+  for (const c of opts.cookies ?? []) cookieParts.push(`${c.name}=${c.value}`);
+  if (cookieParts.length > 0) argv.push('-b', cookieParts.join('; '));
+
+  if (opts.body !== undefined) {
+    const ct = opts.contentType ?? (opts.body.trim().startsWith('{') ? 'application/json' : 'application/x-www-form-urlencoded');
+    if (!allHeaders['Content-Type'] && !allHeaders['content-type']) {
+      allHeaders['Content-Type'] = ct;
+    }
+    argv.push('--data-raw', opts.body);
+  }
+
+  for (const [k, v] of Object.entries(allHeaders)) {
+    argv.push('-H', `${k}: ${v}`);
+  }
+
+  argv.push(opts.url);
+  return argv.join('\x00');
 }
 
 /** Base interface for all validators */
@@ -947,6 +1017,48 @@ registerValidator({
 
 // ─── SSTI Validator ─────────────────────────────────────────────────────────
 
+/**
+ * Body parameter names commonly injected for SSTI probing. Covers the
+ * 2026-04-23 Juice Shop finding (`quantity` on POST /api/BasketItems) plus
+ * the canonical body-param positions seen across real H1 programs.
+ */
+const SSTI_BODY_FIELDS = [
+  'quantity', 'test', 'input', 'content', 'message',
+  'data', 'name', 'template', 'value', 'text',
+] as const;
+
+/** Run a single SSTI probe variant (GET query or POST body) and return the
+ *  stdout for 49 / 7777777 inspection. Pulls auth from `config` so
+ *  auth-gated endpoints are actually reachable. */
+async function runSstiProbe(
+  config: ValidatorConfig,
+  target: string,
+  probe:
+    | { kind: 'get_query'; url: string }
+    | { kind: 'post_body'; url: string; field: string; payload: string },
+): Promise<string> {
+  let command: string;
+  if (probe.kind === 'get_query') {
+    command = buildCurlArgv({
+      url: probe.url,
+      method: 'GET',
+      authHeaders: config.authHeaders,
+      authCookies: config.authCookies,
+    });
+  } else {
+    command = buildCurlArgv({
+      url: probe.url,
+      method: 'POST',
+      body: JSON.stringify({ [probe.field]: probe.payload }),
+      contentType: 'application/json',
+      authHeaders: config.authHeaders,
+      authCookies: config.authCookies,
+    });
+  }
+  const result = await config.executeCommand(command, target);
+  return result.stdout;
+}
+
 registerValidator({
   vulnType: 'ssti',
   async validate(finding, config): Promise<ValidationResult> {
@@ -957,93 +1069,108 @@ registerValidator({
     const targetUrl = finding.target;
     let confirmed = false;
     let confidence = finding.confidence;
+    let detectedEngine = 'unknown';
+    let injectionSite: string | null = null;
 
-    // Step 1: Send {{7*7}} and check for literal 49 in response
+    // Build the candidate injection sites. GET query is the classic fast
+    // path; POST-body sweep handles API endpoints where the SSTI lives in
+    // a JSON field (e.g. the 2026-04-23 Pug SSTI on `quantity`).
     const mathPayload = targetUrl.replace(/(\{\{.*?\}\}|%7B%7B.*?%7D%7D)/, '{{7*7}}');
     const mathUrl = mathPayload === targetUrl
       ? (targetUrl.includes('?') ? `${targetUrl}&test={{7*7}}` : `${targetUrl}?test={{7*7}}`)
       : mathPayload;
-
-    const result1 = await config.executeCommand(
-      ['curl', '-s', '-o', '-', mathUrl].join('\x00'),
-      finding.target
-    );
-
-    const has49 = result1.stdout.includes('49');
-
-    evidence.push({
-      type: 'http_response',
-      description: 'Response to {{7*7}} payload',
-      data: result1.stdout.substring(0, 5000),
-      timestamp: Date.now(),
-    });
-
-    steps.push(`Sent {{7*7}} payload to: ${mathUrl}`);
-    steps.push(`Response contains "49": ${has49 ? 'YES' : 'no'}`);
-
-    if (has49) {
-      confidence = Math.min(100, confidence + 20);
-    }
-
-    // Step 2: Send {{7*'7'}} to fingerprint template engine
-    // Jinja2: 7777777 (string multiplication)
-    // Twig: 49 (still math)
-    // Mako: 49
     const fingerUrl = mathUrl.replace('{{7*7}}', "{{7*'7'}}");
-    const result2 = await config.executeCommand(
-      ['curl', '-s', '-o', '-', fingerUrl].join('\x00'),
-      finding.target
-    );
 
-    const has7777777 = result2.stdout.includes('7777777');
-    const still49 = result2.stdout.includes('49');
+    type Site = {
+      label: string;
+      mathProbe: Parameters<typeof runSstiProbe>[2];
+      fingerProbe: Parameters<typeof runSstiProbe>[2];
+      cleanProbe: Parameters<typeof runSstiProbe>[2];
+    };
 
-    let detectedEngine = 'unknown';
-    if (has7777777) {
-      detectedEngine = 'Jinja2/Python';
-      confidence = Math.min(100, confidence + 30);
+    const sites: Site[] = [
+      {
+        label: 'GET query',
+        mathProbe: { kind: 'get_query', url: mathUrl },
+        fingerProbe: { kind: 'get_query', url: fingerUrl },
+        cleanProbe: { kind: 'get_query', url: mathUrl.replace('{{7*7}}', 'notatemplate') },
+      },
+      // POST-body probes — one per candidate field, constrained to a small
+      // canonical list. Only fire for endpoints that look like APIs to avoid
+      // burning budget on static targets. Heuristic: path contains /api/ or
+      // /rest/, or the finding's description mentions a method/body field.
+      ...((/\/(api|rest|v\d+)\//i.test(targetUrl)
+           || /POST|PUT|PATCH/i.test(finding.description ?? '')
+           || /body|field|parameter/i.test(finding.description ?? '')
+          )
+        ? SSTI_BODY_FIELDS.map((field): Site => ({
+            label: `POST body field "${field}"`,
+            mathProbe: { kind: 'post_body', url: targetUrl, field, payload: '{{7*7}}' },
+            fingerProbe: { kind: 'post_body', url: targetUrl, field, payload: "{{7*'7'}}" },
+            cleanProbe: { kind: 'post_body', url: targetUrl, field, payload: 'notatemplate' },
+          }))
+        : []),
+    ];
+
+    steps.push(`Testing ${sites.length} injection site(s) against ${targetUrl}`);
+
+    for (const site of sites) {
+      steps.push(`--- Trying ${site.label} ---`);
+
+      const mathStdout = await runSstiProbe(config, finding.target, site.mathProbe);
+      const has49 = mathStdout.includes('49');
+      if (!has49) {
+        steps.push(`  Response does not contain "49" — skipping ${site.label}`);
+        continue;
+      }
+
+      evidence.push({
+        type: 'http_response',
+        description: `${site.label}: response to {{7*7}} payload`,
+        data: mathStdout.substring(0, 5000),
+        timestamp: Date.now(),
+      });
+
+      const fingerStdout = await runSstiProbe(config, finding.target, site.fingerProbe);
+      const has7777777 = fingerStdout.includes('7777777');
+      const still49 = fingerStdout.includes('49');
+
+      evidence.push({
+        type: 'http_response',
+        description: `${site.label}: response to {{7*'7'}} fingerprint`,
+        data: fingerStdout.substring(0, 5000),
+        timestamp: Date.now(),
+      });
+
+      // Negative control — make sure the page doesn't always emit "49".
+      const cleanStdout = await runSstiProbe(config, finding.target, site.cleanProbe);
+      if (cleanStdout.includes('49')) {
+        steps.push(`  FALSE POSITIVE: clean (${site.label}) also contains "49" — discarding`);
+        continue;
+      }
+
+      // Real hit — score and fingerprint the engine.
+      let siteConfidence = 20;
+      if (has7777777) {
+        detectedEngine = 'Jinja2/Python';
+        siteConfidence += 30;
+      } else if (still49) {
+        detectedEngine = 'Twig/PHP or Mako or Pug';
+        siteConfidence += 25;
+      } else {
+        detectedEngine = 'unknown (math evaluated)';
+        siteConfidence += 15;
+      }
+
       confirmed = true;
-    } else if (still49 && has49) {
-      detectedEngine = 'Twig/PHP or Mako';
-      confidence = Math.min(100, confidence + 25);
-      confirmed = true;
-    } else if (has49) {
-      // {{7*7}} = 49 but {{7*'7'}} didn't confirm engine
-      // Still likely SSTI but less certain
-      detectedEngine = 'unknown (math evaluated)';
-      confidence = Math.min(100, confidence + 15);
-      confirmed = true;
+      confidence = Math.min(100, confidence + siteConfidence);
+      injectionSite = site.label;
+      steps.push(`  ✓ CONFIRMED at ${site.label} — engine: ${detectedEngine}`);
+      break; // first confirmed site wins
     }
 
-    evidence.push({
-      type: 'http_response',
-      description: `Response to {{7*'7'}} payload (engine fingerprint)`,
-      data: result2.stdout.substring(0, 5000),
-      timestamp: Date.now(),
-    });
-
-    steps.push(`Sent {{7*'7'}} fingerprint payload`);
-    steps.push(`Contains "7777777" (Jinja2): ${has7777777 ? 'YES' : 'no'}`);
-    steps.push(`Contains "49" (Twig/Mako): ${still49 ? 'YES' : 'no'}`);
-    steps.push(`Detected engine: ${detectedEngine}`);
-
-    // Step 3: Verify it's not a false positive by checking a non-template value
-    if (confirmed) {
-      const cleanUrl = mathUrl.replace('{{7*7}}', 'notatemplate');
-      const cleanResult = await config.executeCommand(
-        ['curl', '-s', '-o', '-', cleanUrl].join('\x00'),
-        finding.target
-      );
-      const cleanHas49 = cleanResult.stdout.includes('49');
-
-      if (cleanHas49) {
-        // The page always shows 49 — false positive
-        confirmed = false;
-        confidence = Math.max(0, confidence - 40);
-        steps.push('FALSE POSITIVE: clean request also contains "49"');
-      } else {
-        steps.push('Clean request does NOT contain "49" — SSTI confirmed');
-      }
+    if (!confirmed) {
+      steps.push('No injection site confirmed SSTI');
     }
 
     return {
@@ -1052,7 +1179,9 @@ registerValidator({
       evidence,
       reproductionSteps: steps,
       confidence,
-      validatorUsed: 'ssti',
+      validatorUsed: injectionSite
+        ? `ssti (${injectionSite}, ${detectedEngine})`
+        : 'ssti',
       validationTime: Date.now() - startTime,
     };
   },

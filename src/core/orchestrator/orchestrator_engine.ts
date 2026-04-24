@@ -2473,6 +2473,12 @@ What is your next action?`;
   private async runFindingValidation(finding: AgentFinding): Promise<void> {
     const reactFinding = agentFindingToReactFinding(finding);
 
+    // Pull the active hunt's first auth session (if any) so validators can
+    // reach auth-gated endpoints. The 2026-04-23 Pug SSTI on POST
+    // /api/BasketItems was the motivating case — without auth, curl probes
+    // hit 401 and the {{7*7}} → 49 check never fires.
+    const primarySession = this.sessionManager?.listSessions()[0];
+
     // Build ValidatorConfig with executeCommand routed through Tauri PTY
     const config: ValidatorConfig = {
       executeCommand: async (command: string, target: string): Promise<{
@@ -2507,6 +2513,8 @@ What is your next action?`;
         }
       },
       timeout: 30_000, // 30s per finding validation
+      authHeaders: primarySession?.headers,
+      authCookies: primarySession?.cookies,
     };
 
     try {

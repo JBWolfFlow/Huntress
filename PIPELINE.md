@@ -4,7 +4,7 @@ Single source of truth for outstanding work, verified status, and delivery prior
 
 - **Last updated:** 2026-04-23
 - **Project score:** 8.4 / 10 — platform infrastructure solid and validated through the 2026-04-23 live Juice Shop hunt (3 real findings: 1 CRITICAL SSTI, 2 HIGH DOM-XSS; all hit the validator pipeline cleanly). Validator hardening (P0-3, in progress) and live-target report calibration (P0-4) remain the two gates to first bounty submission.
-- **Test health:** 2,070 TypeScript tests passing (84 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
+- **Test health:** 2,081 TypeScript tests passing (85 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
 
 ---
 
@@ -35,8 +35,8 @@ Priority levels use a fixed rubric:
 
 **Status:**
 - ✅ **XSS multi-payload sweep** (2026-04-23). `xss_reflected` and `xss_dom` now loop through `script-tag`, `iframe-javascript` (Angular-bypass), `svg-onload`, and `img-onerror` variants via `buildXssPayloadVariants()`. First to fire the marker via dialog/console/OOB wins; evidence from every attempt is aggregated. 11 new tests. Next live hunt against Juice Shop should flip the two DOM-XSS findings from `could not be verified` to `CONFIRMED`.
-- ⏳ **SSTI POST-body + auth** (next). Current SSTI validator is GET-only and has no auth context, so Pug SSTI on auth-gated POST `/api/BasketItems` cannot be confirmed. Needs body-param injection + auth session pass-through via `ValidatorConfig`.
-- ⏳ **Remaining ~25 types** — iterate by frequency observed in live hunts.
+- ✅ **SSTI POST-body + auth** (2026-04-23). `buildCurlArgv()` helper (exported) centralizes argv construction with auth-header/cookie pass-through; `ValidatorConfig` gained `authHeaders` and `authCookies` fields populated from the active hunt's primary session in `runFindingValidation`. `ssti` validator now sweeps `SSTI_BODY_FIELDS` (quantity, test, input, content, message, data, name, template, value, text) for `/api/` or `/rest/` URLs in addition to the existing GET-query path. First confirming site wins; negative control still discards page-default `49` hits. 11 new tests. Should flip the 2026-04-23 Pug SSTI on POST `/api/BasketItems` from `could not be verified` to `CONFIRMED`.
+- ⏳ **Remaining ~25 types** — iterate by frequency observed in live hunts. `buildCurlArgv` + auth plumbing is now the shared foundation; migrating other validators (host_header_injection, cors_misconfiguration, path_traversal, ssrf, idor, xxe, command_injection, sqli_error, sqli_blind_time, prototype_pollution, nosql_injection, bola, oauth_*, subdomain_takeover) to use it is a mechanical refactor that unlocks auth for every one of them.
 
 **Acceptance:**
 - Each of the 28 types has a concrete verification routine (timing probe, browser state check, state-machine replay, OOB callback, etc.).
