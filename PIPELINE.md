@@ -3,8 +3,8 @@
 Single source of truth for outstanding work, verified status, and delivery priorities.
 
 - **Last updated:** 2026-04-23
-- **Project score:** 8.6 / 10 — platform infrastructure solid and validator hardening substantially complete. All high-frequency vulnerability types (XSS, SSTI, SQLi, SSRF, IDOR/BOLA, XXE, command injection, path traversal, host header injection) now have deterministic checks with false-positive controls; most also have active OOB-callback or two-identity differential proof paths. Live-target report calibration (P0-4) is the remaining gate.
-- **Test health:** 2,115 TypeScript tests passing (87 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
+- **Project score:** 8.7 / 10 — platform infrastructure solid, validator hardening substantially complete, scope narrowing shipped. All high-frequency vulnerability types (XSS, SSTI, SQLi, SSRF, IDOR/BOLA, XXE, command injection, path traversal, host header injection) have deterministic checks with false-positive controls; most have active OOB-callback or two-identity differential proof paths. Live-target report calibration (P0-4) and the remaining real-H1 UX blockers (auth-detector fallback, economy mode, submit-flow dry run) are the final gates before first submission.
+- **Test health:** 2,122 TypeScript tests passing (88 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
 
 ---
 
@@ -68,6 +68,14 @@ Priority levels use a fixed rubric:
 ---
 
 ## 3. P1 — High (Correctness & Quality Gaps)
+
+### P1-0 · Real-H1-hunt UX blockers (live submission readiness)
+Four concrete items surfaced when the user attempted a live Superhuman hunt on 2026-04-23. All block routine live-H1 use; none block the first possible submission if handled with care.
+
+- ✅ **Scope narrowing (P1-0-a)** — `BountyImporter` gained a toggleable "Narrow scope" section (off by default). When on, the user picks a subset of in-scope targets via checkboxes (with select-all/none helpers); `applyScopeNarrowing()` filters before handing off to the hunt. Unblocks programs like Superhuman where the full scope (30+ assets across `*.grammarly.com`, `*.coda.io`, `*.superhuman.com`) would fan specialists across everything and exhaust any reasonable budget. 7 tests.
+- ⏳ **P1-0-b · Economy mode for real programs** — Defaults of `maxConcurrentAgents = 5` and `maxAgentCostUsd = budget × 0.2` mean five parallel Sonnet agents can claim the whole budget in one batch. Need a settings toggle that drops concurrency to 2, caps specialist fan-out at ~3 per recon finding, and enforces polite per-domain rate limits (most H1 programs ban "automated scanning at scale"). ~1 hour.
+- ⏳ **P1-0-c · Auth-detector login-URL fallback** — When no login-path pattern (`/login`, `/signin`, `/auth`, …) matches, the detector currently picks the first in-scope asset and tells the wizard to use it as the login URL. The Superhuman hunt exposed this: detector pointed at `codacontent.io`, which has no login page. Fix: return `undefined` in the no-match case, make the wizard show "Enter login URL manually." ~1 hour.
+- ⏳ **P1-0-d · Submit-flow dry run** — `HackerOneAPI.submitReport()` + `ReportReviewModal` "Approve & Submit" + `HuntSessionContext.submitToH1()` are wired end-to-end but have never been exercised against a real H1 endpoint. Pre-flight with a mocked `HackerOneAPI` that verifies the payload shape and confirm-checkbox gating. Actual live submission can wait until there's a confirmed finding to submit. ~30 min.
 
 ### P1-1 · Verify generic token refresh against a non-Telegram OAuth2 target
 **Files:** `src/core/auth/token_refresher.ts`, `src/core/engine/react_loop.ts` (authenticatedRequest)

@@ -15,6 +15,23 @@ interface BountyImporterProps {
   onClose?: () => void;
 }
 
+/** Apply scope narrowing to a preview guidelines object. When narrowing is
+ *  off, returns the original in-scope array unchanged. When on, returns
+ *  only the entries in `selectedTargets`. Returns `null` when narrowing is
+ *  on and the selection is empty — callers surface this as a validation
+ *  error rather than dispatching an empty-scope hunt.
+ *  Exported for unit tests. */
+export function applyScopeNarrowing(
+  preview: ProgramGuidelines,
+  narrowScope: boolean,
+  selectedTargets: ReadonlySet<string>,
+): ProgramGuidelines | null {
+  if (!narrowScope) return preview;
+  const inScope = preview.scope.inScope.filter(t => selectedTargets.has(t));
+  if (inScope.length === 0) return null;
+  return { ...preview, scope: { ...preview.scope, inScope } };
+}
+
 type ImportMode = 'url' | 'file' | 'manual';
 
 export const BountyImporter: React.FC<BountyImporterProps> = ({ onImport, onClose }) => {
@@ -28,6 +45,15 @@ export const BountyImporter: React.FC<BountyImporterProps> = ({ onImport, onClos
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [huntBudget, setHuntBudget] = useState(settings.budgetLimitUsd ?? 15);
+
+  // Scope narrowing — optional. Off by default so single-target programs
+  // (Juice Shop, a specific endpoint) don't see a new confirmation step.
+  // Programs with dozens of in-scope assets (Superhuman's merged Grammarly +
+  // Coda scope is 30+) need the ability to hunt one asset at a time —
+  // otherwise the tech-stack filter fans out across the whole program and
+  // any reasonable budget burns in minutes.
+  const [narrowScope, setNarrowScope] = useState(false);
+  const [selectedTargets, setSelectedTargets] = useState<Set<string>>(new Set());
 
   const [manualForm, setManualForm] = useState({
     programName: '',
@@ -170,10 +196,42 @@ export const BountyImporter: React.FC<BountyImporterProps> = ({ onImport, onClos
   }, [manualForm]);
 
   const confirmImport = useCallback(() => {
-    if (preview) {
-      onImport({ ...preview, huntBudgetUsd: huntBudget });
+    if (!preview) return;
+    const narrowed = applyScopeNarrowing(preview, narrowScope, selectedTargets);
+    if (narrowed === null) {
+      setError('Select at least one in-scope target, or disable scope narrowing.');
+      return;
     }
-  }, [preview, huntBudget, onImport]);
+    onImport({ ...narrowed, huntBudgetUsd: huntBudget });
+  }, [preview, huntBudget, narrowScope, selectedTargets, onImport]);
+
+  const toggleTarget = useCallback((target: string) => {
+    setSelectedTargets(prev => {
+      const next = new Set(prev);
+      if (next.has(target)) next.delete(target); else next.add(target);
+      return next;
+    });
+  }, []);
+
+  const selectAllTargets = useCallback(() => {
+    if (preview) setSelectedTargets(new Set(preview.scope.inScope));
+  }, [preview]);
+
+  const selectNoTargets = useCallback(() => {
+    setSelectedTargets(new Set());
+  }, []);
+
+  const toggleNarrowScope = useCallback(() => {
+    setNarrowScope(prev => {
+      const next = !prev;
+      // When flipping narrowing ON for the first time, pre-check everything
+      // so the user's default action is unchanged (select all = full scope).
+      if (next && preview && selectedTargets.size === 0) {
+        setSelectedTargets(new Set(preview.scope.inScope));
+      }
+      return next;
+    });
+  }, [preview, selectedTargets.size]);
 
   const inputClasses =
     'w-full px-4 py-2 bg-gray-900 text-white rounded border border-gray-700 focus:border-red-500 focus:outline-none';
@@ -283,17 +341,80 @@ export const BountyImporter: React.FC<BountyImporterProps> = ({ onImport, onClos
               </div>
             </div>
 
-            {/* In-scope targets */}
+            {/* In-scope targets — plain list or narrow-scope checkbox UI */}
             {preview.scope.inScope.length > 0 && (
               <div>
-                <p className="text-xs font-semibold text-gray-400 uppercase mb-1">In Scope</p>
-                <div className="bg-gray-900 rounded-lg p-3 space-y-1 max-h-32 overflow-y-auto">
-                  {preview.scope.inScope.map((target, i) => (
-                    <p key={i} className="text-sm text-green-400 font-mono">
-                      {target}
-                    </p>
-                  ))}
+                <div className="flex items-center justify-between mb-1">
+                  <p className="text-xs font-semibold text-gray-400 uppercase">In Scope</p>
+                  <label className="flex items-center gap-2 text-[11px] text-gray-400 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={narrowScope}
+                      onChange={toggleNarrowScope}
+                      className="accent-red-500 cursor-pointer"
+                    />
+                    Narrow scope
+                  </label>
                 </div>
+
+                {!narrowScope ? (
+                  <div className="bg-gray-900 rounded-lg p-3 space-y-1 max-h-32 overflow-y-auto">
+                    {preview.scope.inScope.map((target, i) => (
+                      <p key={i} className="text-sm text-green-400 font-mono">
+                        {target}
+                      </p>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="bg-gray-900 rounded-lg p-3 space-y-2">
+                    <div className="flex items-center justify-between text-[10px] text-gray-500">
+                      <span>
+                        {selectedTargets.size} of {preview.scope.inScope.length} selected
+                      </span>
+                      <div className="flex gap-3">
+                        <button
+                          type="button"
+                          onClick={selectAllTargets}
+                          className="text-gray-400 hover:text-green-400 uppercase"
+                        >
+                          Select all
+                        </button>
+                        <button
+                          type="button"
+                          onClick={selectNoTargets}
+                          className="text-gray-400 hover:text-red-400 uppercase"
+                        >
+                          Select none
+                        </button>
+                      </div>
+                    </div>
+                    <div className="space-y-1 max-h-40 overflow-y-auto">
+                      {preview.scope.inScope.map((target, i) => {
+                        const checked = selectedTargets.has(target);
+                        return (
+                          <label
+                            key={i}
+                            className="flex items-center gap-2 text-sm font-mono cursor-pointer hover:bg-gray-800 rounded px-1 py-0.5"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleTarget(target)}
+                              className="accent-red-500 cursor-pointer"
+                            />
+                            <span className={checked ? 'text-green-400' : 'text-gray-500 line-through'}>
+                              {target}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-gray-500 italic pt-1 border-t border-gray-800">
+                      Only checked targets will be hunted. Useful for real-program hunts
+                      where the full scope would blow budget across unrelated assets.
+                    </p>
+                  </div>
+                )}
               </div>
             )}
 
