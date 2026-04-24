@@ -112,11 +112,19 @@ export function buildCurlArgv(opts: {
   authCookies?: Cookie[];
   dumpHeaders?: boolean;
   followRedirects?: boolean;
+  maxRedirects?: number;
+  /** Value passed to `curl -w` — e.g. `%{time_total}` for blind-time SQLi. */
+  writeOut?: string;
+  /** Send body to /dev/null instead of stdout. Used with `writeOut` for timing probes. */
+  discardBody?: boolean;
 }): string {
   const argv: string[] = ['curl', '-s'];
   if (opts.dumpHeaders) argv.push('-D', '-');
-  argv.push('-o', '-');
-  if (opts.followRedirects) argv.push('-L', '--max-redirs', '5');
+  argv.push('-o', opts.discardBody ? '/dev/null' : '-');
+  if (opts.writeOut) argv.push('-w', opts.writeOut);
+  if (opts.followRedirects) {
+    argv.push('-L', '--max-redirs', String(opts.maxRedirects ?? 5));
+  }
 
   const method = opts.method ?? 'GET';
   if (method !== 'GET') argv.push('-X', method);
@@ -490,7 +498,7 @@ registerValidator({
 
     // Step 1: Send the original error-triggering payload
     const result = await config.executeCommand(
-      ['curl', '-s', '-o', '-', finding.target].join('\x00'),
+      buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
@@ -527,7 +535,7 @@ registerValidator({
     // Step 2: Send a clean request for comparison
     const cleanUrl = finding.target.replace(/['"\\].*$/, '');
     const cleanResult = await config.executeCommand(
-      ['curl', '-s', '-o', '-', cleanUrl].join('\x00'),
+      buildCurlArgv({ url: cleanUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
@@ -560,7 +568,10 @@ registerValidator({
 
     // Step 1: Baseline timing
     const baseline = await config.executeCommand(
-      ['curl', '-s', '-o', '/dev/null', '-w', '%{time_total}', finding.target].join('\x00'),
+      buildCurlArgv({
+        url: finding.target, discardBody: true, writeOut: '%{time_total}',
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
     const baselineTime = parseFloat(baseline.stdout) * 1000;
@@ -569,7 +580,10 @@ registerValidator({
 
     // Step 2: Time-based payload (should cause delay)
     const delayResult = await config.executeCommand(
-      ['curl', '-s', '-o', '/dev/null', '-w', '%{time_total}', finding.target].join('\x00'),
+      buildCurlArgv({
+        url: finding.target, discardBody: true, writeOut: '%{time_total}',
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
     const delayTime = parseFloat(delayResult.stdout) * 1000;
@@ -619,7 +633,7 @@ registerValidator({
 
     // Step 1: Send request and check for internal data in response
     const result = await config.executeCommand(
-      ['curl', '-s', '-o', '-', finding.target].join('\x00'),
+      buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
@@ -707,7 +721,10 @@ registerValidator({
 
     // Step 1: Make the original request
     const result1 = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', finding.target].join('\x00'),
+      buildCurlArgv({
+        url: finding.target, dumpHeaders: true,
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
 
@@ -750,9 +767,18 @@ registerValidator({
     const evidence: ValidationEvidence[] = [];
     const steps: string[] = [];
 
-    // Follow redirects and check final location
+    // Follow redirects and check final location.
+    // No auth pass-through: `curl -L` re-sends custom headers on every
+    // redirect hop including cross-origin ones. The whole point of this
+    // validator is to detect redirects that escape scope — sending the
+    // user's bearer/cookies to whatever attacker-chosen host the open
+    // redirect lands on would be a classic credential-leak bug in our
+    // own tooling. Revisit if curl grows per-hop header scoping.
     const result = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '/dev/null', '-L', '--max-redirs', '5', finding.target].join('\x00'),
+      buildCurlArgv({
+        url: finding.target, dumpHeaders: true, discardBody: true,
+        followRedirects: true, maxRedirects: 5,
+      }),
       finding.target
     );
 
@@ -801,7 +827,7 @@ registerValidator({
 
     // Send the XXE payload and check for file content in response
     const result = await config.executeCommand(
-      ['curl', '-s', '-o', '-', finding.target].join('\x00'),
+      buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
@@ -865,7 +891,7 @@ registerValidator({
 
     // Step 1: Send the original payload and check for command output
     const result = await config.executeCommand(
-      ['curl', '-s', '-o', '-', finding.target].join('\x00'),
+      buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
@@ -892,13 +918,19 @@ registerValidator({
     // Step 2: Time-based confirmation — send baseline then delay payload
     const cleanTarget = finding.target.replace(/[;&|`$()]+.*$/, '');
     const baselineResult = await config.executeCommand(
-      ['curl', '-s', '-o', '/dev/null', '-w', '%{time_total}', cleanTarget].join('\x00'),
+      buildCurlArgv({
+        url: cleanTarget, discardBody: true, writeOut: '%{time_total}',
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
     const baselineTime = parseFloat(baselineResult.stdout) * 1000;
 
     const delayResult = await config.executeCommand(
-      ['curl', '-s', '-o', '/dev/null', '-w', '%{time_total}', finding.target].join('\x00'),
+      buildCurlArgv({
+        url: finding.target, discardBody: true, writeOut: '%{time_total}',
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
     const delayTime = parseFloat(delayResult.stdout) * 1000;
@@ -944,7 +976,7 @@ registerValidator({
     const steps: string[] = [];
 
     const result = await config.executeCommand(
-      ['curl', '-s', '-o', '-', finding.target].join('\x00'),
+      buildCurlArgv({ url: finding.target, authHeaders: config.authHeaders, authCookies: config.authCookies }),
       finding.target
     );
 
@@ -1203,7 +1235,11 @@ registerValidator({
     // Step 1: Send request with an attacker-controlled origin
     const evilOrigin = 'https://evil-attacker.com';
     const result1 = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', '-H', `Origin: ${evilOrigin}`, targetUrl].join('\x00'),
+      buildCurlArgv({
+        url: targetUrl, dumpHeaders: true,
+        headers: { 'Origin': evilOrigin },
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
 
@@ -1243,7 +1279,11 @@ registerValidator({
     // Step 2: Test null origin (used in sandboxed iframes, data: URIs)
     if (!confirmed) {
       const result2 = await config.executeCommand(
-        ['curl', '-s', '-D', '-', '-o', '-', '-H', 'Origin: null', targetUrl].join('\x00'),
+        buildCurlArgv({
+          url: targetUrl, dumpHeaders: true,
+          headers: { 'Origin': 'null' },
+          authHeaders: config.authHeaders, authCookies: config.authCookies,
+        }),
         finding.target
       );
 
@@ -1277,7 +1317,11 @@ registerValidator({
       if (targetHost) {
         const subdomainBypass = `https://${targetHost}.evil-attacker.com`;
         const result3 = await config.executeCommand(
-          ['curl', '-s', '-D', '-', '-o', '-', '-H', `Origin: ${subdomainBypass}`, targetUrl].join('\x00'),
+          buildCurlArgv({
+            url: targetUrl, dumpHeaders: true,
+            headers: { 'Origin': subdomainBypass },
+            authHeaders: config.authHeaders, authCookies: config.authCookies,
+          }),
           finding.target
         );
 
@@ -1325,7 +1369,11 @@ registerValidator({
 
     // Step 1: Send request with manipulated Host header
     const result1 = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', '-H', `Host: ${evilHost}`, targetUrl].join('\x00'),
+      buildCurlArgv({
+        url: targetUrl, dumpHeaders: true,
+        headers: { 'Host': evilHost },
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
 
@@ -1358,7 +1406,11 @@ registerValidator({
     // Step 2: Test X-Forwarded-Host (common bypass when Host is validated)
     if (!confirmed) {
       const result2 = await config.executeCommand(
-        ['curl', '-s', '-D', '-', '-o', '-', '-H', `X-Forwarded-Host: ${evilHost}`, targetUrl].join('\x00'),
+        buildCurlArgv({
+          url: targetUrl, dumpHeaders: true,
+          headers: { 'X-Forwarded-Host': evilHost },
+          authHeaders: config.authHeaders, authCookies: config.authCookies,
+        }),
         finding.target
       );
 
@@ -1390,7 +1442,7 @@ registerValidator({
     // Step 3: Verify it's not a false positive — send with legitimate host
     if (bodyHasEvil && !confirmed) {
       const result3 = await config.executeCommand(
-        ['curl', '-s', '-o', '-', targetUrl].join('\x00'),
+        buildCurlArgv({ url: targetUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
         finding.target
       );
 
@@ -1432,7 +1484,10 @@ registerValidator({
 
     // Step 1: Re-send the __proto__ payload from the finding
     const result1 = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', targetUrl].join('\x00'),
+      buildCurlArgv({
+        url: targetUrl, dumpHeaders: true,
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
 
@@ -1468,7 +1523,11 @@ registerValidator({
     for (const payload of protoPayloads) {
       // Try JSON body injection
       const injectResult = await config.executeCommand(
-        ['curl', '-s', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', payload, '-o', '-', targetUrl].join('\x00'),
+        buildCurlArgv({
+          url: targetUrl, method: 'POST',
+          body: payload, contentType: 'application/json',
+          authHeaders: config.authHeaders, authCookies: config.authCookies,
+        }),
         finding.target
       );
 
@@ -1489,7 +1548,7 @@ registerValidator({
 
       // Also check if the pollution persists — make a clean GET request and see if canary appears
       const verifyResult = await config.executeCommand(
-        ['curl', '-s', '-o', '-', targetUrl].join('\x00'),
+        buildCurlArgv({ url: targetUrl, authHeaders: config.authHeaders, authCookies: config.authCookies }),
         finding.target
       );
 
@@ -1631,9 +1690,16 @@ registerValidator({
       'Zendesk': [/Help Center Closed/i],
     };
 
-    // Step 4: HTTP request to the target to check for service error pages
+    // Step 4: HTTP request to the target to check for service error pages.
+    // No auth pass-through: hostname is the takeover-candidate host, not
+    // the user's authenticated target, and follow-redirects would forward
+    // headers off-origin. See note on open_redirect for the rationale.
     const httpResult = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', '-H', `Host: ${hostname}`, `https://${hostname}`].join('\x00'),
+      buildCurlArgv({
+        url: `https://${hostname}`, dumpHeaders: true,
+        followRedirects: true, maxRedirects: 3,
+        headers: { 'Host': hostname },
+      }),
       finding.target
     );
 
@@ -1672,7 +1738,9 @@ registerValidator({
     // Step 5: Also try HTTP on the CNAME target directly (some services respond differently)
     if (!confirmed) {
       const cnameHttpResult = await config.executeCommand(
-        ['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', `https://${cnameTarget}`].join('\x00'),
+        buildCurlArgv({
+          url: `https://${cnameTarget}`, discardBody: true, writeOut: '%{http_code}',
+        }),
         finding.target
       );
 
@@ -1753,8 +1821,14 @@ registerValidator({
       statelessUrl = endpoint.replace(/[?&]state=[^&]*/g, '');
     }
 
+    // No auth pass-through: OAuth flows redirect between app and IdP,
+    // and curl -L re-sends custom headers cross-origin. See open_redirect
+    // note for rationale.
     const result = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', statelessUrl].join('\x00'),
+      buildCurlArgv({
+        url: statelessUrl, dumpHeaders: true,
+        followRedirects: true, maxRedirects: 3,
+      }),
       finding.target
     );
 
@@ -1815,9 +1889,13 @@ registerValidator({
 
     const endpoint = extractOAuthEndpoint(finding);
 
-    // Step 1: Send request WITH code_challenge
+    // Step 1: Send request WITH code_challenge.
+    // No auth pass-through (OAuth redirects cross-origin — see open_redirect).
     const result1 = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', endpoint].join('\x00'),
+      buildCurlArgv({
+        url: endpoint, dumpHeaders: true,
+        followRedirects: true, maxRedirects: 3,
+      }),
       finding.target
     );
 
@@ -1843,7 +1921,10 @@ registerValidator({
     }
 
     const result2 = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', noChallengeUrl].join('\x00'),
+      buildCurlArgv({
+        url: noChallengeUrl, dumpHeaders: true,
+        followRedirects: true, maxRedirects: 3,
+      }),
       finding.target
     );
 
@@ -1902,9 +1983,10 @@ registerValidator({
     if (verifier && verifier.length < 43) {
       steps.push(`Weak verifier found: length ${verifier.length} (RFC 7636 minimum: 43)`);
 
-      // Verify the server accepted the weak verifier
+      // Verify the server accepted the weak verifier.
+      // No auth pass-through (OAuth endpoint; cross-origin redirect risk).
       const result = await config.executeCommand(
-        ['curl', '-s', '-D', '-', '-o', '-', endpoint].join('\x00'),
+        buildCurlArgv({ url: endpoint, dumpHeaders: true }),
         finding.target
       );
 
@@ -1954,9 +2036,13 @@ registerValidator({
 
     const endpoint = extractOAuthEndpoint(finding);
 
-    // Re-send the request that claims scope escalation
+    // Re-send the request that claims scope escalation.
+    // No auth pass-through (OAuth endpoint; cross-origin redirect risk).
     const result = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', endpoint].join('\x00'),
+      buildCurlArgv({
+        url: endpoint, dumpHeaders: true,
+        followRedirects: true, maxRedirects: 3,
+      }),
       finding.target
     );
 
@@ -2027,9 +2113,13 @@ for (const oauthType of [
       const endpoint = extractOAuthEndpoint(finding);
       steps.push(`Validating ${oauthType} at ${endpoint}`);
 
-      // Re-send the OAuth request from the finding
+      // Re-send the OAuth request from the finding.
+      // No auth pass-through (OAuth flow crosses app ↔ IdP origins).
       const result = await config.executeCommand(
-        ['curl', '-s', '-D', '-', '-o', '-', '-L', '--max-redirs', '3', endpoint].join('\x00'),
+        buildCurlArgv({
+          url: endpoint, dumpHeaders: true,
+          followRedirects: true, maxRedirects: 3,
+        }),
         finding.target
       );
 
@@ -2086,7 +2176,10 @@ registerValidator({
 
     // Step 1: Send the original payload (expected to return data or "true" result)
     const injectedResult = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', finding.target].join('\x00'),
+      buildCurlArgv({
+        url: finding.target, dumpHeaders: true,
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
 
@@ -2110,7 +2203,10 @@ registerValidator({
     }
 
     const falseResult = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', falseTarget].join('\x00'),
+      buildCurlArgv({
+        url: falseTarget, dumpHeaders: true,
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
 
@@ -2172,7 +2268,10 @@ registerValidator({
     const steps: string[] = [];
 
     const result = await config.executeCommand(
-      ['curl', '-s', '-D', '-', '-o', '-', finding.target].join('\x00'),
+      buildCurlArgv({
+        url: finding.target, dumpHeaders: true,
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
       finding.target
     );
 
