@@ -18,6 +18,8 @@
  *   get_content          { includeCookies? }           -> { url, title, content, cookies? }
  *   start_auth_capture   { scopeDomains: string[] }    -> { captureStarted: true }
  *   finish_auth_capture  {}                            -> CapturedAuth-shaped payload
+ *   validator_analyze    { url, timeoutMs? }           -> BrowserResult-shaped payload (fresh context)
+ *   validator_dom_xss    { url, timeoutMs? }           -> { sinks, sources } (fresh context)
  *   close                {}                            -> { ok: true }  (exits process)
  *
  * evaluate runs the expression inside the Chromium renderer sandbox (via
@@ -333,6 +335,213 @@ async function doGetContent(req) {
   return out;
 }
 
+async function doValidatorAnalyze(req) {
+  if (typeof req.url !== 'string' || !req.url) {
+    throw new Error('validator_analyze requires a string url');
+  }
+  if (!browser) {
+    const executablePath = findChrome();
+    if (!executablePath) {
+      throw new Error('Chrome/Chromium not found. Install with: apt install chromium');
+    }
+    browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+    });
+  }
+
+  // Fresh context per call — victim-goto isolation. Never reuses the
+  // shared `context`/`page` used by agent tool actions above.
+  const timeoutMs = Math.min(Math.max(req.timeoutMs ?? 15_000, 1_000), 60_000);
+  const analysisContext = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    ignoreHTTPSErrors: true,
+  });
+
+  const localConsole = [];
+  const localRequests = [];
+  let localDialogDetected = false;
+  let localDialogMessage;
+  let success = true;
+  let error;
+
+  try {
+    const p = await analysisContext.newPage();
+
+    p.on('dialog', async (d) => {
+      localDialogDetected = true;
+      localDialogMessage = d.message();
+      await d.dismiss().catch(() => {});
+    });
+    p.on('console', (msg) => {
+      const level = msg.type();
+      localConsole.push({
+        level: ['log', 'warn', 'error', 'info'].includes(level) ? level : 'log',
+        text: msg.text(),
+        timestamp: Date.now(),
+      });
+    });
+    p.on('request', (request) => {
+      const reqUrl = request.url();
+      const tokenPatterns = /[?&](token|key|secret|api_key|access_token|auth|session)=/i;
+      localRequests.push({
+        url: reqUrl,
+        method: request.method(),
+        referrer: request.headers()['referer'] ?? '',
+        leaksTokens: tokenPatterns.test(reqUrl),
+      });
+    });
+
+    try {
+      await p.goto(req.url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    } catch (navErr) {
+      success = false;
+      error = navErr instanceof Error ? navErr.message : String(navErr);
+    }
+
+    await p.waitForTimeout(2000);
+
+    const finalUrl = p.url();
+    const title = await p.title().catch(() => '');
+    const pageSource = (await p.content().catch(() => '')).substring(0, MAX_PAGE_CONTENT);
+
+    let screenshotBase64;
+    try {
+      const buffer = await p.screenshot({ type: 'png', fullPage: false });
+      screenshotBase64 = buffer.toString('base64');
+    } catch {
+      // Non-critical
+    }
+
+    const domAnalysis = await p.evaluate(() => {
+      const html = document.documentElement.outerHTML;
+      const scripts = Array.from(document.querySelectorAll('script'));
+      const allText = scripts.map(s => s.textContent ?? '').join('\n') + '\n' + html;
+      const forms = Array.from(document.querySelectorAll('form'));
+      const formsWithoutCsrf = forms.filter(form => {
+        const formHtml = form.outerHTML.toLowerCase();
+        return !formHtml.includes('csrf')
+          && !formHtml.includes('_token')
+          && !formHtml.includes('authenticity_token');
+      }).length;
+      return {
+        innerHtmlUsage: (allText.match(/\.innerHTML\s*=/g) ?? []).length,
+        evalUsage: (allText.match(/eval\s*\(/g) ?? []).length,
+        postMessageHandlers: (allText.match(/addEventListener\s*\(\s*['"]message['"]/g) ?? []).length,
+        locationReferences: (allText.match(/document\.location|window\.location/g) ?? []).length,
+        formsWithoutCsrf,
+        inlineEventHandlers: (html.match(/\son\w+\s*=/g) ?? []).length,
+      };
+    }).catch(() => ({
+      innerHtmlUsage: 0, evalUsage: 0, postMessageHandlers: 0,
+      locationReferences: 0, formsWithoutCsrf: 0, inlineEventHandlers: 0,
+    }));
+
+    const rawCookies = await analysisContext.cookies().catch(() => []);
+    const cookies = rawCookies.map(c => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      secure: c.secure,
+      httpOnly: c.httpOnly,
+      sameSite: c.sameSite,
+    }));
+
+    return {
+      success,
+      finalUrl,
+      title,
+      dialogDetected: localDialogDetected,
+      dialogMessage: localDialogMessage,
+      consoleLogs: localConsole,
+      networkRequests: localRequests,
+      cookies,
+      screenshotBase64,
+      domAnalysis,
+      pageSource,
+      error,
+    };
+  } finally {
+    await analysisContext.close().catch(() => {});
+  }
+}
+
+async function doValidatorDomXss(req) {
+  if (typeof req.url !== 'string' || !req.url) {
+    throw new Error('validator_dom_xss requires a string url');
+  }
+  if (!browser) {
+    const executablePath = findChrome();
+    if (!executablePath) {
+      throw new Error('Chrome/Chromium not found. Install with: apt install chromium');
+    }
+    browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+    });
+  }
+
+  const timeoutMs = Math.min(Math.max(req.timeoutMs ?? 15_000, 1_000), 60_000);
+  const analysisContext = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    ignoreHTTPSErrors: true,
+  });
+
+  try {
+    const p = await analysisContext.newPage();
+    await p.goto(req.url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
+    await p.waitForTimeout(2000);
+
+    const analysis = await p.evaluate(() => {
+      const sinks = [];
+      const sources = [];
+      const scripts = Array.from(document.querySelectorAll('script'));
+      const scriptText = scripts.map(s => s.textContent ?? '').join('\n');
+      const allText = scriptText + '\n' + document.documentElement.outerHTML;
+
+      const sinkPatterns = [
+        [/\.innerHTML\s*=/g, 'innerHTML assignment'],
+        [/\.outerHTML\s*=/g, 'outerHTML assignment'],
+        [/document\.write\s*\(/g, 'document.write()'],
+        [/document\.writeln\s*\(/g, 'document.writeln()'],
+        [/eval\s*\(/g, 'eval()'],
+        [/setTimeout\s*\(\s*['"]/g, 'setTimeout() with string'],
+        [/setInterval\s*\(\s*['"]/g, 'setInterval() with string'],
+        [/new\s+Function\s*\(/g, 'new Function()'],
+        [/\.insertAdjacentHTML\s*\(/g, 'insertAdjacentHTML()'],
+        [/jQuery\s*\(\s*['"]<|\.html\s*\(/g, 'jQuery HTML injection'],
+      ];
+      const sourcePatterns = [
+        [/document\.location/g, 'document.location'],
+        [/document\.URL/g, 'document.URL'],
+        [/document\.referrer/g, 'document.referrer'],
+        [/location\.hash/g, 'location.hash'],
+        [/location\.search/g, 'location.search'],
+        [/location\.href/g, 'location.href'],
+        [/window\.name/g, 'window.name'],
+        [/addEventListener\s*\(\s*['"]message['"]/g, 'postMessage handler'],
+        [/URLSearchParams/g, 'URLSearchParams'],
+      ];
+      for (const [pattern, name] of sinkPatterns) {
+        const matches = allText.match(pattern);
+        if (matches) sinks.push(`${name} (${matches.length}x)`);
+      }
+      for (const [pattern, name] of sourcePatterns) {
+        const matches = allText.match(pattern);
+        if (matches) sources.push(`${name} (${matches.length}x)`);
+      }
+      return { sinks, sources };
+    }).catch(() => ({ sinks: [], sources: [] }));
+
+    return { sinks: analysis.sinks, sources: analysis.sources };
+  } finally {
+    await analysisContext.close().catch(() => {});
+  }
+}
+
 async function handle(request) {
   switch (request.action) {
     case 'navigate':             return doNavigate(request);
@@ -342,6 +551,8 @@ async function handle(request) {
     case 'get_content':          return doGetContent(request);
     case 'start_auth_capture':   return doStartAuthCapture(request);
     case 'finish_auth_capture':  return doFinishAuthCapture();
+    case 'validator_analyze':    return doValidatorAnalyze(request);
+    case 'validator_dom_xss':    return doValidatorDomXss(request);
     case 'close':
       await shutdown();
       return { closed: true };

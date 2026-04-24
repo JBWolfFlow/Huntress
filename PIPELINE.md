@@ -2,9 +2,9 @@
 
 Single source of truth for outstanding work, verified status, and delivery priorities.
 
-- **Last updated:** 2026-04-13
-- **Project score:** 8.2 / 10 — platform infrastructure solid; validator hardening and live-target report calibration remain the two gates to first bounty submission.
-- **Test health:** 2,048 TypeScript tests passing (82 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
+- **Last updated:** 2026-04-23
+- **Project score:** 8.4 / 10 — platform infrastructure solid and validated through the 2026-04-23 live Juice Shop hunt (3 real findings: 1 CRITICAL SSTI, 2 HIGH DOM-XSS; all hit the validator pipeline cleanly). Validator hardening (P0-3) and live-target report calibration (P0-4) remain the two gates to first bounty submission.
+- **Test health:** 2,059 TypeScript tests passing (83 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
 
 ---
 
@@ -29,32 +29,14 @@ Priority levels use a fixed rubric:
 
 ## 2. P0 — Critical (Blocks First Submission)
 
-### P0-1 · Validate Session 25 runtime fixes in a live Juice Shop hunt
-**Files:** `src/core/engine/react_loop.ts`, `src/agents/recon_agent.ts`, `docker/entrypoint.sh`, `docker/tinyproxy.conf`
-**Why:** Fixes #6 (recon `success=true` semantics) and #10 (endpoint observation fan-out) are the foundation for every subsequent specialist task. They are unit-tested but unproven end-to-end. Tinyproxy hardening (#9) likewise needs a real container run.
-**Acceptance:**
-- Recon completes with `success=true` when ≥3 tool calls are made and the loop hits `iteration_limit`.
-- `generateSolverTasks()` dispatches per-endpoint specialist tasks, not just domain-wide tasks.
-- Zero `curl: (7)` failures across the hunt.
-**Estimate:** 30–60 minutes (one hunt).
-
-### P0-2 · End-to-end test AuthWorkerAgent against Juice Shop
-**Files:** `src/agents/auth_worker_agent.ts`, `src/components/AuthWizardModal.tsx`, `scripts/agent_browser.mjs`
-**Why:** The agent, tool schemas, XHR interception, and wizard UI are all landed but have never driven a full login-to-capture flow against a real target.
-**Acceptance:**
-- Auth Wizard Step 2 "RUN AUTOMATED LOGIN" completes without manual intervention on Juice Shop.
-- Captured bearer token and cookies populate Step 3 automatically.
-- Step 3 → hunt init produces a live authenticated session.
-**Estimate:** ~30 minutes (manual).
-
 ### P0-3 · Replace 28 pass-through validators with deterministic checks
 **File:** `src/core/validation/validator.ts`
-**Why:** Of 46 vulnerability types, 28 currently rely on agent self-confidence rather than deterministic verification. This is the single largest source of false-positive risk and the primary obstacle to submitting to real HackerOne programs without reputation damage.
+**Why:** Of 46 vulnerability types, 28 currently rely on agent self-confidence rather than deterministic verification. This is the single largest source of false-positive risk and the primary obstacle to submitting to real HackerOne programs without reputation damage. The 2026-04-23 Juice Shop hunt made this concrete — every finding (iframe-javascript XSS bypass, Pug `{{7*7}}` SSTI on `/api/BasketItems`) hit the validator pipeline cleanly after the binding-error fix, but all four returned `could not be verified` because the current payload shapes don't match real exploit variants.
 **Acceptance:**
 - Each of the 28 types has a concrete verification routine (timing probe, browser state check, state-machine replay, OOB callback, etc.).
 - Unit tests cover at least one positive and one negative case per validator.
 - A pass-through fallback is permitted only where deterministic verification is provably impossible, and is documented inline.
-**Approach:** Ship iteratively. Pick the five highest-frequency types from recent hunts first; add the rest as they surface.
+**Approach:** Ship iteratively. Start with XSS (add iframe-`javascript:` variant, Angular-bypass detection) and SSTI (real `{{7*7}} → 49` probe) — both observed in the 2026-04-23 hunt. Expand from there.
 **Estimate:** 2–3 focused days.
 
 ### P0-4 · Calibrate report quality scorer against real HackerOne triage outcomes
@@ -135,7 +117,11 @@ These items appear repeatedly in legacy planning docs. Confirmed landed in code 
 | #9 | Tinyproxy `PidFile` moved to `/tmp`; TCP startup probe in `entrypoint.sh` | ✅ Session 25 |
 | #10 | Recon emits `category: 'endpoint'` observations capped at 50 (`recon_agent.ts:282-308`) | ✅ Session 25 |
 | — | `browser_fill` action, tool schema, and ReactLoop handler | ✅ Session 25 |
-| — | AuthWorkerAgent, `capture_complete` / `capture_failed` schemas, XHR interception, AuthWizardModal Step 2 | ✅ Session 25 — E2E validation tracked under P0-2 |
+| — | AuthWorkerAgent, `capture_complete` / `capture_failed` schemas, XHR interception, AuthWizardModal Step 2 | ✅ Session 25 |
+| P0-1 | Session 25 runtime fixes validated live — recon success=true on iteration_limit, per-endpoint dispatch, zero `curl: (7)` | ✅ 2026-04-23 Juice Shop hunt |
+| P0-2 | AuthWorkerAgent E2E — wizard auto-opened on 401 `/rest/basket/1`, RUN AUTOMATED LOGIN captured credentials, hunt ran with attached session | ✅ 2026-04-23 Juice Shop hunt |
+| — | Validator IPC — `headless_browser.ts` rewritten over `AgentBrowserClient`; new `validator_analyze` / `validator_dom_xss` actions in `scripts/agent_browser.mjs`; eliminates the "Importing binding name 'default'" crash that had blocked every XSS/DOM-XSS/prototype-pollution validation | ✅ 2026-04-23 (11 new tests) |
+| — | Recon endpoint scope filter — `isUrlInReconScope()` drops URLs whose host is outside the hunt scope before `category:'endpoint'` observations drive specialist dispatch. Regression-covers the W3C DTD noise seen in the first 2026-04-23 hunt. | ✅ 2026-04-23 (11 new tests) |
 
 ---
 
@@ -165,4 +151,4 @@ These are summarized from `CLAUDE.md` for convenience. Any task that touches the
 
 ## 9. Recommended Next Action
 
-Run **P0-1** (Juice Shop hunt) and **P0-2** (AuthWorkerAgent E2E) back-to-back in a single session. They share setup, together they validate all of Session 25, and the findings they produce feed directly into scoping **P0-3** (which 28 validator types matter most) and **P0-4** (real report output to calibrate against).
+Start **P0-3** with the XSS validator. The 2026-04-23 Juice Shop hunt produced two real DOM-XSS findings (iframe-`javascript:` bypass of Angular's default sanitization) and one CRITICAL SSTI (`{{7*7}}` → `49` on `/api/BasketItems`), all of which hit the validator pipeline cleanly but returned `could not be verified` because the current payload shapes are too narrow. That hunt is now the concrete, reproducible calibration case — add the iframe-`javascript:` XSS variant and a real SSTI evaluation probe, re-run the hunt, and findings should flip from "could not be verified" to `CONFIRMED`. P0-4 follows naturally from there (the upgraded validators produce actionable reports worth calibrating against H1 triage outcomes).

@@ -1,62 +1,53 @@
 /**
- * Headless Browser Integration — Playwright Edition
+ * Headless Browser Integration — Node-subprocess edition
  *
- * Full Playwright-based headless browser for deterministic validation of
- * client-side vulnerabilities. Replaces the Chrome CDP implementation with
- * playwright-core (uses system-installed Chromium, no bundled browser).
+ * Previously this module imported `playwright-core` directly. Tauri's WebView
+ * cannot resolve Node-native modules — the static import failed with
+ * "Importing binding name 'default' cannot be resolved by star export entries",
+ * and every XSS/DOM-XSS/prototype-pollution validation blew up at the
+ * `[VALIDATING...]` step.
  *
- * Implements XBOW's "victim-goto" pattern:
- * - Fresh BrowserContext per validation (clean isolation)
- * - Event listeners set BEFORE navigation (dialog, console, request)
- * - Unique marker matching for XSS confirmation
- * - Screenshot + DOM capture for evidence
- * - page.evaluate() for in-page JS sink/source analysis
- * - 2-second post-navigation wait for deferred JS payloads
+ * We now delegate all Playwright work to `scripts/agent_browser.mjs` over the
+ * stdio-JSON IPC shipped with Session 25 (see `AgentBrowserClient` and
+ * `src-tauri/src/agent_browser.rs`). Each `HeadlessBrowser` instance owns one
+ * persistent subprocess for the hunt's lifetime; `navigateAndAnalyze` and
+ * `analyzeDOMXSS` each ask the subprocess for a *fresh* BrowserContext so
+ * XBOW's "victim-goto" isolation is preserved.
+ *
+ * Public API (class name, methods, return shapes) is unchanged so
+ * `src/core/validation/validator.ts` and other call sites keep working.
  */
 
-import { chromium } from 'playwright-core';
-import type { Browser, Page, Dialog, ConsoleMessage, Request } from 'playwright-core';
+import { AgentBrowserClient } from '../engine/agent_browser_client';
 import type { ValidationEvidence } from './validator';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface HeadlessBrowserConfig {
-  /** Path to Chrome/Chromium executable */
+  /** Path to Chrome/Chromium executable (resolved inside the subprocess) */
   chromePath?: string;
   /** Navigation timeout in ms */
   timeout?: number;
-  /** Whether to run in headless mode */
+  /** Whether to run in headless mode (subprocess always runs headless — kept for API compat) */
   headless?: boolean;
-  /** Window size */
+  /** Window size (subprocess uses 1920x1080 — kept for API compat) */
   windowSize?: { width: number; height: number };
-  /** User agent string */
+  /** User agent string (not currently forwarded — kept for API compat) */
   userAgent?: string;
 }
 
 export interface BrowserResult {
-  /** Whether the page loaded successfully */
   success: boolean;
-  /** Final URL after any redirects */
   finalUrl: string;
-  /** Page title */
   title: string;
-  /** Whether an alert/confirm/prompt dialog appeared */
   dialogDetected: boolean;
-  /** Dialog message content if detected */
   dialogMessage?: string;
-  /** Console log entries */
   consoleLogs: ConsoleEntry[];
-  /** Network requests made by the page */
   networkRequests: NetworkRequest[];
-  /** Cookies set by the page */
   cookies: CookieInfo[];
-  /** Screenshot as base64-encoded PNG */
   screenshotBase64?: string;
-  /** DOM analysis results */
   domAnalysis?: DOMAnalysis;
-  /** Raw page HTML */
   pageSource?: string;
-  /** Error message if navigation failed */
   error?: string;
 }
 
@@ -72,7 +63,6 @@ export interface NetworkRequest {
   statusCode?: number;
   contentType?: string;
   referrer?: string;
-  /** Whether this request leaked tokens in URL/headers */
   leaksTokens: boolean;
 }
 
@@ -87,51 +77,21 @@ export interface CookieInfo {
 }
 
 export interface DOMAnalysis {
-  /** Elements using innerHTML */
   innerHtmlUsage: number;
-  /** Elements using eval-like functions */
   evalUsage: number;
-  /** postMessage handlers found */
   postMessageHandlers: number;
-  /** document.location references */
   locationReferences: number;
-  /** Forms without CSRF tokens */
   formsWithoutCsrf: number;
-  /** Inline event handlers */
   inlineEventHandlers: number;
-}
-
-// ─── System Browser Detection ────────────────────────────────────────────────
-
-const SYSTEM_CHROME_PATHS = [
-  '/usr/bin/chromium',
-  '/usr/bin/chromium-browser',
-  '/usr/bin/google-chrome',
-  '/usr/bin/google-chrome-stable',
-  '/snap/bin/chromium',
-  '/usr/bin/brave-browser',
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Chromium.app/Contents/MacOS/Chromium',
-];
-
-async function findSystemChrome(): Promise<string | undefined> {
-  const { fs: bridgeFs } = await import('../tauri_bridge');
-  for (const p of SYSTEM_CHROME_PATHS) {
-    try {
-      await bridgeFs.access(p);
-      return p;
-    } catch {
-      // Path not accessible — try next
-    }
-  }
-  return undefined;
 }
 
 // ─── Headless Browser Controller ─────────────────────────────────────────────
 
+let validatorSessionCounter = 0;
+
 export class HeadlessBrowser {
   private config: Required<Pick<HeadlessBrowserConfig, 'timeout' | 'headless' | 'windowSize'>> & HeadlessBrowserConfig;
-  private browser: Browser | null = null;
+  private client: AgentBrowserClient | null = null;
 
   constructor(config: HeadlessBrowserConfig) {
     this.config = {
@@ -142,166 +102,72 @@ export class HeadlessBrowser {
     };
   }
 
-  /** Get the underlying Playwright browser instance (must call launch() first) */
-  getBrowser(): Browser | null {
-    return this.browser;
+  /** Returns the underlying IPC client once `launch()` has run; null otherwise.
+   *  The accessor is preserved for callers that only need to check
+   *  "has this browser started yet?" — the historical Playwright `Browser`
+   *  handle is no longer exposed. */
+  getBrowser(): AgentBrowserClient | null {
+    return this.client;
   }
 
-  /** Launch the shared browser instance (reused across validations) */
+  /** Lazy-spawn the Node subprocess. Idempotent. */
   async launch(): Promise<void> {
-    if (this.browser) return;
-
-    const executablePath = this.config.chromePath ?? await findSystemChrome();
-    if (!executablePath) {
-      throw new Error(
-        'Chrome/Chromium not found. Install with: apt install chromium\n' +
-        `Searched: ${SYSTEM_CHROME_PATHS.join(', ')}`
-      );
-    }
-
-    this.browser = await chromium.launch({
-      executablePath,
-      headless: this.config.headless,
-      args: [
-        '--no-sandbox',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--disable-extensions',
-      ],
-    });
+    if (this.client) return;
+    const sessionKey = `validator_${Date.now()}_${validatorSessionCounter++}`;
+    this.client = new AgentBrowserClient(sessionKey);
   }
 
-  /** Close the browser instance */
+  /** Terminate the subprocess. Safe to call multiple times. */
   async close(): Promise<void> {
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
-    }
+    if (!this.client) return;
+    const c = this.client;
+    this.client = null;
+    await c.close();
   }
 
   /**
-   * Navigate to a URL in a fresh context and capture everything.
-   * Fresh BrowserContext per call ensures complete isolation.
+   * Navigate to a URL in a fresh BrowserContext (inside the subprocess)
+   * and capture dialog/console/request/cookie/DOM/screenshot evidence.
    */
   async navigateAndAnalyze(url: string): Promise<BrowserResult> {
     await this.launch();
+    const raw = await this.client!.validatorAnalyze(url, this.config.timeout);
 
-    const consoleLogs: ConsoleEntry[] = [];
-    const networkRequests: NetworkRequest[] = [];
-    let dialogDetected = false;
-    let dialogMessage: string | undefined;
-
-    const context = await this.browser!.newContext({
-      viewport: this.config.windowSize,
-      userAgent: this.config.userAgent,
-      ignoreHTTPSErrors: true,
-    });
-
-    try {
-      const page = await context.newPage();
-
-      // ── Set up event listeners BEFORE navigation ──
-
-      // Dialog detection (alert/confirm/prompt)
-      page.on('dialog', async (dialog: Dialog) => {
-        dialogDetected = true;
-        dialogMessage = dialog.message();
-        await dialog.dismiss();
-      });
-
-      // Console capture
-      page.on('console', (msg: ConsoleMessage) => {
-        const level = msg.type();
-        consoleLogs.push({
-          level: (['log', 'warn', 'error', 'info'].includes(level) ? level : 'log') as ConsoleEntry['level'],
-          text: msg.text(),
-          timestamp: Date.now(),
-        });
-      });
-
-      // Network request tracking
-      page.on('request', (request: Request) => {
-        const reqUrl = request.url();
-        const tokenPatterns = /[?&](token|key|secret|api_key|access_token|auth|session)=/i;
-        networkRequests.push({
-          url: reqUrl,
-          method: request.method(),
-          referrer: request.headers()['referer'] ?? '',
-          leaksTokens: tokenPatterns.test(reqUrl),
-        });
-      });
-
-      // ── Navigate ──
-      let success = true;
-      let error: string | undefined;
-      try {
-        await page.goto(url, {
-          waitUntil: 'domcontentloaded',
-          timeout: this.config.timeout,
-        });
-      } catch (navError) {
-        success = false;
-        error = navError instanceof Error ? navError.message : String(navError);
-      }
-
-      // 2-second post-navigation wait for deferred JS payloads
-      await page.waitForTimeout(2000);
-
-      // ── Capture results ──
-      const finalUrl = page.url();
-      const title = await page.title().catch(() => '');
-      const pageSource = await page.content().catch(() => '');
-
-      // Screenshot as base64
-      let screenshotBase64: string | undefined;
-      try {
-        const buffer = await page.screenshot({ type: 'png', fullPage: false });
-        screenshotBase64 = buffer.toString('base64');
-      } catch {
-        // Screenshot failed — non-critical
-      }
-
-      // DOM analysis via page.evaluate()
-      const domAnalysis = await this.analyzeDomInPage(page);
-
-      // Cookies
-      const rawCookies = await context.cookies();
-      const cookies: CookieInfo[] = rawCookies.map(c => ({
+    return {
+      success: raw.success,
+      finalUrl: raw.finalUrl,
+      title: raw.title,
+      dialogDetected: raw.dialogDetected,
+      dialogMessage: raw.dialogMessage,
+      consoleLogs: raw.consoleLogs.map(c => ({
+        level: c.level,
+        text: c.text,
+        timestamp: c.timestamp,
+      })),
+      networkRequests: raw.networkRequests.map(n => ({
+        url: n.url,
+        method: n.method,
+        referrer: n.referrer,
+        leaksTokens: n.leaksTokens,
+      })),
+      cookies: raw.cookies.map(c => ({
         name: c.name,
         value: c.value,
         domain: c.domain,
         path: c.path,
         secure: c.secure,
         httpOnly: c.httpOnly,
-        sameSite: c.sameSite,
-      }));
-
-      return {
-        success,
-        finalUrl,
-        title,
-        dialogDetected,
-        dialogMessage,
-        consoleLogs,
-        networkRequests,
-        cookies,
-        screenshotBase64,
-        domAnalysis,
-        pageSource: pageSource.substring(0, 50_000),
-        error,
-      };
-    } finally {
-      await context.close();
-    }
+        sameSite: c.sameSite ?? '',
+      })),
+      screenshotBase64: raw.screenshotBase64,
+      domAnalysis: raw.domAnalysis,
+      pageSource: raw.pageSource,
+      error: raw.error,
+    };
   }
 
   /**
-   * Validate an XSS finding by navigating to the crafted URL and detecting
-   * JavaScript execution via dialog, console, or OOB beacon.
-   *
-   * @param url The crafted URL with XSS payload
-   * @param marker A unique marker string to match in dialogs/console (e.g., HUNTRESS_XSS_a1b2c3d4)
-   * @param oobChecker Optional function to check if an OOB beacon was received
+   * Validate an XSS finding by navigating and scoring dialog/console/OOB evidence.
    */
   async validateXSS(
     url: string,
@@ -313,7 +179,6 @@ export class HeadlessBrowser {
 
     const result = await this.navigateAndAnalyze(url);
 
-    // Check for dialog with exact marker match
     if (result.dialogDetected && result.dialogMessage?.includes(marker)) {
       confidence += 50;
       evidence.push({
@@ -324,7 +189,6 @@ export class HeadlessBrowser {
       });
     }
 
-    // Check console for marker
     const markerInConsole = result.consoleLogs.some(l => l.text.includes(marker));
     if (markerInConsole) {
       confidence += 30;
@@ -337,7 +201,6 @@ export class HeadlessBrowser {
       });
     }
 
-    // Check OOB beacon
     if (oobChecker?.()) {
       confidence += 40;
       evidence.push({
@@ -348,7 +211,6 @@ export class HeadlessBrowser {
       });
     }
 
-    // Add screenshot evidence
     if (result.screenshotBase64) {
       evidence.push({
         type: 'screenshot',
@@ -366,24 +228,18 @@ export class HeadlessBrowser {
   }
 
   /**
-   * Validate stored XSS by navigating to the rendering page (victim context).
-   *
-   * @param renderUrl The URL where the stored payload renders (not the injection URL)
-   * @param marker The unique marker injected during the attack phase
-   * @param oobChecker Optional OOB callback checker
+   * Validate stored XSS by navigating to the rendering (victim) page.
    */
   async validateStoredXSS(
     renderUrl: string,
     marker: string,
     oobChecker?: () => boolean,
   ): Promise<{ confirmed: boolean; confidence: number; evidence: ValidationEvidence[] }> {
-    // Stored XSS uses the same detection logic but navigates to the *rendering* page
     return this.validateXSS(renderUrl, marker, oobChecker);
   }
 
   /**
-   * Analyze a page for DOM-based XSS sinks and sources using page.evaluate().
-   * Runs inside the live page context for accurate detection.
+   * Sink/source scan for DOM-XSS. Uses a fresh subprocess context.
    */
   async analyzeDOMXSS(url: string): Promise<{
     sinks: string[];
@@ -392,130 +248,26 @@ export class HeadlessBrowser {
     evidence: ValidationEvidence[];
   }> {
     await this.launch();
+    const raw = await this.client!.validatorDomXss(url, this.config.timeout);
 
-    const context = await this.browser!.newContext({
-      viewport: this.config.windowSize,
-      ignoreHTTPSErrors: true,
-    });
+    const hasDangerousFlow = raw.sinks.length > 0 && raw.sources.length > 0;
+    const evidence: ValidationEvidence[] = [];
 
-    try {
-      const page = await context.newPage();
-
-      await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.config.timeout,
-      }).catch(() => {});
-
-      await page.waitForTimeout(2000);
-
-      // Run sink/source analysis inside the live page
-      const analysis = await page.evaluate(() => {
-        const sinks: string[] = [];
-        const sources: string[] = [];
-
-        // Grab all script text content
-        const scripts = Array.from(document.querySelectorAll('script'));
-        const scriptText = scripts.map(s => s.textContent ?? '').join('\n');
-        const allText = scriptText + '\n' + document.documentElement.outerHTML;
-
-        // Sinks
-        const sinkPatterns: Array<[RegExp, string]> = [
-          [/\.innerHTML\s*=/g, 'innerHTML assignment'],
-          [/\.outerHTML\s*=/g, 'outerHTML assignment'],
-          [/document\.write\s*\(/g, 'document.write()'],
-          [/document\.writeln\s*\(/g, 'document.writeln()'],
-          [/eval\s*\(/g, 'eval()'],
-          [/setTimeout\s*\(\s*['"]/g, 'setTimeout() with string'],
-          [/setInterval\s*\(\s*['"]/g, 'setInterval() with string'],
-          [/new\s+Function\s*\(/g, 'new Function()'],
-          [/\.insertAdjacentHTML\s*\(/g, 'insertAdjacentHTML()'],
-          [/jQuery\s*\(\s*['"]<|\.html\s*\(/g, 'jQuery HTML injection'],
-        ];
-
-        // Sources
-        const sourcePatterns: Array<[RegExp, string]> = [
-          [/document\.location/g, 'document.location'],
-          [/document\.URL/g, 'document.URL'],
-          [/document\.referrer/g, 'document.referrer'],
-          [/location\.hash/g, 'location.hash'],
-          [/location\.search/g, 'location.search'],
-          [/location\.href/g, 'location.href'],
-          [/window\.name/g, 'window.name'],
-          [/addEventListener\s*\(\s*['"]message['"]/g, 'postMessage handler'],
-          [/URLSearchParams/g, 'URLSearchParams'],
-        ];
-
-        for (const [pattern, name] of sinkPatterns) {
-          const matches = allText.match(pattern);
-          if (matches) sinks.push(`${name} (${matches.length}x)`);
-        }
-
-        for (const [pattern, name] of sourcePatterns) {
-          const matches = allText.match(pattern);
-          if (matches) sources.push(`${name} (${matches.length}x)`);
-        }
-
-        return { sinks, sources };
+    if (raw.sinks.length > 0 || raw.sources.length > 0) {
+      evidence.push({
+        type: 'script_output',
+        description: 'DOM XSS sink/source analysis (live page)',
+        data: `Sinks: ${raw.sinks.join(', ') || 'none'}\nSources: ${raw.sources.join(', ') || 'none'}\nDangerous source→sink flow: ${hasDangerousFlow ? 'YES' : 'no'}`,
+        timestamp: Date.now(),
       });
-
-      const hasDangerousFlow = analysis.sinks.length > 0 && analysis.sources.length > 0;
-      const evidence: ValidationEvidence[] = [];
-
-      if (analysis.sinks.length > 0 || analysis.sources.length > 0) {
-        evidence.push({
-          type: 'script_output',
-          description: 'DOM XSS sink/source analysis (live page)',
-          data: `Sinks: ${analysis.sinks.join(', ') || 'none'}\nSources: ${analysis.sources.join(', ') || 'none'}\nDangerous source→sink flow: ${hasDangerousFlow ? 'YES' : 'no'}`,
-          timestamp: Date.now(),
-        });
-      }
-
-      return {
-        sinks: analysis.sinks,
-        sources: analysis.sources,
-        hasDangerousFlow,
-        evidence,
-      };
-    } finally {
-      await context.close();
     }
-  }
 
-  /** Run DOM analysis inside a live page via page.evaluate() */
-  private async analyzeDomInPage(page: Page): Promise<DOMAnalysis> {
-    try {
-      return await page.evaluate(() => {
-        const html = document.documentElement.outerHTML;
-        const scripts = Array.from(document.querySelectorAll('script'));
-        const allText = scripts.map(s => s.textContent ?? '').join('\n') + '\n' + html;
-
-        const forms = Array.from(document.querySelectorAll('form'));
-        const formsWithoutCsrf = forms.filter(form => {
-          const formHtml = form.outerHTML.toLowerCase();
-          return !formHtml.includes('csrf') &&
-                 !formHtml.includes('_token') &&
-                 !formHtml.includes('authenticity_token');
-        }).length;
-
-        return {
-          innerHtmlUsage: (allText.match(/\.innerHTML\s*=/g) ?? []).length,
-          evalUsage: (allText.match(/eval\s*\(/g) ?? []).length,
-          postMessageHandlers: (allText.match(/addEventListener\s*\(\s*['"]message['"]/g) ?? []).length,
-          locationReferences: (allText.match(/document\.location|window\.location/g) ?? []).length,
-          formsWithoutCsrf,
-          inlineEventHandlers: (html.match(/\son\w+\s*=/g) ?? []).length,
-        };
-      });
-    } catch {
-      return {
-        innerHtmlUsage: 0,
-        evalUsage: 0,
-        postMessageHandlers: 0,
-        locationReferences: 0,
-        formsWithoutCsrf: 0,
-        inlineEventHandlers: 0,
-      };
-    }
+    return {
+      sinks: raw.sinks,
+      sources: raw.sources,
+      hasDangerousFlow,
+      evidence,
+    };
   }
 }
 

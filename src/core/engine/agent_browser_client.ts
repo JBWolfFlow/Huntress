@@ -69,6 +69,50 @@ export interface GetContentResult {
   cookies?: BrowserCookie[];
 }
 
+// ─── Validator-specific shapes (fresh-context analysis) ─────────────────────
+
+export interface ValidatorConsoleEntry {
+  level: 'log' | 'warn' | 'error' | 'info';
+  text: string;
+  timestamp: number;
+}
+
+export interface ValidatorNetworkRequest {
+  url: string;
+  method: string;
+  referrer: string;
+  leaksTokens: boolean;
+}
+
+export interface ValidatorDomAnalysis {
+  innerHtmlUsage: number;
+  evalUsage: number;
+  postMessageHandlers: number;
+  locationReferences: number;
+  formsWithoutCsrf: number;
+  inlineEventHandlers: number;
+}
+
+export interface ValidatorAnalyzeResult {
+  success: boolean;
+  finalUrl: string;
+  title: string;
+  dialogDetected: boolean;
+  dialogMessage?: string;
+  consoleLogs: ValidatorConsoleEntry[];
+  networkRequests: ValidatorNetworkRequest[];
+  cookies: BrowserCookie[];
+  screenshotBase64?: string;
+  domAnalysis: ValidatorDomAnalysis;
+  pageSource: string;
+  error?: string;
+}
+
+export interface ValidatorDomXssResult {
+  sinks: string[];
+  sources: string[];
+}
+
 interface RawResponse<T> {
   id: string | null;
   ok: boolean;
@@ -154,6 +198,16 @@ export class AgentBrowserClient {
 
   async getContent(includeCookies?: boolean): Promise<GetContentResult> {
     return this.send<GetContentResult>('get_content', { includeCookies });
+  }
+
+  /** Fresh-context navigate + dialog/console/request/DOM capture for finding validation. */
+  async validatorAnalyze(url: string, timeoutMs?: number): Promise<ValidatorAnalyzeResult> {
+    return this.send<ValidatorAnalyzeResult>('validator_analyze', { url, timeoutMs });
+  }
+
+  /** Fresh-context sink/source scan for DOM-XSS validation. */
+  async validatorDomXss(url: string, timeoutMs?: number): Promise<ValidatorDomXssResult> {
+    return this.send<ValidatorDomXssResult>('validator_dom_xss', { url, timeoutMs });
   }
 
   /** Terminate the subprocess. Safe to call multiple times. */

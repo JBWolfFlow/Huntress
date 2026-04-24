@@ -135,6 +135,52 @@ Result: Node.js, Express, GraphQL, Apollo Server
 Tool call: request_specialist { agent_type: "graphql_hunter", target: "api.[redacted].com/graphql", context: "Apollo GraphQL with playground exposed, no WAF", priority: "high" }
 Tool call: request_specialist { agent_type: "idor_hunter", target: "staging.[redacted].com", context: "Staging env with no auth — likely has test data and relaxed access controls", priority: "high" }`;
 
+/**
+ * Check if a URL's host falls within any of the provided recon scope entries.
+ * Matching is subdomain-friendly: a bare entry `example.com` accepts
+ * `example.com`, `api.example.com`, `staging.api.example.com`, etc. This
+ * matches the recon intent — recon discovers subdomains of the target and
+ * hands them off to specialists, so limiting to exact hostname match would
+ * kill subdomain enumeration. Wildcard entries (`*.example.com`) are
+ * equivalent to their bare form under this semantics.
+ *
+ * Exported for unit testing. Used to drop out-of-scope URLs harvested from
+ * HTML (e.g. W3C DTD references like `www.w3.org/TR/...`) before they drive
+ * specialist dispatch.
+ */
+export function isUrlInReconScope(url: string, scope: readonly string[]): boolean {
+  let urlHost: string;
+  try {
+    urlHost = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!urlHost) return false;
+
+  for (const raw of scope) {
+    const entry = raw.trim();
+    if (!entry) continue;
+
+    const isWildcard = entry.startsWith('*.');
+    let scopeHost: string;
+    if (isWildcard) {
+      scopeHost = entry.slice(2).toLowerCase();
+    } else {
+      try {
+        scopeHost = new URL(
+          entry.startsWith('http') ? entry : `https://${entry}`
+        ).hostname.toLowerCase();
+      } catch {
+        scopeHost = entry.split(':')[0].toLowerCase();
+      }
+    }
+    if (!scopeHost) continue;
+
+    if (urlHost === scopeHost || urlHost.endsWith(`.${scopeHost}`)) return true;
+  }
+  return false;
+}
+
 export class ReconAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {
     id: 'recon',
@@ -284,6 +330,12 @@ export class ReconAgent implements BaseAgent {
       // and fan out per-endpoint specialist tasks (xss/sqli/ssrf/ssti), not
       // just broad domain tasks. Source URLs from HTTP exchanges the loop
       // made + any URLs surfaced in tool-call stdout (subfinder/httpx/katana).
+      //
+      // Scope filter (2026-04-23): the 2026-04-23 Juice Shop hunt harvested
+      // `http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd` — an HTML DTD
+      // reference — as an endpoint and dispatched SSTI/XSS specialists
+      // against it. Drop anything whose host isn't in the hunt's scope
+      // before it drives dispatch.
       const urlRegex = /https?:\/\/[^\s"'<>)]+/g;
       const discoveredUrls = new Set<string>();
       for (const ex of result.httpExchanges) {
@@ -299,8 +351,9 @@ export class ReconAgent implements BaseAgent {
         const matches = scanText.match(urlRegex);
         if (matches) for (const u of matches) discoveredUrls.add(u);
       }
+      const inScopeUrls = [...discoveredUrls].filter(u => isUrlInReconScope(u, task.scope));
       // Cap at 50 to avoid blackboard blowup on large recons.
-      const endpointObservations = [...discoveredUrls].slice(0, 50).map(url => ({
+      const endpointObservations = inScopeUrls.slice(0, 50).map(url => ({
         category: 'endpoint' as const,
         detail: url,
         relevantTo: undefined,
