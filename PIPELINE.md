@@ -3,8 +3,8 @@
 Single source of truth for outstanding work, verified status, and delivery priorities.
 
 - **Last updated:** 2026-04-23
-- **Project score:** 8.4 / 10 — platform infrastructure solid and validated through the 2026-04-23 live Juice Shop hunt (3 real findings: 1 CRITICAL SSTI, 2 HIGH DOM-XSS; all hit the validator pipeline cleanly). Validator hardening (P0-3) and live-target report calibration (P0-4) remain the two gates to first bounty submission.
-- **Test health:** 2,059 TypeScript tests passing (83 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
+- **Project score:** 8.4 / 10 — platform infrastructure solid and validated through the 2026-04-23 live Juice Shop hunt (3 real findings: 1 CRITICAL SSTI, 2 HIGH DOM-XSS; all hit the validator pipeline cleanly). Validator hardening (P0-3, in progress) and live-target report calibration (P0-4) remain the two gates to first bounty submission.
+- **Test health:** 2,070 TypeScript tests passing (84 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
 
 ---
 
@@ -29,15 +29,20 @@ Priority levels use a fixed rubric:
 
 ## 2. P0 — Critical (Blocks First Submission)
 
-### P0-3 · Replace 28 pass-through validators with deterministic checks
+### P0-3 · Replace 28 pass-through validators with deterministic checks (in progress)
 **File:** `src/core/validation/validator.ts`
 **Why:** Of 46 vulnerability types, 28 currently rely on agent self-confidence rather than deterministic verification. This is the single largest source of false-positive risk and the primary obstacle to submitting to real HackerOne programs without reputation damage. The 2026-04-23 Juice Shop hunt made this concrete — every finding (iframe-javascript XSS bypass, Pug `{{7*7}}` SSTI on `/api/BasketItems`) hit the validator pipeline cleanly after the binding-error fix, but all four returned `could not be verified` because the current payload shapes don't match real exploit variants.
+
+**Status:**
+- ✅ **XSS multi-payload sweep** (2026-04-23). `xss_reflected` and `xss_dom` now loop through `script-tag`, `iframe-javascript` (Angular-bypass), `svg-onload`, and `img-onerror` variants via `buildXssPayloadVariants()`. First to fire the marker via dialog/console/OOB wins; evidence from every attempt is aggregated. 11 new tests. Next live hunt against Juice Shop should flip the two DOM-XSS findings from `could not be verified` to `CONFIRMED`.
+- ⏳ **SSTI POST-body + auth** (next). Current SSTI validator is GET-only and has no auth context, so Pug SSTI on auth-gated POST `/api/BasketItems` cannot be confirmed. Needs body-param injection + auth session pass-through via `ValidatorConfig`.
+- ⏳ **Remaining ~25 types** — iterate by frequency observed in live hunts.
+
 **Acceptance:**
 - Each of the 28 types has a concrete verification routine (timing probe, browser state check, state-machine replay, OOB callback, etc.).
 - Unit tests cover at least one positive and one negative case per validator.
 - A pass-through fallback is permitted only where deterministic verification is provably impossible, and is documented inline.
-**Approach:** Ship iteratively. Start with XSS (add iframe-`javascript:` variant, Angular-bypass detection) and SSTI (real `{{7*7}} → 49` probe) — both observed in the 2026-04-23 hunt. Expand from there.
-**Estimate:** 2–3 focused days.
+**Estimate:** 2–3 focused days (XSS increment shipped).
 
 ### P0-4 · Calibrate report quality scorer against real HackerOne triage outcomes
 **File:** `src/core/reporting/report_quality.ts`

