@@ -10,6 +10,11 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import type { H1Report } from '../core/reporting/h1_api';
 import type { DuplicateScore } from '../utils/duplicate_checker';
+import {
+  computeReportChecklist,
+  computeChecklistScore,
+  computeSubmissionGate,
+} from './report_submission_gate';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -124,45 +129,16 @@ export const ReportReviewModal: React.FC<ReportReviewModalProps> = ({
 
   const severity = SEVERITY_STYLES[report.severity] ?? SEVERITY_STYLES.medium;
 
-  // Compute checklist items
-  const checklist = useMemo(() => ({
-    hasDescription: (report.description?.length ?? 0) > 50,
-    hasImpact: (report.impact?.length ?? 0) > 20,
-    hasSteps: (report.steps?.length ?? 0) >= 3,
-    hasSeverity: Boolean(report.severity),
-    hasCvss: Boolean(report.cvssScore),
-    hasCwe: Boolean(report.weaknessId),
-    hasEvidence: Boolean(
-      report.proof?.screenshots?.length ||
-      report.proof?.video ||
-      report.proof?.logs?.length
-    ),
-    hasSeverityJustification: Boolean(report.severityJustification?.length),
-  }), [report]);
-
-  const checklistScore = useMemo(() => {
-    const checks = Object.values(checklist);
-    return Math.round((checks.filter(Boolean).length / checks.length) * 100);
-  }, [checklist]);
-
-  // Determine if submission is blocked
-  const isBlocked = useMemo(() => {
-    // Block if duplicate score is "skip"
-    if (duplicateScore?.recommendation === 'skip') return true;
-    // Block if quality grade is F
-    if (qualityScore?.grade === 'F') return true;
-    // Block if missing critical fields
-    if (!checklist.hasDescription || !checklist.hasSteps) return true;
-    return false;
-  }, [duplicateScore, qualityScore, checklist]);
-
-  const blockReason = useMemo(() => {
-    if (duplicateScore?.recommendation === 'skip') return 'High duplicate probability detected. Review and update before submitting.';
-    if (qualityScore?.grade === 'F') return 'Report quality is too low for submission. Edit the report to improve clarity and completeness.';
-    if (!checklist.hasDescription) return 'Report is missing a description.';
-    if (!checklist.hasSteps) return 'Report needs at least 3 reproduction steps.';
-    return null;
-  }, [duplicateScore, qualityScore, checklist]);
+  // Checklist + submission-gate logic lives in `report_submission_gate.ts`
+  // so it can be unit-tested without DOM or React Testing Library.
+  const checklist = useMemo(() => computeReportChecklist(report), [report]);
+  const checklistScore = useMemo(() => computeChecklistScore(checklist), [checklist]);
+  const gate = useMemo(
+    () => computeSubmissionGate(report, duplicateScore, qualityScore),
+    [report, duplicateScore, qualityScore],
+  );
+  const isBlocked = gate.blocked;
+  const blockReason = gate.reason;
 
   const handleSubmit = useCallback(async () => {
     if (!confirmChecked || isBlocked) return;

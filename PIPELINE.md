@@ -2,9 +2,9 @@
 
 Single source of truth for outstanding work, verified status, and delivery priorities.
 
-- **Last updated:** 2026-04-23
-- **Project score:** 8.8 / 10 — platform infrastructure solid, validator hardening substantially complete, scope narrowing shipped, economy mode shipped. All high-frequency vulnerability types (XSS, SSTI, SQLi, SSRF, IDOR/BOLA, XXE, command injection, path traversal, host header injection) have deterministic checks with false-positive controls; most have active OOB-callback or two-identity differential proof paths. Live-target report calibration (P0-4) and the two remaining real-H1 UX items (auth-detector fallback, submit-flow dry run) are the final gates before first submission.
-- **Test health:** 2,146 TypeScript tests passing (89 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
+- **Last updated:** 2026-04-24
+- **Project score:** 8.9 / 10 — all four real-H1 UX blockers shipped (scope narrowing, economy mode, auth-detector fallback, submit-flow dry run). Validator hardening substantially complete; live-target report calibration (P0-4) is the only remaining gate before first submission.
+- **Test health:** 2,163 TypeScript tests passing (90 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
 
 ---
 
@@ -75,7 +75,7 @@ Four concrete items surfaced when the user attempted a live Superhuman hunt on 2
 - ✅ **Scope narrowing (P1-0-a)** — `BountyImporter` gained a toggleable "Narrow scope" section (off by default). When on, the user picks a subset of in-scope targets via checkboxes (with select-all/none helpers); `applyScopeNarrowing()` filters before handing off to the hunt. Unblocks programs like Superhuman where the full scope (30+ assets across `*.grammarly.com`, `*.coda.io`, `*.superhuman.com`) would fan specialists across everything and exhaust any reasonable budget. 7 tests.
 - ✅ **Economy mode (P1-0-b)** — New cohesive config module at `src/core/orchestrator/economy_mode.ts`: `EconomyModeConfig` interface + frozen `ECONOMY_MODE_OFF` / `ECONOMY_MODE_ON` constants + `resolveEconomyMode(enabled)` + `selectSolverAgents(catalog, skipped, cap)` + `specialistYieldRank(id)`. When the user flips the toggle in Settings → Advanced → Hunt Behavior: `maxConcurrentAgents` drops 5 → 2, specialist fan-out per recon is capped at 3 (prioritized by yield rank — sqli/xss/idor first), and per-agent budget claim widens 0.2 → 0.5 so the slower serialized hunt still completes. Frozen-object contract so callers can't mutate defaults; test-first with 21 unit tests (resolver, rank ordering, selection + skip + cap + empty-pool edge cases, no-mutation invariant, strict-more-conservative cross-config invariant). Default off — local test hunts see no change.
 - ✅ **Auth-detector login-URL fallback (P1-0-c)** — `AuthDetector.buildProfileForType` no longer falls through to `baseUrl` for the cookie flow. When no login path was confidently detected, `profile.url` stays `undefined` and the instruction block changes from "Navigate to the login page: <random-in-scope-host>" to "Enter the login page URL below — Huntress could not auto-detect one." `AuthWizardModal.handleRunCapture` and `handleRunAuthWorker` were also tightened to require an explicit `authUrl` before starting automated login or browser capture — the silent `authUrl || scope.inScope[0]` fallback (which landed the user at `codacontent.io` on the 2026-04-23 Superhuman run) is gone. 3 new tests covering confident detection, no-confident-URL (the Superhuman regression case), and the bearer/api_key profile invariant (those legitimately keep baseUrl — only cookie got the stricter policy).
-- ⏳ **P1-0-d · Submit-flow dry run** — `HackerOneAPI.submitReport()` + `ReportReviewModal` "Approve & Submit" + `HuntSessionContext.submitToH1()` are wired end-to-end but have never been exercised against a real H1 endpoint. Pre-flight with a mocked `HackerOneAPI` that verifies the payload shape and confirm-checkbox gating. Actual live submission can wait until there's a confirmed finding to submit. ~30 min.
+- ✅ **Submit-flow dry run (P1-0-d)** — Submission gate extracted as a pure helper (`src/components/report_submission_gate.ts`) with `computeReportChecklist`, `computeChecklistScore`, and `computeSubmissionGate`. `ReportReviewModal` refactored to consume them. Axios-mocked test suite (`h1_submit_dryrun.test.ts`) pins the `/reports` POST payload shape (JSON:API envelope with `type: 'report'`, `severity_rating`, `weakness_id`, `relationships.program.data.attributes.handle`), the Basic-Auth construction from `{username, apiToken}`, the `vulnerability_information` markdown (numbered steps, description, impact), and the `SubmissionResult` shape on both success and retry-exhausted error paths. Gate tests pin the block order (duplicate-skip → quality-F → missing description → insufficient steps) and confirm the happy path lets a minimal-but-valid report through. 17 new tests.
 
 ### P1-1 · Verify generic token refresh against a non-Telegram OAuth2 target
 **Files:** `src/core/auth/token_refresher.ts`, `src/core/engine/react_loop.ts` (authenticatedRequest)
@@ -176,4 +176,11 @@ These are summarized from `CLAUDE.md` for convenience. Any task that touches the
 
 ## 9. Recommended Next Action
 
-Re-run the 2026-04-23 Juice Shop hunt to confirm the three previously "could not be verified" findings (2 DOM-XSS, 1 SSTI) now flip to `CONFIRMED` with the hardened validators. That same run exercises the full auth pass-through path, the active OOB injection paths (SSRF + command_injection + blind XXE), and the two-identity differential (if both the attacker and victim login are captured). Successful confirmation is the green light to start **P0-4** — calibrate the report quality scorer against real H1 triage outcomes, since the reports it's now scoring will contain deterministic exploit evidence rather than agent self-confidence.
+All four real-H1-hunt UX blockers are now shipped. The next action is the first live HackerOne submission itself — the machinery is in place end-to-end:
+
+  1. Pick a program with a small scope OR use **Narrow scope** (P1-0-a) in `BountyImporter` to pick one asset.
+  2. Toggle **Economy mode** (P1-0-b) in Settings → Advanced → Hunt Behavior.
+  3. Run the hunt. When a finding lands, `ReportReviewModal` enforces the submission gate (P1-0-d) before the Approve & Submit button unlocks.
+  4. First real submission produces the triage data that P0-4 needs (report quality scorer calibration).
+
+Before the first *real* program, a dry-run of the XSS+SSTI hardening against Juice Shop is still worth doing — confirm the 2026-04-23 findings flip to `CONFIRMED` with the hardened validators — but it's verification, not a blocker.
