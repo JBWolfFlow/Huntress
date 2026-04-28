@@ -3,8 +3,9 @@
 Single source of truth for outstanding work, verified status, and delivery priorities.
 
 - **Last updated:** 2026-04-24
-- **Project score:** 8.9 / 10 — all four real-H1 UX blockers shipped (scope narrowing, economy mode, auth-detector fallback, submit-flow dry run); P1-2 recon-pipeline tool inventory enforced via single-source-of-truth + invariant tests + Docker smoke script. Validator hardening substantially complete; live-target report calibration (P0-4) is the only remaining gate before first submission.
+- **Project score:** 8.9 / 10 — all four real-H1 UX blockers shipped (scope narrowing, economy mode, auth-detector fallback, submit-flow dry run); P1-2 recon-pipeline tool inventory enforced via single-source-of-truth + invariant tests + Docker smoke script; P1-3 PentAGI adoption roadmap drafted (12 items mapped to current blockers).
 - **Test health:** 2,172 TypeScript tests passing (91 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
+- **External research:** PentAGI deep-dive at `docs/research/PENTAGI_DEEP_DIVE.md` — informs P1-3 adoption order.
 
 ---
 
@@ -94,6 +95,28 @@ Four concrete items surfaced when the user attempted a live Superhuman hunt on 2
 - **Image-side smoke test** — `scripts/verify_attack_tools.sh` runs each inventoried tool's probe inside the built `huntress-attack-machine:latest` container; fails on any missing or unrunnable binary. Run after every Dockerfile change.
 
 Recon agent prompt cleaned up — the methodology header used to claim it would do JS analysis with `getJS`/`jsluice` and screenshots with `gowitness`; now it correctly states `katana -jc` covers JS endpoint extraction and the validator's Playwright handles screenshots. `jsluice` added to the explicit "do NOT attempt" list. 9 tests.
+
+### P1-3 · Adopt high-leverage patterns from PentAGI
+Cross-reference with [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi) (15.9k-star Go pentest platform) surfaced concrete patterns that solve problems we are still struggling with. Full deep dive at `docs/research/PENTAGI_DEEP_DIVE.md`. Adoption order chosen to unblock real-H1 readiness in dependency order.
+
+| ID | Item | Effort | Unblocks |
+|---|---|---|---|
+| P1-3-a | **3-identical-toolcall hard guardrail** — single line in every specialist system prompt + ReactLoop enforcement after 3 consecutive identical `(toolName, argsHash)` calls | ~2 hours | The 2026-04-23 SSTI 90-tool-call burn pattern; cheapest first-line defense |
+| P1-3-b | **Per-agent-type tool-call cap** — `maxToolCallsPerAgent` config in ReactLoop; counts tool calls (not LLM iterations); hard-stops at limit | ~2 hours | Same as P1-3-a, second line |
+| P1-3-c | **Adviser execution-monitor sub-agent** — wakes on no-progress patterns (>5 identical calls OR >10 total without finding); receives recent messages + tool call history; answers six diagnostic questions; output guides next agent step | ~1 day | Smart fallback when P1-3-a/b aren't enough; pentagi's signature pattern |
+| P1-3-d | **Chain summarizer** (port of `pkg/csum/chain_summary.go`) — multi-strategy summarization with byte budgets (50KB last, 16KB pair, 64KB QA, 25% reserve); preserves tool-call/response pairs as atomic units | ~1 day | Long real-program hunts (>1hr) without context degradation |
+| P1-3-e | **Sploitus exploit-DB tool** — agent-callable tool that hits `https://sploitus.com/search` for exploits + tools matching a query; returns CVSS, source previews, CVE refs | ~½ day | Direct boost to P0-4 (real CVE references in PoC reports = triage-friendly evidence) |
+| P1-3-f | **Reporter "Independent Judgment" reviewer agent** — second-pass agent (Sonnet) that reads the validator's confirmation evidence, ignores the `confirmed` claim, forms own conclusion (upgrade/downgrade/flag-for-review). Synthetic accept/reject signal | ~1 day | P0-4 enabler — gives us a calibration signal **before** live H1 triage data accumulates |
+| P1-3-g | **DB-persisted Flow / Task / Subtask state** — Tauri SQLite store; orchestrator writes state transitions; restart resumes from last checkpoint | ~2-3 days | Required before any real-program hunt >30 minutes (we currently lose all state on crash) |
+| P1-3-h | **Prompt template validator + typed variable registry** — build-time check that every prompt template's `${var}` references resolve against a typed registry; CI blocks on unauthorized var | ~1 day | Defensive eng — catches the class of bugs that landed users at `codacontent.io` (P1-0-c regression) before they ship |
+| P1-3-i | **Authorization-status preamble** — shared `AUTHORIZATION_PREAMBLE` constant prepended to every specialist system prompt; tells agents the engagement is pre-authorized so they stop hedging | ~2 hours | Small ergonomic win; reduces agent-hesitation cycles on aggressive payloads. Must NOT leak into report-render layer (audience there needs responsible-disclosure framing) |
+| P1-3-j | **Toolcall_fixer side-channel** — when an agent emits malformed JSON for a tool call, route to a sub-LLM with original args + error + schema; receive corrected JSON; retry. Silent self-healing | ~1 day | Reduces Haiku-tier malformed-JSON failures; quality-of-life |
+| P1-3-k | **Detach modes for long-running commands** — `detach: boolean` field in `execute_command`; PTY layer fire-and-forgets daemons (returns "started in background" after 500ms); batch commands wait | ~1 day | Daemon/listener-based PoCs (reverse shells, http server for SSRF callbacks) without blocking the agent |
+| P1-3-l | **Refiner / failure categorization** — when an agent fails, categorize as Technical / Environmental / Conceptual / External; pivot strategy for Conceptual; retry-with-tweaks for Technical | ~1 day | Smarter retries vs. blind redispatch |
+
+**Recommended sequence:** P1-3-a → P1-3-b → P1-3-c → P1-3-d → P1-3-e → P1-3-f are the P0-adjacent set (~4 focused days, all unblock real-H1 readiness). P1-3-g is the next gate (long-hunt reliability). Items P1-3-h through P1-3-l are quality-of-life.
+
+**Explicitly NOT adopting:** pentagi's multi-LLM provider abstraction (violates Huntress CLAUDE.md "Anthropic only"), web-app deployment (we are desktop-by-design), generic-pentest agent fleet (our 27 specialists are sharper for bounty hunting), Neo4j/Graphiti (Qdrant is sufficient for our use; structured-search-protocol pattern adoptable without it).
 
 ---
 
