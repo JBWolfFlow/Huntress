@@ -2,20 +2,28 @@
 
 Single source of truth for outstanding work, verified status, and delivery priorities.
 
-- **Last updated:** 2026-04-24
-- **Project score:** 8.9 / 10 — all four real-H1 UX blockers shipped (scope narrowing, economy mode, auth-detector fallback, submit-flow dry run); P1-2 recon-pipeline tool inventory enforced via single-source-of-truth + invariant tests + Docker smoke script; P1-3 PentAGI adoption roadmap drafted (12 items mapped to current blockers).
-- **Test health:** 2,172 TypeScript tests passing (91 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
-- **External research:** PentAGI deep-dive at `docs/research/PENTAGI_DEEP_DIVE.md` — informs P1-3 adoption order.
+- **Last updated:** 2026-04-28 (consolidation pass — verified every claim against code)
+- **Project score:** 8.9 / 10 — all four real-H1 UX blockers shipped; PentAGI roadmap defined but no items implemented yet; report writer needs sectioning work
+- **Test health:** 2,172 TypeScript tests passing (91 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean
+- **External research:** PentAGI deep-dive at `docs/research/PENTAGI_DEEP_DIVE.md` — informs P1-3 adoption order. H1 report quality research at `docs/RESEARCH_H1_REPORT_QUALITY.md` — informs P0-4 + report writer rebuild.
 
 ---
 
 ## 1. How to Use This Document
 
-This file replaces `SESSION_*_PLAN.md`, `AUDIT_TRACKER.md`, `PHASE_NEXT_PLAN.md`, and every other ad-hoc planning doc that previously existed in this repo. When work is added, updated, or completed:
+This file is the **only** pipeline / roadmap document. It supersedes every prior planning doc:
+
+- `PRODUCTION_ROADMAP.md` (deleted 2026-04-28 — Phases 1-3 + all blockers shipped, body was stale to Session 12)
+- `LIVE_HUNT_ROADMAP.md` (deleted 2026-04-28 — historical)
+- `CONTINUATION_PROMPT.md` (deleted 2026-04-28 — Session 25 backlog I1-I7 all shipped, I8 manual test carried forward below)
+- `PRE_HUNT_TASKS.md` (deleted 2026-04-28 — all phases A-D shipped)
+- `AUTH_RESEARCH_AND_CONTINUATION.md` (deleted 2026-04-28 — superseded)
+
+When work is added, updated, or completed:
 
 1. Update the relevant section here in the same commit as the code change.
-2. Move finished items from the priority tables into **§6 Verified Complete**, with the commit SHA that landed them.
-3. Do not create parallel planning documents. If a plan needs more than a paragraph of design, put it under **§7 Design Notes**.
+2. Move finished items from the priority tables into **§7 Verified Complete**, with the commit SHA that landed them.
+3. Do not create parallel planning documents. Longer-form design context goes under `docs/` and is referenced from the relevant priority item.
 
 Priority levels use a fixed rubric:
 
@@ -30,74 +38,105 @@ Priority levels use a fixed rubric:
 
 ## 2. P0 — Critical (Blocks First Submission)
 
-### P0-3 · Replace 28 pass-through validators with deterministic checks (in progress)
+### P0-3 · Deterministic validators for the remaining pass-through types (in progress — bigger than previously documented)
 **File:** `src/core/validation/validator.ts`
-**Why:** Of 46 vulnerability types, 28 currently rely on agent self-confidence rather than deterministic verification. This is the single largest source of false-positive risk and the primary obstacle to submitting to real HackerOne programs without reputation damage. The 2026-04-23 Juice Shop hunt made this concrete — every finding (iframe-javascript XSS bypass, Pug `{{7*7}}` SSTI on `/api/BasketItems`) hit the validator pipeline cleanly after the binding-error fix, but all four returned `could not be verified` because the current payload shapes don't match real exploit variants.
 
-**Status:**
-- ✅ **XSS multi-payload sweep** (2026-04-23). `xss_reflected` and `xss_dom` now loop through `script-tag`, `iframe-javascript` (Angular-bypass), `svg-onload`, and `img-onerror` variants via `buildXssPayloadVariants()`. First to fire the marker via dialog/console/OOB wins; evidence from every attempt is aggregated. 11 new tests. Next live hunt against Juice Shop should flip the two DOM-XSS findings from `could not be verified` to `CONFIRMED`.
-- ✅ **SSTI POST-body + auth** (2026-04-23). `buildCurlArgv()` helper (exported) centralizes argv construction with auth-header/cookie pass-through; `ValidatorConfig` gained `authHeaders` and `authCookies` fields populated from the active hunt's primary session in `runFindingValidation`. `ssti` validator now sweeps `SSTI_BODY_FIELDS` (quantity, test, input, content, message, data, name, template, value, text) for `/api/` or `/rest/` URLs in addition to the existing GET-query path. First confirming site wins; negative control still discards page-default `49` hits. 11 new tests. Should flip the 2026-04-23 Pug SSTI on POST `/api/BasketItems` from `could not be verified` to `CONFIRMED`.
-- ✅ **Bulk migration of 18 validators to `buildCurlArgv`** (2026-04-23). Every `['curl', '-s', ...].join('\x00')` in `validator.ts` now goes through the shared builder. Same-origin validators (`sqli_error`, `sqli_blind_time`, `ssrf`, `idor`, `xxe`, `command_injection`, `path_traversal`, `cors_misconfiguration`, `host_header_injection`, `prototype_pollution`, `nosql_injection`, `bola`) inherit auth from the active hunt. Follow-redirect validators (`open_redirect`, `subdomain_takeover`, `oauth_*`) explicitly opt out — curl `-L` re-sends custom `-H` headers cross-origin, which would leak bearer/cookies to whatever host the redirect lands on. That policy is locked down by `validator_auth_pass_through.test.ts` (8 tests).
-- ✅ **Deep validator hardening** (2026-04-23). Nine concrete increments:
-  - **`sqli_blind_time`** — fixed the shipping-day bug where baseline and delay probes sent the same URL; added `deriveSqlBaselineUrl()` that strips `SLEEP/BENCHMARK/pg_sleep/WAITFOR` patterns (and URL-encoded variants), with a last-query-value fallback when no pattern matches. Refuses to confirm when no distinct baseline can be derived.
-  - **`sqli_error`** — added POST-body sweep over `SQLI_BODY_FIELDS` (id, user_id, username, email, search, q, query, filter, sort, order, name) × 4 canonical error triggers, gated behind an API-endpoint heuristic. Each candidate site has its own clean-value negative control.
-  - **`xss_stored`** — plain-navigation path (agent's stored payload still live) with fall-through to the four-variant re-injection sweep from `buildXssPayloadVariants()`. First fire via dialog or console wins.
-  - **`ssrf`** — active OOB injection: allocate a fresh `interactsh` callback, substitute its HTTP URL into the target's last query-param slot, wait 3s for the server-side fetch to land. Falls back to response-content indicators and passive agent-phase callback correlation if active OOB doesn't fire.
-  - **`command_injection`** — active OOB injection: five shell-exec payload shapes (`;curl`, `$(curl)`, `` `curl` ``, `|wget`, `;nslookup`) substituted into the URL-param slot, looking for callbacks on the allocated OOB host. Complements the existing output-indicator and timing-anomaly paths.
-  - **`path_traversal`** — encoding bypass sweep: `url-encoded`, `double-url-encoded`, `mixed-encoding`, `overlong`, `backslash`. Clean-URL baseline check rejects findings where the fingerprint leaks from the page default.
-  - **`host_header_injection`** — extended from 2 to 7 override headers (`Host`, `X-Forwarded-Host`, `X-Forwarded-Server`, `X-Host`, `X-Original-URL`, `X-Rewrite-URL`, `Forwarded`). Redirect reflection short-circuits; body reflection requires clean-request control.
-  - **`idor` / `bola`** — shared `validateBrokenAccess()` helper with two-identity data-ownership differential. When a secondary session is configured, same finding.target is re-sent as the attacker; identical-body-different-identity confirms broken access regardless of status code. Falls back to the prior status-only check when no secondary is configured; downgrades status-only confirmation when the secondary is denied (ownership IS checked).
-  - **`xxe`** — blind-OOB DTD fetch: synthesize a real XXE payload with `<!ENTITY % remote SYSTEM "oob://...">` referencing a fresh callback URL, POST as `application/xml`, wait 3s for the XML parser to dereference the external entity. Only fires when direct-echo path doesn't already confirm.
-  - Auth plumbing extended: `ValidatorConfig` gained `secondaryAuthHeaders` / `secondaryAuthCookies` / `primaryAuthLabel` / `secondaryAuthLabel`, populated from `sessionManager.listSessions()[0..1]` in `runFindingValidation`.
-  - 26 new unit tests covering every increment, including false-positive rejection and missing-dependency paths (`validator_deep_hardening.test.ts`).
+**Verified state (2026-04-28 audit):** validator.ts dispatches on **58 vulnerability types**. **24 have deterministic verification routines.** **34 are pass-through** (return based on agent confidence only). Prior PIPELINE versions claimed "only 3-4 pass-through remain" — that was wrong.
+
+**Deterministic (24):**
+xss_reflected, xss_dom, xss_stored (4-variant payload sweep + dialog/console detection), sqli_error (POST-body sweep × 4 triggers), sqli_blind_time (`deriveSqlBaselineUrl` + timing diff), ssrf (active OOB injection via interactsh), idor + bola (`validateBrokenAccess` two-identity differential), open_redirect (Playwright redirect chain), xxe (blind-OOB DTD fetch), command_injection (5 shell-exec OOB shapes), path_traversal (5 encoding bypass variants), ssti (10 SSTI_BODY_FIELDS), cors_misconfiguration (preconnect + clean-origin control), host_header_injection (7 override headers), prototype_pollution (browser chain mutation), nosql_injection (MongoDB pattern + differential), oauth_missing_state, oauth_downgrade_attack, oauth_weak_verifier, oauth_scope_escalation.
+
+**Pass-through by design (3) — leave alone:**
+- `sqli_blind_boolean` — stateful, requires custom scaffolding
+- `csrf` — stateful, requires custom scaffolding
+- `subdomain_takeover` — heuristic-only is correct (no definitive verification for dangling CNAMEs)
+
+**Pass-through that should become deterministic (31) — backlog:**
+ssrf_blind, xxe_blind, command_injection_blind, lfi, lfi_rce, oauth_redirect_uri, oauth_state, oauth_pkce, jwt_vulnerability, jwt_alg_confusion, jwt_none, jwt_kid_injection, information_disclosure, rate_limit_bypass, graphql_introspection, graphql_batching, mass_assignment, rce, race_condition, toctou, double_spend, http_smuggling, cache_poisoning, cache_deception, deserialization, saml_attack, mfa_bypass, websocket, crlf_injection, prompt_injection, business_logic.
 
 **Acceptance:**
-- Each of the 28 types has a concrete verification routine (timing probe, browser state check, state-machine replay, OOB callback, etc.).
+- Each high-frequency type listed above gets a concrete verification routine (timing probe, browser state check, state-machine replay, OOB callback, etc.).
 - Unit tests cover at least one positive and one negative case per validator.
-- A pass-through fallback is permitted only where deterministic verification is provably impossible, and is documented inline.
-**Status:** All high-frequency types have deep verification with false-positive controls. Still pass-through (by design — these are either stateful and require custom scaffolding, or low-frequency enough to defer): `sqli_blind_boolean`, `csrf`, `subdomain_takeover` (heuristic-only is the right choice — no definitive verification exists for dangling CNAMEs that isn't already in the service fingerprint check). The oauth_* validators do concrete state/pkce/scope checks but could benefit from richer payload synthesis in a future pass.
+- Pass-through fallback is permitted only where deterministic verification is provably impossible, and the reason is documented inline.
+
+**Highest-priority next batch** (chosen for severity weight + frequency in real-program scopes):
+1. cache_poisoning + cache_deception — 3-step cache proof (poison → CF-Cache-Status: HIT → clean request returns poisoned response)
+2. jwt_alg_confusion + jwt_none — synthesize forged JWT, replay, check 200 response with forged identity
+3. ssrf_blind + xxe_blind + command_injection_blind — already have OOB infrastructure, just unwire the pass-through fallback
+4. http_smuggling — CL.TE / TE.CL differential probe
+5. race_condition — HTTP/2 single-packet via concurrent fetch
 
 ### P0-4 · Calibrate report quality scorer against real HackerOne triage outcomes
 **File:** `src/core/reporting/report_quality.ts`
-**Why:** The scorer was built from `docs/RESEARCH_H1_REPORT_QUALITY.md` but has never been correlated with actual accept/reject decisions. Its current output is directional, not predictive.
+
+**Why:** The scorer was built from `docs/RESEARCH_H1_REPORT_QUALITY.md` but has never been correlated with actual accept/reject decisions. Output is directional, not predictive.
+
 **Acceptance:**
 - At least 10 submitted reports tracked through triage.
-- Scorer thresholds adjusted so that reports predicted "high quality" correlate with acceptance ≥ baseline accept rate, and "low quality" with rejection.
+- Scorer thresholds adjusted so reports predicted "high quality" correlate with acceptance ≥ baseline accept rate, and "low quality" with rejection.
 - Calibration notes recorded in `docs/RESEARCH_H1_REPORT_QUALITY.md`.
-**Estimate:** 3–5 days, spans multiple hunts. Depends on P0-1 and P0-3.
+
+**Estimate:** 3–5 days, spans multiple hunts. Depends on P0-5 (so the 10 reports are actually H1-format) and on first live submissions actually happening.
+
+### P0-5 · Report writer rebuild — make every generated report a triage-ready H1 submission
+**Files:** `src/core/reporting/poc_generator.ts`, `src/core/reporting/templates.ts`, `src/core/reporting/report_quality.ts`
+
+**Why:** Code audit on 2026-04-28 found that `REPORT_TEMPLATES` (10 H1-standard templates with Prerequisites / Vulnerability Details / Expected vs Actual / Affected Scope / Remediation sections) is imported by `poc_generator.ts` but never called. `toMarkdown()` builds reports inline section-by-section and produces output that is **missing every H1-required section beyond Description / Impact / Steps / Proof**. This is the single largest report-quality gap.
+
+Every dollar P0-3 (validator hardening) earns is forfeit if the report submitted at the end of the chain looks like AI slop. Per `docs/RESEARCH_H1_REPORT_QUALITY.md` triage signals: "no raw HTTP request/response pairs", "perfectly formatted prose with extensive bullet lists", "generic impact without specific data" — current `toMarkdown()` output trips multiple of these.
+
+**Quick wins (≤1 day each):**
+
+- **P0-5-a · Wire `REPORT_TEMPLATES` into `toMarkdown()`.** Pick template by `vuln.type`, `fillTemplate()` with extracted data (url, parameter, payload, severity, http_evidence, poc, quick_reproduction), fall back to current inline build for vuln types without a template. Single change makes every report 2× more H1-compliant.
+- **P0-5-b · Add the missing H1 sections to the inline-build fallback** for vuln types without a template: Prerequisites (per-vuln-type defaults), Vulnerability Details block (URL / Method / Parameter / Payload / Severity), **Expected vs Actual Behavior**, Affected Scope, Remediation. H1 docs explicitly require Expected vs Actual.
+- **P0-5-c · Raise `bodySnippet` cap from 500 → 2000 chars** on the response that proves the vuln; keep 500 for context responses. The difference between a $500 and $5000 report per research doc is "showed specific data accessed, not theoretical impact."
+- **P0-5-d · Show all relevant exchanges, not just 5.** Sort by relevance (exploitation step weighted higher than recon). Cap at 10.
+- **P0-5-e · Add per-vuln-type evidence checklist to `report_quality.ts`** based on the Evidence Decision Matrix in `docs/RESEARCH_H1_REPORT_QUALITY.md` §8. Quality scorer should fail reports missing the required evidence shape for their type (e.g. CORS without cross-origin fetch PoC → fail; XSS without `alert(document.domain)` → fail; cache poisoning without 3-step proof → fail; IDOR without two-account comparison → fail).
+
+**Medium (1-2 days each):**
+
+- **P0-5-f · Wire `H1Api.uploadAttachment` from `toMarkdown()`** so screenshots are actual H1 attachments, not file paths.
+- **P0-5-g · Surface validator's `ValidationEvidence[]` (screenshots, OOB callbacks, dialog detection) into the report's HTTP Evidence section.** Currently this evidence dies at the validator boundary.
+- **P0-5-h · Video capture for chained findings** via Playwright video recording (already used in `headless_browser.ts`) wired to H1 attachment upload. Research doc cites <2-min video as one of the five required H1 elements.
+
+**Bigger:**
+
+- **P0-5-i · Independent Reporter agent** — second-pass Sonnet review that grades the report against H1 triage criteria and either upgrades, downgrades, or flags-for-review before submission. (Same item as P1-3-f below — listed in both places because it serves both report quality and PentAGI adoption.)
+
+**Acceptance:**
+- Every generated report includes Prerequisites, Vulnerability Details, Expected vs Actual, Affected Scope, Remediation sections (template-driven where available).
+- Quality scorer enforces per-vuln-type evidence requirements.
+- Screenshots upload as H1 attachments, not file path references.
+- A report generated for a Juice Shop SQLi finding is structurally indistinguishable from a top-rated H1 report (manual comparison against 3 disclosed reports).
+
+**Estimate:** 2-3 focused days for quick wins (a-e), additional 2-3 days for medium (f-h), 1 day for bigger (i).
 
 ---
 
 ## 3. P1 — High (Correctness & Quality Gaps)
 
-### P1-0 · Real-H1-hunt UX blockers (live submission readiness)
-Four concrete items surfaced when the user attempted a live Superhuman hunt on 2026-04-23. All block routine live-H1 use; none block the first possible submission if handled with care.
-
-- ✅ **Scope narrowing (P1-0-a)** — `BountyImporter` gained a toggleable "Narrow scope" section (off by default). When on, the user picks a subset of in-scope targets via checkboxes (with select-all/none helpers); `applyScopeNarrowing()` filters before handing off to the hunt. Unblocks programs like Superhuman where the full scope (30+ assets across `*.grammarly.com`, `*.coda.io`, `*.superhuman.com`) would fan specialists across everything and exhaust any reasonable budget. 7 tests.
-- ✅ **Economy mode (P1-0-b)** — New cohesive config module at `src/core/orchestrator/economy_mode.ts`: `EconomyModeConfig` interface + frozen `ECONOMY_MODE_OFF` / `ECONOMY_MODE_ON` constants + `resolveEconomyMode(enabled)` + `selectSolverAgents(catalog, skipped, cap)` + `specialistYieldRank(id)`. When the user flips the toggle in Settings → Advanced → Hunt Behavior: `maxConcurrentAgents` drops 5 → 2, specialist fan-out per recon is capped at 3 (prioritized by yield rank — sqli/xss/idor first), and per-agent budget claim widens 0.2 → 0.5 so the slower serialized hunt still completes. Frozen-object contract so callers can't mutate defaults; test-first with 21 unit tests (resolver, rank ordering, selection + skip + cap + empty-pool edge cases, no-mutation invariant, strict-more-conservative cross-config invariant). Default off — local test hunts see no change.
-- ✅ **Auth-detector login-URL fallback (P1-0-c)** — `AuthDetector.buildProfileForType` no longer falls through to `baseUrl` for the cookie flow. When no login path was confidently detected, `profile.url` stays `undefined` and the instruction block changes from "Navigate to the login page: <random-in-scope-host>" to "Enter the login page URL below — Huntress could not auto-detect one." `AuthWizardModal.handleRunCapture` and `handleRunAuthWorker` were also tightened to require an explicit `authUrl` before starting automated login or browser capture — the silent `authUrl || scope.inScope[0]` fallback (which landed the user at `codacontent.io` on the 2026-04-23 Superhuman run) is gone. 3 new tests covering confident detection, no-confident-URL (the Superhuman regression case), and the bearer/api_key profile invariant (those legitimately keep baseUrl — only cookie got the stricter policy).
-- ✅ **Submit-flow dry run (P1-0-d)** — Submission gate extracted as a pure helper (`src/components/report_submission_gate.ts`) with `computeReportChecklist`, `computeChecklistScore`, and `computeSubmissionGate`. `ReportReviewModal` refactored to consume them. Axios-mocked test suite (`h1_submit_dryrun.test.ts`) pins the `/reports` POST payload shape (JSON:API envelope with `type: 'report'`, `severity_rating`, `weakness_id`, `relationships.program.data.attributes.handle`), the Basic-Auth construction from `{username, apiToken}`, the `vulnerability_information` markdown (numbered steps, description, impact), and the `SubmissionResult` shape on both success and retry-exhausted error paths. Gate tests pin the block order (duplicate-skip → quality-F → missing description → insufficient steps) and confirm the happy path lets a minimal-but-valid report through. 17 new tests.
-
 ### P1-1 · Verify generic token refresh against a non-Telegram OAuth2 target
-**Files:** `src/core/auth/token_refresher.ts`, `src/core/engine/react_loop.ts` (authenticatedRequest)
-**Why:** The four-strategy `RefreshConfig` discriminated union has only been exercised on Telegram's `initdata_exchange` strategy. OAuth2 and custom refresh endpoints are the common case for real targets. If they regress, hunts will stall at token expiry (typically 10–15 minutes).
+**Files:** `src/core/auth/token_refresher.ts`, `src/core/auth/session_manager.ts`
+
+**Code state:** `RefreshConfig` discriminated union has all 4 strategies (initdata_exchange, refresh_token, custom_endpoint, re_login). `getTokenExpiry()` parses JWT exp at L112-132. Proactive refresh threshold 90s (`DEFAULT_REFRESH_THRESHOLD_MS`). Rate limit 1/30s/session (`RATE_LIMIT_MS`). 401 auto-retry in `session_manager.ts:361-364`. `onRefreshFailed` callback at `token_refresher.ts:99-104, 291`. **Code is complete; only live verification is missing.**
+
 **Acceptance:**
 - A single hunt exceeds the target's token TTL by 20+ minutes with zero 401 errors.
 - Proactive refresh (90s threshold) logs fire before expiry.
 - 401 auto-retry path exercised at least once.
+
 **Estimate:** One hunt (~60 minutes) plus any patching surfaced.
 
 ### P1-2 · Audit recon pipeline tools against Dockerfile  ✅ shipped 2026-04-24
 **Files:** `src/core/orchestrator/recon_pipeline.ts`, `src/agents/recon_agent.ts`, `scripts/verify_attack_tools.sh`, `src/tests/recon_tool_inventory.test.ts`
-**Outcome:** Inventory drift between source code and the Docker image is now caught at three independent layers:
-- **Single source of truth** — `ATTACK_MACHINE_TOOLS` constant (and its derived `ATTACK_MACHINE_TOOL_NAMES` set) listed at the top of `recon_pipeline.ts` with each tool's canonical version-probe args.
-- **Source-side invariants** (no Docker required) — 9 unit tests verify: no duplicates, every entry has non-empty name + probe args, set/array agreement, intentionally-removed tools (`getJS`, `gowitness`, `jsluice`, `findomain`) stay absent, every `buildStages()` `command.tool` field is in the inventory, every `command.command` starts with its declared `tool`, all major recon stages exist, the agent's system prompt mentions every pipeline-referenced tool by name.
-- **Image-side smoke test** — `scripts/verify_attack_tools.sh` runs each inventoried tool's probe inside the built `huntress-attack-machine:latest` container; fails on any missing or unrunnable binary. Run after every Dockerfile change.
 
-Recon agent prompt cleaned up — the methodology header used to claim it would do JS analysis with `getJS`/`jsluice` and screenshots with `gowitness`; now it correctly states `katana -jc` covers JS endpoint extraction and the validator's Playwright handles screenshots. `jsluice` added to the explicit "do NOT attempt" list. 9 tests.
+Inventory drift between source code and the Docker image is now caught at three independent layers:
+- **Single source of truth** — `ATTACK_MACHINE_TOOLS` constant + `ATTACK_MACHINE_TOOL_NAMES` set in `recon_pipeline.ts`.
+- **Source-side invariants** (no Docker required) — 9 unit tests verify no duplicates, every entry has non-empty name + probe args, every `command.tool` is in the inventory, every `command.command` starts with its declared `tool`, recon agent prompt mentions every pipeline-referenced tool.
+- **Image-side smoke test** — `scripts/verify_attack_tools.sh` runs each inventoried tool's probe inside `huntress-attack-machine:latest`. Fails on missing/unrunnable binary.
 
-### P1-3 · Adopt high-leverage patterns from PentAGI
-Cross-reference with [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi) (15.9k-star Go pentest platform) surfaced concrete patterns that solve problems we are still struggling with. Full deep dive at `docs/research/PENTAGI_DEEP_DIVE.md`. Adoption order chosen to unblock real-H1 readiness in dependency order.
+### P1-3 · Adopt high-leverage patterns from PentAGI (12 items, 0/12 shipped)
+Cross-reference with [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi) (15.9k-star Go pentest platform) surfaced concrete patterns that solve problems we are still struggling with. Full deep dive at `docs/research/PENTAGI_DEEP_DIVE.md`. **Code-level verification on 2026-04-28 confirmed: 0 of 12 items have any implementation in the codebase.**
 
 | ID | Item | Effort | Unblocks |
 |---|---|---|---|
@@ -105,11 +144,11 @@ Cross-reference with [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi) (
 | P1-3-b | **Per-agent-type tool-call cap** — `maxToolCallsPerAgent` config in ReactLoop; counts tool calls (not LLM iterations); hard-stops at limit | ~2 hours | Same as P1-3-a, second line |
 | P1-3-c | **Adviser execution-monitor sub-agent** — wakes on no-progress patterns (>5 identical calls OR >10 total without finding); receives recent messages + tool call history; answers six diagnostic questions; output guides next agent step | ~1 day | Smart fallback when P1-3-a/b aren't enough; pentagi's signature pattern |
 | P1-3-d | **Chain summarizer** (port of `pkg/csum/chain_summary.go`) — multi-strategy summarization with byte budgets (50KB last, 16KB pair, 64KB QA, 25% reserve); preserves tool-call/response pairs as atomic units | ~1 day | Long real-program hunts (>1hr) without context degradation |
-| P1-3-e | **Sploitus exploit-DB tool** — agent-callable tool that hits `https://sploitus.com/search` for exploits + tools matching a query; returns CVSS, source previews, CVE refs | ~½ day | Direct boost to P0-4 (real CVE references in PoC reports = triage-friendly evidence) |
-| P1-3-f | **Reporter "Independent Judgment" reviewer agent** — second-pass agent (Sonnet) that reads the validator's confirmation evidence, ignores the `confirmed` claim, forms own conclusion (upgrade/downgrade/flag-for-review). Synthetic accept/reject signal | ~1 day | P0-4 enabler — gives us a calibration signal **before** live H1 triage data accumulates |
+| P1-3-e | **Sploitus exploit-DB tool** — agent-callable tool that hits `https://sploitus.com/search` for exploits + tools matching a query; returns CVSS, source previews, CVE refs | ~½ day | Direct boost to P0-4 / P0-5 (real CVE references in PoC reports = triage-friendly evidence) |
+| P1-3-f | **Reporter "Independent Judgment" reviewer agent** — second-pass agent (Sonnet) that reads the validator's confirmation evidence, ignores the `confirmed` claim, forms own conclusion (upgrade/downgrade/flag-for-review). Synthetic accept/reject signal. Same item as P0-5-i. | ~1 day | P0-4 enabler — gives us a calibration signal **before** live H1 triage data accumulates |
 | P1-3-g | **DB-persisted Flow / Task / Subtask state** — Tauri SQLite store; orchestrator writes state transitions; restart resumes from last checkpoint | ~2-3 days | Required before any real-program hunt >30 minutes (we currently lose all state on crash) |
 | P1-3-h | **Prompt template validator + typed variable registry** — build-time check that every prompt template's `${var}` references resolve against a typed registry; CI blocks on unauthorized var | ~1 day | Defensive eng — catches the class of bugs that landed users at `codacontent.io` (P1-0-c regression) before they ship |
-| P1-3-i | **Authorization-status preamble** — shared `AUTHORIZATION_PREAMBLE` constant prepended to every specialist system prompt; tells agents the engagement is pre-authorized so they stop hedging | ~2 hours | Small ergonomic win; reduces agent-hesitation cycles on aggressive payloads. Must NOT leak into report-render layer (audience there needs responsible-disclosure framing) |
+| P1-3-i | **Authorization-status preamble** — shared `AUTHORIZATION_PREAMBLE` constant prepended to every specialist system prompt | ~2 hours | Small ergonomic win; reduces agent-hesitation cycles on aggressive payloads. Must NOT leak into report-render layer (audience there needs responsible-disclosure framing) |
 | P1-3-j | **Toolcall_fixer side-channel** — when an agent emits malformed JSON for a tool call, route to a sub-LLM with original args + error + schema; receive corrected JSON; retry. Silent self-healing | ~1 day | Reduces Haiku-tier malformed-JSON failures; quality-of-life |
 | P1-3-k | **Detach modes for long-running commands** — `detach: boolean` field in `execute_command`; PTY layer fire-and-forgets daemons (returns "started in background" after 500ms); batch commands wait | ~1 day | Daemon/listener-based PoCs (reverse shells, http server for SSRF callbacks) without blocking the agent |
 | P1-3-l | **Refiner / failure categorization** — when an agent fails, categorize as Technical / Environmental / Conceptual / External; pivot strategy for Conceptual; retry-with-tweaks for Technical | ~1 day | Smarter retries vs. blind redispatch |
@@ -118,20 +157,50 @@ Cross-reference with [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi) (
 
 **Explicitly NOT adopting:** pentagi's multi-LLM provider abstraction (violates Huntress CLAUDE.md "Anthropic only"), web-app deployment (we are desktop-by-design), generic-pentest agent fleet (our 27 specialists are sharper for bounty hunting), Neo4j/Graphiti (Qdrant is sufficient for our use; structured-search-protocol pattern adoptable without it).
 
+### P1-4 · Auth Phase 2 backlog (carried over from `DEEPER_AUTH_RESEARCH_AND_PLAN.md`)
+Phase 1 (Q1-Q4 + Q6 Gap 5/7) is shipped and verified. Four Phase 2 items have not been carried forward in any plan and would otherwise be lost:
+
+- **P1-4-a · Q6 Gap 6 — login-detection scoring in `scripts/auth_capture.mjs`.** Current Set-Cookie heuristic at L111-114 is too eager; any tracking cookie (Cloudflare, GA) triggers `loginDetected = true`. Replace with response-shape scoring: POST to `/login`-shaped path + (status 2xx or 30x to authed area) + (Set-Cookie with HttpOnly flag OR Authorization in subsequent request). ~½ day.
+- **P1-4-b · Q6 Gap 8 — `refreshMode` field on `AuthProfileConfig` + Settings UI surfacing.** Tells the user which refresh strategy will fire, lets them override per-profile. ~1 day.
+- **P1-4-c · Q8 — full Auth tab redesign in Settings.** Profile cards with per-profile auth method, refresh status, last-401 timestamp. ~2 days.
+- **P1-4-d · Finding-panel `sessionLabel` badges.** UI follow-through on Q3: every IDOR/BOLA finding card shows which session_label it was found with (the IDOR Settings badge already shows global readiness). ~½ day.
+
+### P1-5 · Live verification of Session 25 fixes (manual — not a code task)
+- **P1-5-a · I8 from Session 25** — auth browser capture E2E manual test against Telegram. After login: wizard form shows auth method + token populated, [TEST AUTH] returns 2xx/3xx. No code, just confirmation.
+
 ---
 
 ## 4. P2 — Medium (Coverage & Polish)
 
 ### P2-1 · Cross-subdomain deduplication edge-case tests
 **File:** `src/core/orchestrator/finding_dedup.ts`
-**Why:** `extractRootDomain` is untested for eTLD+1 cases (`example.co.uk`), IP literals, and `localhost:port`. A miscalculation produces duplicate findings in the final report.
-**Acceptance:** Unit tests cover eTLD+1, IPv4, IPv6, and port-bearing hosts. Dedup produces one finding per semantic vulnerability across subdomain permutations.
+
+`extractRootDomain` is shipped (lines 150-172) but untested for eTLD+1 cases (`example.co.uk`), IPv6 literals, and `localhost:port`. A miscalculation produces duplicate findings in the final report.
+
+**Acceptance:** Unit tests cover eTLD+1 (`.co.uk`, `.com.au`), IPv4 literals, IPv6, port-bearing hosts. Dedup produces one finding per semantic vulnerability across subdomain permutations.
+
 **Estimate:** ~1 day.
 
 ### P2-2 · Agent-specific severity calibration prompts
 **Files:** `src/agents/cors_hunter.ts`, `src/agents/cache_hunter.ts`, and other specialist agents
-**Why:** C1/C2 apply a global severity calibration prompt. Only `host_header.ts` carries type-specific guidance (preconnect reflection ≠ SSRF). Other agents with well-known misclassification patterns would benefit from the same treatment.
+
+C1/C2 apply a global severity calibration prompt. Only `host_header.ts` carries type-specific guidance (preconnect reflection ≠ SSRF). Other agents with well-known misclassification patterns would benefit from the same treatment.
+
 **Acceptance:** Each agent whose type has a documented false-positive pattern includes explicit guidance in its system prompt.
+
+### P2-3 · Tinyproxy `PidFile` move + TCP startup probe (Session 25 #9)
+**File:** `docker/entrypoint.sh`
+
+PIPELINE.md previously claimed this was shipped (Session 25 #9). Code audit on 2026-04-28 found `entrypoint.sh` exists but neither the PidFile move nor the TCP startup probe is present. Either ship the change or strike the claim — currently the doc and the code disagree.
+
+**Acceptance:** `tinyproxy.conf` `PidFile` set to `/tmp/tinyproxy.pid`. `entrypoint.sh` waits for tinyproxy to accept TCP on 127.0.0.1:3128 before exec'ing the agent command.
+
+**Estimate:** ~1 hour.
+
+### P2-4 · I7 / I8 architecture verified — add agent-count tests
+The Blackboard cross-agent sharing (I7) and WAF context injection (I8) infrastructure is shipped. **No test verifies that all 27 agents actually receive the injected context.** A future agent added without proper config would silently miss SharedFinding/WafContext. Add a test that enumerates the agent catalog and asserts every agent receives both contexts.
+
+**Estimate:** ~½ day.
 
 ---
 
@@ -141,70 +210,155 @@ Cross-reference with [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi) (
 |---|---|---|
 | P3-1 | JS-rendering crawler for SPA endpoint discovery | Large lift (~2–3 days). Reconsider after P0 clears and hunt data shows measurable SPA blind spots. |
 | P3-2 | Training pipeline integration | Requires GPU infrastructure. Future phase, not on the current critical path. |
+| P3-3 | Auth Phase 3 — mTLS, Firebase SDK auth, Supabase JWT, TOTP-protected login, OAuth PKCE helper | Each is a small integration; bundle when one is needed by an actual target. |
+| P3-4 | Auth Phase 4 — MTProto sidecar (Telegram full automation), AWS SigV4 signing, magic-link login, Kerberos | Triggered by external signal — wait for a real target to demand each. |
+| P3-5 | Continuous monitoring — background polling for new subdomains, JS file changes, scope updates | Defer until first long-running hunts complete and we know what to monitor. |
+| P3-6 | XBOW 104-challenge benchmark runner | Useful score signal; not a submission blocker. |
+| P3-7 | Multi-target parallel hunting (queue multiple H1 programs) | Optimization, not capability. |
+| P3-8 | Mobile API testing (APK decompile, cert pinning bypass) | Out of scope for current targets. |
+| P3-9 | Cloud misconfiguration scanning (S3, GCP, Azure blob) | Useful but not bottlenecked here. |
+| P3-10 | Visual recon / application flow mapping, GitHub dorking, Wayback Machine, source map analysis | Each is its own feature; adopt one when a hunt clearly needs it. |
+| P3-11 | Browser extension for manual hunting augmentation, community agent marketplace, team mode | Long-tail product features. |
 
 ---
 
-## 6. Verified Complete
-
-These items appear repeatedly in legacy planning docs. Confirmed landed in code as of 2026-04-13 — **do not reopen without new evidence**.
-
-| ID | Area | Status |
-|---|---|---|
-| I2 | localStorage encrypted via Tauri secure storage (AES-256-GCM) with plaintext migration | ✅ Session 19 |
-| I7 | Cross-agent knowledge sharing via Blackboard; `SharedFinding[]` injected into all 27 agents | ✅ Session 19 (17 tests) |
-| I8 | WAF-awareness context with vendor-specific bypass strategies injected into all 27 agents | ✅ Session 19 (18 tests) |
-| S4 | Auth context management: Settings UI, secure credential storage, ReactLoop auto-injection | ✅ Session 14 |
-| S6 | Auth detection wizard | ✅ Session 15 |
-| S7 | Token refresh: JWT exp parsing, Telegram initdata re-exchange, rate-limited | ✅ Session 16 |
-| S8 | Generic `RefreshConfig` union (initdata / OAuth2 / custom / re-login) | ✅ Session 17 |
-| C1 | Mandatory evidence block in every agent system prompt | ✅ Phase C |
-| C2 | Severity calibration gate (`checkSeverityCalibration` in `react_loop.ts`) | ✅ Phase C |
-| C3 | Cross-subdomain dedup by root domain (`finding_dedup.ts:174-187`) | ✅ Phase C — edge cases covered under P2-1 |
-| C5 | Report quality scorer (`src/core/reporting/report_quality.ts`) | ✅ Phase C — calibration tracked under P0-4 |
-| #6 | Recon `success=true` on `iteration_limit` with ≥3 tool calls (`react_loop.ts:542-552`) | ✅ Session 25 (16 tests) |
-| #8 | `dnsx` and `wafw00f` added to `docker/Dockerfile.attack-machine` | ✅ Session 25 |
-| #9 | Tinyproxy `PidFile` moved to `/tmp`; TCP startup probe in `entrypoint.sh` | ✅ Session 25 |
-| #10 | Recon emits `category: 'endpoint'` observations capped at 50 (`recon_agent.ts:282-308`) | ✅ Session 25 |
-| — | `browser_fill` action, tool schema, and ReactLoop handler | ✅ Session 25 |
-| — | AuthWorkerAgent, `capture_complete` / `capture_failed` schemas, XHR interception, AuthWizardModal Step 2 | ✅ Session 25 |
-| P0-1 | Session 25 runtime fixes validated live — recon success=true on iteration_limit, per-endpoint dispatch, zero `curl: (7)` | ✅ 2026-04-23 Juice Shop hunt |
-| P0-2 | AuthWorkerAgent E2E — wizard auto-opened on 401 `/rest/basket/1`, RUN AUTOMATED LOGIN captured credentials, hunt ran with attached session | ✅ 2026-04-23 Juice Shop hunt |
-| — | Validator IPC — `headless_browser.ts` rewritten over `AgentBrowserClient`; new `validator_analyze` / `validator_dom_xss` actions in `scripts/agent_browser.mjs`; eliminates the "Importing binding name 'default'" crash that had blocked every XSS/DOM-XSS/prototype-pollution validation | ✅ 2026-04-23 (11 new tests) |
-| — | Recon endpoint scope filter — `isUrlInReconScope()` drops URLs whose host is outside the hunt scope before `category:'endpoint'` observations drive specialist dispatch. Regression-covers the W3C DTD noise seen in the first 2026-04-23 hunt. | ✅ 2026-04-23 (11 new tests) |
-
----
-
-## 7. Design Notes
-
-Longer-form design context lives under `docs/`:
-
-- `docs/RESEARCH_H1_REPORT_QUALITY.md` — research behind the report quality scorer. Cited by **P0-4**.
-- `docs/PHASE5_*.md` — operational runbooks for training deployment (architecture, monitoring, rollback, troubleshooting). Not a pipeline doc; retained as reference.
-
-Add new design notes under `docs/` and reference them from the relevant priority item above. Do not create new top-level planning files.
-
----
-
-## 8. Architectural Invariants (Do Not Violate)
+## 6. Architectural Invariants (Do Not Violate)
 
 These are summarized from `CLAUDE.md` for convenience. Any task that touches these areas must preserve the invariant:
 
 1. **`HttpClient` (`src/core/http/request_engine.ts`) is the only HTTP egress path** — kill switch, scope validation, rate limiting, stealth, WAF detection run in that fixed order.
 2. **Agent dispatch is fire-and-forget.** Validation and duplicate checks run asynchronously against findings with `pending` status.
 3. **Scope validation is default-deny.** `src-tauri/src/safe_to_test.rs` — any change requires positive and negative tests.
-4. **Tiered model routing is locked** for the seven agents listed in `COMPLEXITY_LOCKED_AGENTS` (`src/core/orchestrator/cost_router.ts`). Budget enforcement: 90% soft warning, 100% hard stop.
+4. **Tiered model routing is locked** for the seven agents listed in `COMPLEXITY_LOCKED_AGENTS` (`src/core/orchestrator/cost_router.ts`). Budget enforcement: 90% soft warning, 100% hard stop. **Anthropic models only.**
 5. **Command execution uses argv arrays, never shell interpolation.** `src-tauri/src/pty_manager.rs`.
-6. **Approval gate and kill switch cannot be bypassed.** `auto_approve` is the only sanctioned exception and requires explicit opt-in.
+6. **Approval gate and kill switch cannot be bypassed.** `auto_approve` is the only sanctioned exception and requires explicit opt-in per category.
+7. **API keys go through secure storage only.** AES-256-GCM with HKDF. Never log or print keys.
+8. **`safe_to_test.rs`, `kill_switch.rs`, and the approval gate core are FROZEN** — do not modify without explicit user request.
+
+---
+
+## 7. Verified Complete
+
+These items have been verified shipped via direct code inspection on 2026-04-28. Do not reopen without new evidence.
+
+### Safety architecture (production-ready)
+| ID | Area | Evidence |
+|---|---|---|
+| — | Scope validation (default-deny, wildcards, CIDR, TLS cert) | `src-tauri/src/safe_to_test.rs` — 42+ tests |
+| — | Kill switch (atomic, persistent, fail-safe-active) | `src-tauri/src/kill_switch.rs` |
+| — | Approval gate (60s timeout, audit trail) | `src/contexts/HuntSessionContext.tsx` |
+| — | PTY command execution (argv-only, env sanitization) | `src-tauri/src/pty_manager.rs` |
+| — | Secure storage (AES-256-GCM, HKDF) | `src-tauri/src/secure_storage.rs` |
+| — | Docker sandbox (read-only rootfs, capability drop, scope-enforcing tinyproxy) | `src-tauri/src/sandbox.rs` + `docker/Dockerfile.attack-machine` |
+
+### Auth pipeline (Phase 1 — all verified)
+| ID | Area | Evidence |
+|---|---|---|
+| Q1 | Env-var injection + `.curlrc` + token scrubbing | `src/core/auth/session_env.ts:37-75`; `src-tauri/src/sandbox.rs:958` (`sandbox_write_file`); `react_loop.ts:220-234` (`scrubAuthSecrets`) |
+| Q2 | Agent system-prompt auth block | `react_loop.ts:2099-2128` (`buildAuthSection`) |
+| Q3 | `session_label` + `findByLabel` + IDOR badge | `session_manager.ts:102` (`findByLabel`); `tool_schemas.ts:291` (`session_label`); `SettingsPanel.tsx:661-692` (IDOR-ready badge) |
+| Q4 | Telegram preset wizard (DevTools paste-assist + initdata_exchange auto-select) | `AuthWizardModal.tsx:99,138,427` |
+| Q6 Gap 5 | Multi-probe bearer validation (tri-state) | `session_manager.ts:225` (`probeBearer`) |
+| Q6 Gap 7 | Scope-aware redirect + cross-origin auth header strip | `request_engine.ts:345` (`stripCrossOriginAuthHeaders`); unified loop in Tauri (L613) and axios (L808) paths |
+| S4 | Auth Settings UI (CRUD bearer/form/API key/custom) | `SettingsPanel.tsx:31-49` |
+| S6 | Auth detection wizard | `auth_detector.ts:26-42`; `HuntSessionContext.tsx:664-708` |
+| S7 | Token refresh (JWT exp parsing, rate-limited 1/30s) | `token_refresher.ts:83,86,148-152,180` |
+| S8 | Generic `RefreshConfig` 4-strategy union | `token_refresher.ts:21-68` |
+
+### Orchestration / agent infrastructure
+| ID | Area | Evidence |
+|---|---|---|
+| I2 | localStorage encrypted via Tauri secure storage with plaintext migration | `HuntSessionContext.tsx:62-95`; `secure_storage.rs:206-271,406-430` |
+| I7 | Cross-agent knowledge sharing via Blackboard; SharedFinding[] in ReactLoopConfig | `blackboard.ts:43-168`; `react_loop.ts:33,89-92,2298-2312` (caveat: agent-count enumeration test missing — see P2-4) |
+| I8 | WAF-awareness `WafContext` injected via ReactLoopConfig | `base_agent.ts:41-49`; `react_loop.ts:2289-2297` (caveat: same as I7 — see P2-4) |
+| C1 | Mandatory evidence block in agent system prompts | `recon_agent.ts:41-100` and other specialist prompts |
+| C2 | Severity calibration gate with 7 named rules | `react_loop.ts:2143-2238` (`checkSeverityCalibration`) |
+| C3 | Cross-subdomain dedup via `extractRootDomain()` | `finding_dedup.ts:150-189,222-249` |
+| C5 | Report quality scorer (8 categories, threshold 60) | `report_quality.ts` (categories: clarity 10%, completeness 10%, evidence 5%, impact 10%, reproducibility 15%, httpEvidence 25%, executablePoc 15%, expectedVsActual 10%) |
+
+### Validators (24 deterministic — see §2 P0-3 for enumeration)
+xss_reflected/dom/stored, sqli_error/blind_time, ssrf, idor, bola, open_redirect, xxe, command_injection, path_traversal, ssti, cors_misconfiguration, host_header_injection, prototype_pollution, nosql_injection, oauth_missing_state/downgrade_attack/weak_verifier/scope_escalation. Helpers: `buildXssPayloadVariants` (4 variants), `SSTI_BODY_FIELDS` (10 fields), `buildCurlArgv` (auth pass-through), `deriveSqlBaselineUrl`, `validateBrokenAccess` (two-identity), `secondaryAuthHeaders`/`secondaryAuthCookies`/`primaryAuthLabel`/`secondaryAuthLabel` on `ValidatorConfig`.
+
+### Real-H1 UX blockers (all four shipped)
+| ID | Area | Evidence |
+|---|---|---|
+| P1-0-a | Toggleable scope narrowing in BountyImporter | `BountyImporter.tsx:24-33,55`; 7 tests in `scope_narrowing.test.ts` |
+| P1-0-b | Economy mode (`maxConcurrentAgents` 5→2, fan-out cap, frozen config contract) | `economy_mode.ts:24-94,118`; `SettingsPanel.tsx:1205`; 21 tests in `economy_mode.test.ts` |
+| P1-0-c | AuthDetector login-URL fallback fix (no silent `baseUrl`) | `auth_detector.ts:570-596`; `AuthWizardModal.tsx:228`; 40 tests in `s6_auth_detector.test.ts` |
+| P1-0-d | Submit-flow dry run (gate extracted, payload pinned) | `report_submission_gate.ts:42-110`; `ReportReviewModal.tsx:14-16`; 17 tests in `h1_submit_dryrun.test.ts` |
+
+### Session 25 issues (I1-I7 shipped, I8 carried forward as P1-5-a)
+| ID | Issue | Evidence |
+|---|---|---|
+| I1 | `specialist_request` filtered from finding pipeline | `orchestrator_engine.ts:2198-2202` |
+| I2 | Browser tools route through Node.js subprocess | `scripts/agent_browser.mjs`; `react_loop.ts:654-668` |
+| I3 | Auto-approval categories with safe defaults | `SettingsContext.tsx:167-174` (`autoApprove` 4 categories); `safety_policies.ts:276-289` (`classifyCommand`) |
+| I4 | `[+ Add Auth]` button for mid-hunt auth injection | `HuntSessionContext.tsx:177,1057` (`addAuthToActiveHunt`) |
+| I5 | Container reaper on orchestrator init | `sandbox_executor.ts:124` (`reapOrphans`); `orchestrator_engine.ts:1019`; 4 tests in `i5_orphan_reaper.test.ts` |
+| I6 | Severity calibration integration tests | `src/tests/integration/severity_calibration_e2e.test.ts` |
+| I7 | Cross-subdomain dedup integration tests | `src/tests/integration/dedup_e2e.test.ts` |
+
+### Additional Session 25 work
+| Item | Evidence |
+|---|---|
+| Recon `success=true` on `iteration_limit` with ≥3 tool calls | `react_loop.ts:542-552` (16 tests) |
+| `dnsx` and `wafw00f` added to attack-machine Dockerfile | `docker/Dockerfile.attack-machine` |
+| ~~Tinyproxy `PidFile` to `/tmp` + TCP startup probe~~ | **NOT FOUND in code** — see P2-3 |
+| Recon emits `category: 'endpoint'` observations capped at 50 | `recon_agent.ts:332,361` |
+| `browser_fill` action + tool schema + ReactLoop handler | `tool_schemas.ts:469`; ReactLoop handler |
+| AuthWorkerAgent + `capture_complete`/`capture_failed` schemas + XHR interception | `auth_worker_agent.ts:1-80`; `tool_schemas.ts:426-469`; `react_loop.ts:1865-1908` |
+| Validator IPC over `AgentBrowserClient` (eliminates "binding name 'default'" crash) | `headless_browser.ts:1-22`; `scripts/agent_browser.mjs:21-22,340,473,554-555` (11 tests) |
+| Recon endpoint scope filter (`isUrlInReconScope`) | `recon_agent.ts:155-170,358` (11 tests) |
+
+### Validators / hardening (Session 26-27 — already integrated above in P0-3 enumeration)
+| Item | Evidence |
+|---|---|
+| Multi-payload sweep in XSS validators (Angular sanitization defeated) | `validator.ts:251` (`buildXssPayloadVariants`); 11 tests |
+| SSTI POST-body sweep + auth plumbing | `validator.ts:1553` (`SSTI_BODY_FIELDS`); 11 tests |
+| 18 validators migrated to `buildCurlArgv` (auth pass-through, follow-redirect opt-out) | `validator.ts:117` (`buildCurlArgv`); 8 tests in `validator_auth_pass_through.test.ts` |
+| Deep validator hardening — 9 increments (sqli_blind_time baseline, sqli_error POST sweep, xss_stored, ssrf OOB, command_injection OOB, path_traversal encoding, host_header 7 headers, idor/bola two-identity, xxe blind-OOB DTD) | `validator.ts` lines vary; 26 tests in `validator_deep_hardening.test.ts` |
+
+### Phases shipped historically (verified via code presence + previous audits)
+- **Phase 1** — Tiered model routing, budget enforcement, scope normalization, tech-stack filtering (Hunt #5)
+- **Phase 2** — Rate limiting & stealth (RateController + StealthModule + WAF detection in HttpClient)
+- **Phase 3** — Finding validation pipeline + H1 duplicate checking (`validateFinding` + `runH1DuplicateCheck` fire-and-forget)
+- **Phase 4** — H1 API integration + reporting infrastructure (auth, retry, file uploads)
+- Approval gate + kill switch + secure storage hardening (Sessions 7-9)
+- Docker attack machine (Session 8 — 640MB, 15 tools)
+- API schema import (OpenAPI/Swagger/GraphQL — Session 8)
+- Session 11 fixes for Hunt #7 (Docker lifecycle, hallucination gate ≥3 HTTP, normalizeEvidence, OAuth validators, API limit detection, cross-hunt dedup, adjust_budget)
+- Session 12 fixes (dispatch undefined target guard, chain validated:boolean, GitHub+internal duplicate sources, real CVSS calculator)
+- Session 13 report templates + HTTP exchanges + H1 quality scorer recalibration
+
+---
+
+## 8. Design Notes
+
+Longer-form design context lives under `docs/`:
+
+- `docs/RESEARCH_H1_REPORT_QUALITY.md` — research behind the report quality scorer. Cited by **P0-4** and **P0-5**.
+- `docs/research/PENTAGI_DEEP_DIVE.md` — full PentAGI cross-reference (422 lines, two-phase analysis). Cited by **P1-3**.
+- `docs/PHASE5_*.md` — operational runbooks for training deployment (architecture, monitoring, rollback, troubleshooting). Reference only.
+
+Add new design notes under `docs/` and reference them from the relevant priority item above. Do not create new top-level planning files.
 
 ---
 
 ## 9. Recommended Next Action
 
-All four real-H1-hunt UX blockers are now shipped. The next action is the first live HackerOne submission itself — the machinery is in place end-to-end:
+Two parallel tracks of work, in this order:
 
-  1. Pick a program with a small scope OR use **Narrow scope** (P1-0-a) in `BountyImporter` to pick one asset.
-  2. Toggle **Economy mode** (P1-0-b) in Settings → Advanced → Hunt Behavior.
-  3. Run the hunt. When a finding lands, `ReportReviewModal` enforces the submission gate (P1-0-d) before the Approve & Submit button unlocks.
-  4. First real submission produces the triage data that P0-4 needs (report quality scorer calibration).
+**Track 1 — Report writer (P0-5 a-e quick wins, ~2 days):** Wire `REPORT_TEMPLATES` into `toMarkdown()`, add missing H1 sections to inline build, raise body snippet cap, show all relevant exchanges, add per-vuln-type evidence checklist to quality scorer. After this, the first live submission is a reasonable shape rather than AI slop.
 
-Before the first *real* program, a dry-run of the XSS+SSTI hardening against Juice Shop is still worth doing — confirm the 2026-04-23 findings flip to `CONFIRMED` with the hardened validators — but it's verification, not a blocker.
+**Track 2 — First live HackerOne submission:** All UX machinery is in place (P1-0 a-d shipped). Pick a program with small scope OR use Narrow scope (P1-0-a), toggle Economy mode (P1-0-b), run hunt, submission gate (P1-0-d) gates the report. First real submission produces the triage data that P0-4 calibration needs.
+
+After those, in priority order:
+3. **P1-3-a + P1-3-b** (~4 hours total) — prevents the 90-tool-call burn pattern.
+4. **P0-5-i / P1-3-f Independent Reporter agent** (~1 day) — synthetic accept/reject signal as triage data accumulates.
+5. **P1-3-e Sploitus** (~½ day) — real CVE refs in reports.
+6. **P1-3-c Adviser** (~1 day) — smart no-progress fallback.
+7. **P1-3-d Chain summarizer** (~1 day) — required before any hunt over 1 hour.
+8. **P0-3 next batch** of validator deepening (cache_poisoning, jwt_*, blind family) — ongoing work.
+9. **P1-3-g DB-persisted state** (~2-3 days) — gate before any real-program hunt >30 minutes.
+
+*Total to "production-ready report writer + 5 submissions + most P1-3": ~10 focused days.*

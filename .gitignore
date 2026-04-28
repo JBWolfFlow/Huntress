@@ -120,7 +120,11 @@ config/kill_switch.lock
 
 # Claude Code / MCP local state (personal, should not be shared)
 .claude/
+.claude-mem/
 .playwright-mcp/
+CLAUDE.md
+**/CLAUDE.md
+scheduled_tasks.lock
 
 # Hunt-specific local artifacts
 src-tauri/huntress_knowledge.db
