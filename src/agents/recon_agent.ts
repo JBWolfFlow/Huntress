@@ -2,19 +2,23 @@
  * Recon Agent — Full Implementation
  *
  * Performs comprehensive reconnaissance using the ReAct loop engine.
- * Attack playbook:
- * 1. Subdomain enumeration (subfinder)
+ * Attack playbook (every tool listed here is verified present in
+ * docker/Dockerfile.attack-machine — see ATTACK_MACHINE_TOOLS in
+ * src/core/orchestrator/recon_pipeline.ts for the canonical inventory):
+ * 1. Subdomain enumeration (subfinder, assetfinder)
  * 2. DNS resolution (dnsx)
  * 3. HTTP probing (httpx with tech detection)
  * 4. WAF detection (wafw00f)
  * 5. Port scanning (naabu)
- * 6. Web crawling (katana)
- * 7. URL collection (gau, waybackurls)
- * 8. JS analysis (getJS, jsluice)
- * 9. Parameter mining (paramspider)
- * 10. Tech fingerprint (whatweb)
- * 11. Screenshot evidence (gowitness)
- * 12. SSL/TLS analysis (testssl.sh)
+ * 6. Web crawling + URL collection (katana, gau, waybackurls)
+ * 7. Parameter mining (paramspider)
+ * 8. Tech fingerprint (whatweb)
+ * 9. Vulnerability scan + SSL (nuclei, testssl.sh)
+ *
+ * JS analysis and screenshots are intentionally absent: katana's `-jc`
+ * flag covers JS endpoint extraction, and the Playwright-backed validator
+ * browser handles screenshot evidence — `getJS`, `jsluice`, and
+ * `gowitness` are NOT in the image.
  */
 
 import type { ModelProvider } from '../core/providers/types';
@@ -42,7 +46,7 @@ const RECON_SYSTEM_PROMPT = `You are an expert reconnaissance agent for bug boun
 
 - Commands run through argv — NOT through a shell. Do NOT use shell pipes (\`|\`), redirects (\`>\`), process substitution (\`<(...)\`), or chained commands (\`&&\`). Use tool flags for filtering (e.g. \`httpx -path\` instead of \`httpx | grep\`). If you need to capture response headers, use \`curl -s -D /tmp/headers.txt -o /tmp/body.txt\` then read the file.
 - Installed in the sandbox image: subfinder, assetfinder, dnsx, naabu, gau, waybackurls, httpx, katana, wafw00f, whatweb, paramspider, nuclei, testssl.sh, dalfox, interactsh-client, ffuf, sqlmap, ghauri, commix, curl, wget, jq, nmap, python3, git.
-- NOT installed — do NOT attempt: findomain, getJS, gowitness.
+- NOT installed — do NOT attempt: findomain, getJS, gowitness, jsluice. For JS endpoint extraction use \`katana -jc\` instead. For screenshot evidence the validator pipeline already runs Playwright; do not try to take screenshots from the sandbox.
 
 ### Phase 1: Subdomain Enumeration
 - Run subfinder with JSON output: \`subfinder -d TARGET -json -silent\`

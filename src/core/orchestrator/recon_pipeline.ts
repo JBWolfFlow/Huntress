@@ -50,6 +50,63 @@
 import { AssetMapBuilder } from './asset_map';
 import type { AssetMap } from './asset_map';
 
+// ─── Canonical attack-machine tool inventory ────────────────────────────────
+//
+// Single source of truth for what's installed in
+// `docker/Dockerfile.attack-machine`. Used by:
+//   - The pipeline below — every `tool` field must appear here.
+//   - `scripts/verify_attack_tools.sh` — runs `--version` for each tool
+//     inside the built image as a smoke test.
+//   - `src/tests/recon_tool_inventory.test.ts` — enforces the invariant
+//     that the pipeline never invokes a tool not in this list.
+//
+// When adding/removing tools, update this constant and the Dockerfile
+// in the same change. The smoke test catches the case where they drift.
+//
+// Convention: keys are the canonical command names invoked in argv[0].
+// Values are the recommended `--version`-style flag for the smoke check.
+// Tools whose authors picked a non-standard probe flag (testssl.sh, gau)
+// have their own entry; everything else uses the default.
+
+export const ATTACK_MACHINE_TOOLS: ReadonlyArray<{
+  name: string;
+  versionArgs: ReadonlyArray<string>;
+  /** True when the tool prints version info to stderr and exits 0. */
+  category: 'go' | 'python' | 'apt' | 'base';
+}> = Object.freeze([
+  // Go binaries pulled from ProjectDiscovery / tomnomnom / ffuf / dalfox releases.
+  { name: 'subfinder',     versionArgs: ['-version'],   category: 'go' },
+  { name: 'assetfinder',   versionArgs: ['-h'],         category: 'go' },
+  { name: 'httpx',         versionArgs: ['-version'],   category: 'go' },
+  { name: 'katana',        versionArgs: ['-version'],   category: 'go' },
+  { name: 'naabu',         versionArgs: ['-version'],   category: 'go' },
+  { name: 'dnsx',          versionArgs: ['-version'],   category: 'go' },
+  { name: 'nuclei',        versionArgs: ['-version'],   category: 'go' },
+  { name: 'gau',           versionArgs: ['--version'],  category: 'go' },
+  { name: 'waybackurls',   versionArgs: ['-h'],         category: 'go' },
+  { name: 'ffuf',          versionArgs: ['-V'],         category: 'go' },
+  { name: 'dalfox',        versionArgs: ['version'],    category: 'go' },
+  { name: 'interactsh-client', versionArgs: ['-version'], category: 'go' },
+  // Python tooling installed in /opt/tools venv.
+  { name: 'sqlmap',        versionArgs: ['--version'],  category: 'python' },
+  { name: 'wafw00f',       versionArgs: ['--version'],  category: 'python' },
+  { name: 'paramspider',   versionArgs: ['-h'],         category: 'python' },
+  // apt packages.
+  { name: 'whatweb',       versionArgs: ['--version'],  category: 'apt' },
+  { name: 'testssl.sh',    versionArgs: ['--version'],  category: 'apt' },
+  { name: 'nmap',          versionArgs: ['-V'],         category: 'apt' },
+  // base utilities.
+  { name: 'curl',          versionArgs: ['--version'],  category: 'base' },
+  { name: 'wget',          versionArgs: ['--version'],  category: 'base' },
+  { name: 'jq',            versionArgs: ['--version'],  category: 'base' },
+  { name: 'dig',           versionArgs: ['-v'],         category: 'base' },
+] as const);
+
+/** Set of canonical tool names — used by the inventory invariant test. */
+export const ATTACK_MACHINE_TOOL_NAMES: ReadonlySet<string> = new Set(
+  ATTACK_MACHINE_TOOLS.map(t => t.name),
+);
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export type StageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
@@ -101,13 +158,15 @@ export interface PipelineResult {
 
 // ─── Pipeline Definition ─────────────────────────────────────────────────────
 
-function buildStages(target: string, config: PipelineConfig): PipelineStage[] {
-  // All tools listed here are installed in docker/Dockerfile.attack-machine.
-  // If a tool is added/removed from the image, keep this function in sync.
-  // Verified present: subfinder, assetfinder, dnsx, naabu, gau, waybackurls,
-  // httpx, katana, wafw00f, whatweb, paramspider, nuclei, testssl.sh.
-  // (getJS and gowitness remain uninstalled — katana -jc and the agent's
-  // Playwright browser cover those use cases.)
+export function buildStages(target: string, config: PipelineConfig): PipelineStage[] {
+  // Every `tool` field referenced below MUST appear in ATTACK_MACHINE_TOOLS
+  // (the canonical inventory at the top of this file). The
+  // `recon_tool_inventory` test enforces that invariant — break it and CI
+  // fails before the bad command ever runs against a target.
+  //
+  // Removed-by-design: getJS, gowitness, jsluice. katana's `-jc` flag
+  // covers JS endpoint extraction; the validator pipeline already runs
+  // Playwright for screenshot evidence.
   const stages: PipelineStage[] = [
     {
       id: 'subdomain_enum',

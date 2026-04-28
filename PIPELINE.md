@@ -3,8 +3,8 @@
 Single source of truth for outstanding work, verified status, and delivery priorities.
 
 - **Last updated:** 2026-04-24
-- **Project score:** 8.9 / 10 — all four real-H1 UX blockers shipped (scope narrowing, economy mode, auth-detector fallback, submit-flow dry run). Validator hardening substantially complete; live-target report calibration (P0-4) is the only remaining gate before first submission.
-- **Test health:** 2,163 TypeScript tests passing (90 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
+- **Project score:** 8.9 / 10 — all four real-H1 UX blockers shipped (scope narrowing, economy mode, auth-detector fallback, submit-flow dry run); P1-2 recon-pipeline tool inventory enforced via single-source-of-truth + invariant tests + Docker smoke script. Validator hardening substantially complete; live-target report calibration (P0-4) is the only remaining gate before first submission.
+- **Test health:** 2,172 TypeScript tests passing (91 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean.
 
 ---
 
@@ -86,13 +86,14 @@ Four concrete items surfaced when the user attempted a live Superhuman hunt on 2
 - 401 auto-retry path exercised at least once.
 **Estimate:** One hunt (~60 minutes) plus any patching surfaced.
 
-### P1-2 · Audit recon pipeline tools against Dockerfile
-**Files:** `docker/Dockerfile.attack-machine`, `src/core/orchestrator/recon_pipeline.ts`
-**Why:** `getJS` is confirmed missing from the image. `waybackurls`, `gau`, `paramspider`, `gowitness`, `testssl.sh`, and `naabu` have not been audited and may fail silently in the pipeline.
-**Acceptance:**
-- Every tool invoked by `recon_pipeline.ts` is present in the Docker image, or the invocation is removed and the recon prompt updated accordingly.
-- A CI-level smoke test (or documented manual check) confirms each tool responds to `--version`.
-**Estimate:** ~45 minutes.
+### P1-2 · Audit recon pipeline tools against Dockerfile  ✅ shipped 2026-04-24
+**Files:** `src/core/orchestrator/recon_pipeline.ts`, `src/agents/recon_agent.ts`, `scripts/verify_attack_tools.sh`, `src/tests/recon_tool_inventory.test.ts`
+**Outcome:** Inventory drift between source code and the Docker image is now caught at three independent layers:
+- **Single source of truth** — `ATTACK_MACHINE_TOOLS` constant (and its derived `ATTACK_MACHINE_TOOL_NAMES` set) listed at the top of `recon_pipeline.ts` with each tool's canonical version-probe args.
+- **Source-side invariants** (no Docker required) — 9 unit tests verify: no duplicates, every entry has non-empty name + probe args, set/array agreement, intentionally-removed tools (`getJS`, `gowitness`, `jsluice`, `findomain`) stay absent, every `buildStages()` `command.tool` field is in the inventory, every `command.command` starts with its declared `tool`, all major recon stages exist, the agent's system prompt mentions every pipeline-referenced tool by name.
+- **Image-side smoke test** — `scripts/verify_attack_tools.sh` runs each inventoried tool's probe inside the built `huntress-attack-machine:latest` container; fails on any missing or unrunnable binary. Run after every Dockerfile change.
+
+Recon agent prompt cleaned up — the methodology header used to claim it would do JS analysis with `getJS`/`jsluice` and screenshots with `gowitness`; now it correctly states `katana -jc` covers JS endpoint extraction and the validator's Playwright handles screenshots. `jsluice` added to the explicit "do NOT attempt" list. 9 tests.
 
 ---
 
