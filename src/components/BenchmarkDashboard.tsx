@@ -176,18 +176,68 @@ export const BenchmarkDashboard: React.FC = () => {
             <StatCard label="Duration" value={formatDuration(latestResult.totalDurationMs)} color="text-gray-300" />
           </div>
 
-          {/* Per-challenge breakdown */}
+          {/* Per-tag breakdown — Phase 1.1 */}
+          {Object.keys(latestResult.byTag ?? {}).length > 0 && (
+            <div className="mt-3 border border-gray-800 rounded p-3">
+              <h4 className="text-xs text-gray-500 mb-2">Score by vulnerability tag</h4>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                {Object.entries(latestResult.byTag)
+                  .sort(([, a], [, b]) => (b.solved / b.total) - (a.solved / a.total))
+                  .map(([tag, stats]) => {
+                    const pct = stats.total > 0 ? (stats.solved / stats.total) * 100 : 0;
+                    const color = pct >= 60 ? 'text-green-400' : pct >= 30 ? 'text-yellow-400' : 'text-red-400';
+                    return (
+                      <div key={tag} className="flex justify-between text-xs">
+                        <span className="text-gray-300">{tag}</span>
+                        <span className={color}>{stats.solved}/{stats.total} ({pct.toFixed(0)}%)</span>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          )}
+
+          {/* Per-level breakdown — Phase 1.1 */}
+          {Object.keys(latestResult.byLevel ?? {}).length > 0 && (
+            <div className="mt-3 border border-gray-800 rounded p-3">
+              <h4 className="text-xs text-gray-500 mb-2">Score by difficulty level</h4>
+              <div className="grid grid-cols-3 gap-x-4 gap-y-1">
+                {Object.entries(latestResult.byLevel)
+                  .sort(([a], [b]) => Number(a) - Number(b))
+                  .map(([level, stats]) => {
+                    const pct = stats.total > 0 ? (stats.solved / stats.total) * 100 : 0;
+                    const color = pct >= 60 ? 'text-green-400' : pct >= 30 ? 'text-yellow-400' : 'text-red-400';
+                    return (
+                      <div key={level} className="flex justify-between text-xs">
+                        <span className="text-gray-300">L{level}</span>
+                        <span className={color}>{stats.solved}/{stats.total} ({pct.toFixed(0)}%)</span>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          )}
+
+          {/* Per-challenge breakdown — now with cost + duration (Phase 1.1) */}
           {latestResult.results.length > 0 && (
             <div className="mt-3 border border-gray-800 rounded p-3">
-              <h4 className="text-xs text-gray-500 mb-2">Results</h4>
-              <div className="space-y-1">
+              <h4 className="text-xs text-gray-500 mb-2">Per-challenge results</h4>
+              <div className="grid grid-cols-[1fr_auto_auto_auto_auto] gap-x-3 text-xs">
+                <span className="text-gray-500 border-b border-gray-800 pb-1">Challenge</span>
+                <span className="text-gray-500 border-b border-gray-800 pb-1 text-right">Status</span>
+                <span className="text-gray-500 border-b border-gray-800 pb-1 text-right">Iter</span>
+                <span className="text-gray-500 border-b border-gray-800 pb-1 text-right">Cost</span>
+                <span className="text-gray-500 border-b border-gray-800 pb-1 text-right">Time</span>
                 {latestResult.results.map(cr => (
-                  <div key={cr.challengeId} className="flex justify-between text-xs">
-                    <span className="text-gray-300">{cr.challengeId}</span>
-                    <span className={cr.solved ? 'text-green-400' : 'text-red-400'}>
-                      {cr.solved ? 'SOLVED' : 'FAILED'}
+                  <React.Fragment key={cr.challengeId}>
+                    <span className="text-gray-300 truncate">{cr.challengeId}</span>
+                    <span className={`text-right ${cr.solved ? 'text-green-400' : 'text-red-400'}`}>
+                      {cr.solved ? 'SOLVED' : cr.error ? 'ERROR' : 'FAILED'}
                     </span>
-                  </div>
+                    <span className="text-right text-gray-400">{cr.iterations}</span>
+                    <span className="text-right text-blue-400">${cr.costUsd.toFixed(3)}</span>
+                    <span className="text-right text-gray-500">{formatDuration(cr.durationMs)}</span>
+                  </React.Fragment>
                 ))}
               </div>
             </div>

@@ -170,6 +170,30 @@ Phase 1 (Q1-Q4 + Q6 Gap 5/7) is shipped and verified. Four Phase 2 items have no
 
 ---
 
+### P0-6 · XBOW benchmark — wire the runner, run it, publish the number
+**Files:** `src/components/BenchmarkDashboard.tsx`, `scripts/run_xbow_benchmark.ts`, `src/core/benchmark/xbow_runner.ts`
+
+**Why:** The 2026-04-28 review's top operational call: "Run the XBOW Validation Benchmark and publish the number, whatever it is. You can't improve what you don't measure." Reviewer prediction: 30–55% range first run.
+
+**Infrastructure status (shipped 2026-04-28):**
+- ✅ `XBOWBenchmarkRunner` (1,190 LOC) — challenge discovery, Docker orchestration, CTF agent loop, SQLite persistence, historical comparison
+- ✅ `BenchmarkDashboard` mounted at App.tsx:507 under the `benchmark` tab — click `[run benchmark]` to trigger
+- ✅ Dashboard now surfaces per-tag breakdown, per-level breakdown, and per-challenge cost + iterations + duration (Phase 1.1 enhancements)
+- ✅ `execute_training_command` Tauri allowlist already includes `git`, `docker`, plus `curl`, `nmap`, `sqlmap`, `nikto`, `gobuster`, `ffuf`, etc. for the CTF solver agent
+- ✅ `scripts/run_xbow_benchmark.ts` — headless CLI runner for cron / CI / first-time scoring without launching Tauri. Usage: `ANTHROPIC_API_KEY=... npx tsx scripts/run_xbow_benchmark.ts [--tags=sqli,xss] [--levels=1,2] [--max-parallel=2]`
+
+**Operational status (TODO):**
+- [ ] **First run** — execute against the full 104-challenge suite (or a representative subset). Cost: ~$50–$200, runtime: hours
+- [ ] Publish the score in §1 header of this doc (replace "8.9/10" with "X% on XBOW benchmark")
+- [ ] Re-run after each P0-3 validator-deepening batch to measure delta
+
+**Smoke test (cheap, ~$5):** Filter to one tag and 5 challenges to validate the pipeline end-to-end before the full run:
+```
+ANTHROPIC_API_KEY=sk-ant-... npx tsx scripts/run_xbow_benchmark.ts --tags=xss --max-parallel=1 --timeout-per-challenge=180000
+```
+
+---
+
 ## 4. P2 — Medium (Coverage & Polish)
 
 ### P2-1 · Cross-subdomain deduplication edge-case tests
