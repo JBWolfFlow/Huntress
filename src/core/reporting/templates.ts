@@ -502,7 +502,78 @@ export function fillTemplate(template: string, data: Record<string, string>): st
   // Remove any remaining unfilled placeholders (e.g., optional sections not provided)
   filled = filled.replace(/\{\{[a-z_]+\}\}/g, '');
 
+  // P0-5-a: Strip lines that became "**Label:** " (label with empty value) after
+  // placeholder substitution — keeps the markdown clean when optional fields
+  // aren't populated. Matches lines that are just "**Foo:** " or "**Foo:** "
+  // followed by trailing whitespace then EOL.
+  filled = filled.replace(/^\*\*[A-Za-z][^:*]*:\*\*\s*$/gm, '');
+  // Collapse multiple consecutive blank lines into one
+  filled = filled.replace(/\n{3,}/g, '\n\n');
+
   return filled.trim();
+}
+
+/**
+ * P0-5-a: Map a validator vuln type (e.g. `xss_reflected`, `sqli_blind_time`,
+ * `cors_misconfiguration`) to a REPORT_TEMPLATES key. Returns null when no
+ * template matches — caller should fall back to the inline-build path.
+ *
+ * Mapping is deliberately conservative: only types where the existing template
+ * is a clean fit. New templates should be added before extending this map.
+ */
+export function getTemplateKey(vulnType: string): string | null {
+  const t = vulnType.toLowerCase().trim();
+  if (t in REPORT_TEMPLATES) return t;
+
+  // XSS family → xss
+  if (t === 'xss_reflected' || t === 'xss_dom' || t === 'xss_stored') return 'xss';
+  // SQLi family → sql_injection
+  if (t === 'sqli_error' || t === 'sqli_blind_time' || t === 'sqli_blind_boolean') return 'sql_injection';
+  // BOLA → idor (same template, two-account access proof)
+  if (t === 'bola') return 'idor';
+  // CORS misconfiguration → cors
+  if (t === 'cors_misconfiguration') return 'cors';
+  // JWT family → jwt
+  if (t.startsWith('jwt_')) return 'jwt';
+  // SSRF family → ssrf
+  if (t === 'ssrf_blind') return 'ssrf';
+  // Command injection family → command_injection
+  if (t === 'command_injection_blind') return 'command_injection';
+  // Path traversal aliases
+  if (t === 'lfi' || t === 'lfi_rce') return 'path_traversal';
+  // CRLF / response splitting
+  if (t === 'crlf_injection') return 'crlf';
+
+  return null;
+}
+
+/**
+ * P0-5-a: Extract the most-likely vulnerable parameter from a URL or step list.
+ * Used to fill `{{parameter}}` placeholders in templates when the caller
+ * didn't pass one explicitly.
+ *
+ * Heuristic order:
+ *   1. Last query-string parameter in `url` (often the injection point)
+ *   2. First `?<param>=` pattern found in `steps`
+ *   3. Returns null when nothing found — fillTemplate strips the placeholder.
+ */
+export function extractParameter(url: string, steps?: string[]): string | null {
+  try {
+    const u = new URL(url);
+    const params = Array.from(u.searchParams.keys());
+    if (params.length > 0) return params[params.length - 1];
+  } catch {
+    // url isn't fully-qualified — fall through to step extraction
+  }
+
+  if (steps) {
+    for (const step of steps) {
+      const m = step.match(/[?&]([a-zA-Z_][a-zA-Z0-9_]*)=/);
+      if (m) return m[1];
+    }
+  }
+
+  return null;
 }
 
 export default REPORT_TEMPLATES;

@@ -15,7 +15,7 @@ import { DuplicateChecker, type Vulnerability, type DuplicateScore } from '../..
 import { SeverityPredictor, type SeverityPrediction, type ProgramBountyRanges } from './severity_predictor';
 import type { H1Report } from './h1_api';
 import type { HttpExchange } from '../../agents/base_agent';
-import { REPORT_TEMPLATES, fillTemplate } from './templates';
+import { REPORT_TEMPLATES, fillTemplate, getTemplateKey, extractParameter } from './templates';
 import { calculateCVSS, estimateMetrics, type CVSSResult } from './cvss_calculator';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -48,6 +48,98 @@ export interface ReportGenerationOptions {
   /** RQ1/RQ3: Structured HTTP exchanges from the agent's ReAct loop */
   httpExchanges?: HttpExchange[];
 }
+
+/**
+ * P0-5-b: Per-vuln-type defaults for H1-required sections used by the
+ * inline-build path (`buildInlineBody`). When a vuln type doesn't have a
+ * REPORT_TEMPLATES entry, these defaults supply Prerequisites / Expected /
+ * Actual / Affected Scope / Remediation so the report still ships with
+ * every section H1 triagers expect.
+ *
+ * Keys mirror validator.ts dispatch types. Add new entries when introducing
+ * a new vuln type that doesn't have a template.
+ */
+interface H1SectionDefaults {
+  prerequisites: string;
+  expected: string;
+  actual: string;
+  affectedScope: string;
+  remediation: string;
+}
+
+const H1_SECTION_DEFAULTS: Record<string, H1SectionDefaults> = {
+  cache_poisoning: {
+    prerequisites: '- HTTP client (curl) capable of setting custom headers\n- A cache buster value to ensure the request reaches the origin\n- Knowledge of which downstream cache the target uses (CloudFront, Akamai, Cloudflare, Varnish)',
+    expected: 'The application should normalize cache keys before storage and reject requests that smuggle attacker-controlled state into cached responses. Headers like X-Forwarded-Host, X-Original-URL, and Host should not be reflected into responses.',
+    actual: 'The attacker-controlled header is reflected into the response body or status, the response is cached by the downstream tier, and subsequent clean requests retrieve the poisoned response.',
+    affectedScope: 'Every user routed through the affected cache tier receives the poisoned response until the cache entry expires or is purged. CDN-cached resources can amplify the impact to all users globally.',
+    remediation: 'Strip or normalize attacker-controllable headers before computing cache keys. Set explicit Cache-Control and Vary headers. Audit which inputs reach the cache and ensure none originate from the request.',
+  },
+  business_logic: {
+    prerequisites: '- A standard user account on the target application\n- HTTP client capable of replaying and modifying requests\n- Understanding of the workflow being abused (cart, checkout, MFA, etc.)',
+    expected: 'The application should enforce business invariants server-side: positive quantities, non-zero prices, sequential workflow steps, and authorization checks at every transition.',
+    actual: 'The server accepts a state transition that violates the documented business rule, allowing the attacker to obtain value or access they should not be entitled to.',
+    affectedScope: 'Depends on the abused workflow. Payment-related flaws affect financial integrity directly; account-creation flaws affect identity boundary; permissions flaws affect every protected resource.',
+    remediation: 'Enforce all business invariants in the server-side handler, not the UI. Add idempotency keys to state transitions. Log and rate-limit anomalous parameter values (negative numbers, zero, very large values).',
+  },
+  race_condition: {
+    prerequisites: '- HTTP client supporting parallel requests (curl with `--parallel`, Python `asyncio`, Burp Turbo Intruder)\n- A target operation with an obvious race window (balance check → debit, coupon application, MFA setup)',
+    expected: 'State-modifying operations should hold a row-level lock for the full read-modify-write cycle and reject concurrent operations on the same resource.',
+    actual: 'Multiple concurrent requests succeed where exactly one should have been allowed — duplicate withdrawals, coupon stacking, account creation collisions.',
+    affectedScope: 'Anyone who can hit the vulnerable endpoint can amplify their privileges or balance. Financial impact tracks directly with the operation\'s monetary value.',
+    remediation: 'Use database-level transactions with appropriate isolation levels (SERIALIZABLE for financial operations) or distributed locks. Add server-side request deduplication via idempotency keys.',
+  },
+  prototype_pollution: {
+    prerequisites: '- A modern browser with DevTools to inspect Object.prototype\n- HTTP client to deliver the polluted payload\n- Understanding of which sink the polluted prototype reaches (Express middleware, template engine, deserialization)',
+    expected: 'User-controlled JSON should not be merged into Object.prototype or used to set arbitrary keys via dotted paths. Libraries should use Object.create(null) or freeze the prototype.',
+    actual: 'A property set on Object.prototype via the vulnerable code path persists across the JS runtime and influences subsequent operations on unrelated objects.',
+    affectedScope: 'All users of the application can be affected because the polluted prototype is process-global. Impact ranges from XSS via gadget chains to RCE in Node.js when the right gadget exists.',
+    remediation: 'Use Object.create(null) for user-controlled key/value containers. Validate JSON keys against an allowlist. Adopt libraries that explicitly defend against prototype pollution (e.g. lodash >= 4.17.21).',
+  },
+  http_smuggling: {
+    prerequisites: '- HTTP client capable of sending raw bytes (the smuggled request must be byte-precise)\n- A target with a front-end (CDN/load balancer) and back-end with parsing disagreement\n- Sometimes a co-operating victim request to demonstrate request hijacking',
+    expected: 'Front-end and back-end should agree on request boundaries. CL.TE, TE.CL, and TE.TE disagreements should be rejected at the front-end with a 400.',
+    actual: 'The front-end uses one header to delimit the request while the back-end uses the other, allowing the attacker to inject a second request that the back-end attributes to a victim\'s connection.',
+    affectedScope: 'Every user who shares the back-end connection pool with the attacker can have their request poisoned, hijacked, or have responses redirected.',
+    remediation: 'Configure front-end and back-end to use HTTP/2 end-to-end (eliminates the parsing disagreement) or normalize CL/TE headers at the front-end and reject ambiguous requests.',
+  },
+  deserialization: {
+    prerequisites: '- The target accepts serialized objects (Pickle, PHP serialize, Java ObjectInputStream, .NET BinaryFormatter, Ruby Marshal)\n- A gadget chain present in the target\'s classpath\n- HTTP client to deliver the payload (often base64-encoded)',
+    expected: 'Untrusted data should never be deserialized. If unavoidable, use a strict allowlist of permitted classes and integrity-check the payload first (HMAC, signature).',
+    actual: 'The deserialization sink instantiates attacker-controlled classes, triggering a gadget chain that runs arbitrary code or modifies application state.',
+    affectedScope: 'Full RCE is the typical outcome; the application server (and anything it can reach) is compromised.',
+    remediation: 'Replace native serialization with safe formats (JSON, MessagePack with schema). If you must deserialize, sign the payload and validate the signature before deserialization.',
+  },
+  ssti: {
+    prerequisites: '- HTTP client capable of POST requests with body parameters\n- Knowledge of the template engine (Jinja2, Twig, Pug, Velocity, ERB) to craft the right payload',
+    expected: 'User input should be passed as data to the template renderer, not concatenated into the template source. Sandboxed evaluators should reject access to filesystem and execution primitives.',
+    actual: 'The application interpolates user input directly into a template string, so the engine evaluates expressions like `{{7*7}}` and emits the result.',
+    affectedScope: 'SSTI typically escalates to RCE on Pug/Jinja/Velocity. Even sandboxed engines often leak filesystem access or environment variables.',
+    remediation: 'Treat user input as data, not template source. Use parameterized template APIs. Sandbox the renderer and remove dangerous globals from the template context.',
+  },
+  saml_attack: {
+    prerequisites: '- A valid SAML assertion from the target IdP\n- A SAML toolkit (SAMLRaider, python3-saml, samltest.id)\n- Understanding of which XSW or signature-wrapping variant the parser accepts',
+    expected: 'The Service Provider should validate that the signature covers the assertion the parser uses, reject extra elements, and verify the IdP issuer + audience.',
+    actual: 'A signature-wrapping variant lets the attacker substitute the signed assertion with one that asserts a different identity, and the SP accepts it.',
+    affectedScope: 'Authentication bypass — the attacker can log in as any user, including admins. The full SP and any federated services are compromised.',
+    remediation: 'Use a SAML library that validates the signed assertion is the one consumed (libsaml-style enforcement). Reject assertions with multiple Assertion elements or unsigned wrapper elements.',
+  },
+  mfa_bypass: {
+    prerequisites: '- A valid first-factor credential (username + password)\n- HTTP client to replay the post-first-factor flow\n- An understanding of how the application binds first and second factors',
+    expected: 'The MFA verification step should be bound to the same session as the first-factor auth, single-use, and rate-limited. Skipping or replaying the second step should fail.',
+    actual: 'The attacker can skip the MFA verification entirely or replay a captured MFA token in another session, completing authentication without the second factor.',
+    affectedScope: 'Every account protected by the bypassed MFA flow is reduced to single-factor security. High-value accounts (admins, finance) are particularly impacted.',
+    remediation: 'Bind the second-factor token to the session ID and the first-factor user. Make it single-use with a short TTL. Audit every code path between first-factor success and the final session issuance.',
+  },
+  // Sensible default for any vuln type without a tailored entry.
+  other: {
+    prerequisites: '- HTTP client (curl, Burp Suite, or browser DevTools)\n- Standard web testing toolkit',
+    expected: 'The application should validate, sanitize, and authorize all incoming requests before performing the requested action.',
+    actual: 'The application processes the malicious request without sufficient validation, producing the security impact described above.',
+    affectedScope: 'See Impact section above for the full blast radius.',
+    remediation: 'Apply the principle of least privilege. Validate inputs against an allowlist. Add server-side authorization checks. Follow the OWASP guidance for this vulnerability class.',
+  },
+};
 
 export class PoCGenerator {
   private qdrant: QdrantClient;
@@ -175,6 +267,19 @@ export class PoCGenerator {
 
     console.log('✓ Report generated successfully');
 
+    // P0-5-a: Capture the original vuln context so toMarkdown() can
+    // template-render or fall back to an enriched inline build with the
+    // H1-required sections (Prerequisites, Vulnerability Details, etc).
+    const inferredMethod = options.httpExchanges?.find(e => e.request.method !== 'GET')?.request.method
+      ?? options.httpExchanges?.[0]?.request.method;
+    const vulnContext: H1Report['vulnContext'] = {
+      type: vuln.type,
+      url: vuln.url,
+      target: vuln.target,
+      parameter: extractParameter(vuln.url, vuln.steps) ?? undefined,
+      method: inferredMethod,
+    };
+
     return {
       title,
       severity: severityPrediction.severity,
@@ -190,19 +295,44 @@ export class PoCGenerator {
       weaknessId,
       httpEvidence,
       quickReproduction,
+      vulnContext,
     };
   }
 
   /**
-   * Convert report to HackerOne markdown format
+   * Convert report to HackerOne markdown format.
+   *
+   * P0-5-a: When `report.vulnContext.type` matches a REPORT_TEMPLATES key
+   * (or normalizes to one via getTemplateKey), the template is filled with
+   * the report's data. Otherwise the inline-build path produces a report
+   * with all H1-required sections (Prerequisites, Vulnerability Details,
+   * Expected vs Actual, Affected Scope, Remediation) — see P0-5-b.
+   *
+   * The header (title + severity + bounty + CVSS + CWE) and trailing
+   * sections (Severity Justification, Duplicate Check) are added in both
+   * paths so the output is consistent regardless of which build was used.
    */
   toMarkdown(report: H1Report): string {
-    let markdown = `# ${report.title}\n\n`;
+    const header = this.buildReportHeader(report);
+    const trailer = this.buildReportTrailer(report);
 
-    // Severity and bounty
+    const templateKey = report.vulnContext ? getTemplateKey(report.vulnContext.type) : null;
+    if (templateKey && REPORT_TEMPLATES[templateKey]) {
+      const body = this.buildTemplatedBody(report, templateKey);
+      return header + body + '\n\n' + trailer;
+    }
+
+    // Fallback: inline build with H1-required sections (P0-5-b)
+    const body = this.buildInlineBody(report);
+    return header + body + trailer;
+  }
+
+  /** Header common to both template-driven and inline-built reports. */
+  private buildReportHeader(report: H1Report): string {
+    let markdown = `# ${report.title}\n\n`;
     markdown += `**Severity:** ${report.severity.toUpperCase()}\n`;
     markdown += `**Suggested Bounty:** $${report.suggestedBounty.min.toLocaleString()} - $${report.suggestedBounty.max.toLocaleString()}\n`;
-    
+
     if (report.cvssScore) {
       markdown += `**CVSS Score:** ${report.cvssScore}`;
       if (report.cvssVector) {
@@ -210,18 +340,89 @@ export class PoCGenerator {
       }
       markdown += '\n';
     }
-    
+
     if (report.weaknessId) {
       markdown += `**CWE:** CWE-${report.weaknessId}\n`;
     }
-    
+
     markdown += '\n---\n\n';
+    return markdown;
+  }
+
+  /**
+   * P0-5-a: Build the body section by filling a REPORT_TEMPLATES entry.
+   * Templates carry H1-standard sections (Prerequisites, Vulnerability
+   * Details, Expected vs Actual, Affected Scope, Remediation); we just
+   * supply the placeholders.
+   */
+  private buildTemplatedBody(report: H1Report, templateKey: string): string {
+    const template = REPORT_TEMPLATES[templateKey];
+    const ctx = report.vulnContext!;
+
+    const stepsBlock = report.steps
+      .map((step, i) => `${i + 1}. ${step}`)
+      .join('\n');
+
+    const pocBlock = this.buildPocBlock(report);
+
+    const data: Record<string, string> = {
+      url: ctx.url,
+      severity: report.severity.toUpperCase(),
+      steps: stepsBlock,
+      http_evidence: report.httpEvidence ?? '_No structured HTTP evidence captured during this run._',
+      poc: pocBlock,
+      quick_reproduction: report.quickReproduction ?? '_See Steps to Reproduce above._',
+    };
+
+    if (ctx.parameter) data.parameter = ctx.parameter;
+    if (ctx.payload) data.payload = ctx.payload;
+    if (ctx.method) data.method = ctx.method;
+    // Endpoint = URL path (templates use this for IDOR/JWT)
+    try {
+      const u = new URL(ctx.url);
+      data.endpoint = u.pathname;
+      data.origin = `${u.protocol}//${u.host}`;
+    } catch {
+      data.endpoint = ctx.url;
+    }
+    // Type-specific extras with sane defaults
+    data.xss_type = ctx.type.replace(/^xss_/, '') || 'reflected';
+    data.attack_type = ctx.type.replace(/^jwt_/, '').replace(/_/g, ' ') || 'signature bypass';
+    data.database_type = 'unspecified';
+
+    return fillTemplate(template, data);
+  }
+
+  /**
+   * P0-5-b: Inline-build body for vuln types without a template, but with
+   * the same H1-required sections that templates carry. Pulls per-type
+   * defaults from `H1_SECTION_DEFAULTS` so every report (templated or not)
+   * carries Prerequisites / Vulnerability Details / Expected vs Actual /
+   * Affected Scope / Remediation.
+   */
+  private buildInlineBody(report: H1Report): string {
+    const ctx = report.vulnContext;
+    const type = ctx?.type ?? 'other';
+    const defaults = H1_SECTION_DEFAULTS[type] ?? H1_SECTION_DEFAULTS.other;
+
+    let markdown = '';
+
+    // Vulnerability Details — only when we have context
+    if (ctx) {
+      markdown += `## Vulnerability Details\n\n`;
+      markdown += `**Target:** ${ctx.target}\n`;
+      markdown += `**URL:** ${ctx.url}\n`;
+      if (ctx.method) markdown += `**Method:** ${ctx.method}\n`;
+      if (ctx.parameter) markdown += `**Parameter:** ${ctx.parameter}\n`;
+      if (ctx.payload) markdown += `**Payload:** \`${ctx.payload}\`\n`;
+      markdown += `**Severity:** ${report.severity.toUpperCase()}\n\n`;
+    }
+
+    // Prerequisites
+    markdown += `## Prerequisites\n\n${defaults.prerequisites}\n\n`;
 
     // Description
     markdown += `## Description\n\n${report.description}\n\n`;
-
-    // Impact
-    markdown += `## Impact\n\n${report.impact}\n\n`;
 
     // Steps to Reproduce
     markdown += `## Steps to Reproduce\n\n`;
@@ -240,30 +441,52 @@ export class PoCGenerator {
       markdown += `## Quick Reproduction\n\n${report.quickReproduction}\n\n`;
     }
 
+    // Expected vs Actual Behavior — H1 explicitly requires this
+    markdown += `## Expected vs Actual Behavior\n\n`;
+    markdown += `**Expected:** ${defaults.expected}\n\n`;
+    markdown += `**Actual:** ${defaults.actual}\n\n`;
+
     // Proof of Concept
-    if (report.proof.video || report.proof.screenshots?.length || report.proof.logs?.length) {
-      markdown += `## Proof of Concept\n\n`;
-
-      if (report.proof.video) {
-        markdown += `**Video Recording:** ${report.proof.video}\n\n`;
-      }
-
-      if (report.proof.screenshots && report.proof.screenshots.length > 0) {
-        markdown += `**Screenshots:**\n`;
-        report.proof.screenshots.forEach((screenshot, index) => {
-          markdown += `- Screenshot ${index + 1}: ${screenshot}\n`;
-        });
-        markdown += '\n';
-      }
-
-      if (report.proof.logs && report.proof.logs.length > 0) {
-        markdown += `**Logs:**\n`;
-        report.proof.logs.forEach((log, index) => {
-          markdown += `- Log ${index + 1}: ${log}\n`;
-        });
-        markdown += '\n';
-      }
+    const pocBlock = this.buildPocBlock(report);
+    if (pocBlock !== '_No additional proof artifacts attached._') {
+      markdown += `## Proof of Concept\n\n${pocBlock}\n\n`;
     }
+
+    // Impact
+    markdown += `## Impact\n\n${report.impact}\n\n`;
+
+    // Affected Scope
+    markdown += `## Affected Scope\n\n${defaults.affectedScope}\n\n`;
+
+    // Remediation
+    markdown += `## Remediation\n\n${defaults.remediation}\n\n`;
+
+    return markdown;
+  }
+
+  /** Build the PoC artifacts block — used by both template and inline paths. */
+  private buildPocBlock(report: H1Report): string {
+    const parts: string[] = [];
+    if (report.proof.video) {
+      parts.push(`**Video Recording:** ${report.proof.video}`);
+    }
+    if (report.proof.screenshots && report.proof.screenshots.length > 0) {
+      parts.push('**Screenshots:**');
+      report.proof.screenshots.forEach((s, i) => parts.push(`- Screenshot ${i + 1}: ${s}`));
+    }
+    if (report.proof.logs && report.proof.logs.length > 0) {
+      parts.push('**Logs:**');
+      report.proof.logs.forEach((log, i) => parts.push(`- Log ${i + 1}: ${log}`));
+    }
+    if (parts.length === 0) {
+      return '_No additional proof artifacts attached._';
+    }
+    return parts.join('\n');
+  }
+
+  /** Trailing sections common to both build paths (Severity Justification, Duplicate Check). */
+  private buildReportTrailer(report: H1Report): string {
+    let markdown = '';
 
     // Severity Justification
     if (report.severityJustification && report.severityJustification.length > 0) {
@@ -522,8 +745,21 @@ export class PoCGenerator {
   private formatStructuredExchanges(exchanges: HttpExchange[]): string {
     const parts: string[] = [];
 
-    // Show up to 5 most relevant exchanges (the ones most likely to demonstrate the vuln)
-    const displayExchanges = exchanges.slice(0, 5);
+    // P0-5-d: Show up to 10 exchanges, ranked by relevance to the vuln proof.
+    // Ranking heuristic (higher = more relevant):
+    //   +3 method is non-GET (POST/PUT/DELETE/PATCH = state-changing, exploitation step)
+    //   +2 status is anomalous (4xx, 5xx, or unusual 2xx range often proves impact)
+    //   +1 response body contains an obvious indicator (error, alert, ENTITY, etc.)
+    //   +index/exchanges.length: later requests usually demonstrate the exploit
+    // The original positional order is preserved as a tiebreaker so multi-step
+    // chains read top-to-bottom in the report.
+    const ranked = exchanges
+      .map((ex, originalIndex) => ({ ex, originalIndex, score: this.exchangeRelevanceScore(ex, originalIndex, exchanges.length) }))
+      .sort((a, b) => b.score - a.score || a.originalIndex - b.originalIndex)
+      .slice(0, 10)
+      .sort((a, b) => a.originalIndex - b.originalIndex)
+      .map(r => r.ex);
+    const displayExchanges = ranked;
 
     for (let i = 0; i < displayExchanges.length; i++) {
       const ex = displayExchanges[i];
@@ -567,7 +803,13 @@ export class PoCGenerator {
       }
 
       if (ex.response.bodySnippet) {
-        const snippetLimit = 500;
+        // P0-5-c: Raise body-snippet cap from 500 → 2000 chars on the most-relevant
+        // exchange (the last one — typically the exploitation step that proves
+        // impact); keep 500 chars on context exchanges so reports don't bloat.
+        // The "$500 vs $5000" delta per docs/RESEARCH_H1_REPORT_QUALITY.md is
+        // showing exact data accessed; 500 chars often truncates that proof.
+        const isMostRelevant = i === displayExchanges.length - 1;
+        const snippetLimit = isMostRelevant ? 2000 : 500;
         const snippet = ex.response.bodySnippet.length > snippetLimit
           ? ex.response.bodySnippet.substring(0, snippetLimit) + '\n[...truncated]'
           : ex.response.bodySnippet;
@@ -586,6 +828,22 @@ export class PoCGenerator {
     }
 
     return parts.join('\n\n');
+  }
+
+  /**
+   * P0-5-d: Score an HttpExchange by likely relevance to the vuln proof.
+   * See ranking heuristic in formatStructuredExchanges() above.
+   */
+  private exchangeRelevanceScore(ex: HttpExchange, index: number, total: number): number {
+    let score = 0;
+    if (ex.request.method !== 'GET') score += 3;
+    const status = ex.response.status;
+    if (status >= 400 || (status >= 200 && status !== 200 && status !== 204)) score += 2;
+    const body = (ex.response.bodySnippet ?? '').toLowerCase();
+    if (/error|exception|denied|forbidden|alert\(|<script|entity|union\s+select|sleep\s*\(|sqlstate/i.test(body)) score += 1;
+    // Later requests usually carry the exploit payload
+    score += (total > 1) ? (index / (total - 1)) : 0;
+    return score;
   }
 
   private extractHttpFromText(text: string): string | null {

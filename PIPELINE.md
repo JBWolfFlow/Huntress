@@ -81,17 +81,17 @@ ssrf_blind, xxe_blind, command_injection_blind, lfi, lfi_rce, oauth_redirect_uri
 ### P0-5 · Report writer rebuild — make every generated report a triage-ready H1 submission
 **Files:** `src/core/reporting/poc_generator.ts`, `src/core/reporting/templates.ts`, `src/core/reporting/report_quality.ts`
 
-**Why:** Code audit on 2026-04-28 found that `REPORT_TEMPLATES` (10 H1-standard templates with Prerequisites / Vulnerability Details / Expected vs Actual / Affected Scope / Remediation sections) is imported by `poc_generator.ts` but never called. `toMarkdown()` builds reports inline section-by-section and produces output that is **missing every H1-required section beyond Description / Impact / Steps / Proof**. This is the single largest report-quality gap.
+**Why:** Code audit on 2026-04-28 found that `REPORT_TEMPLATES` (10 H1-standard templates with Prerequisites / Vulnerability Details / Expected vs Actual / Affected Scope / Remediation sections) was imported by `poc_generator.ts` but never called. `toMarkdown()` built reports inline section-by-section, producing output missing every H1-required section beyond Description / Impact / Steps / Proof. This was the single largest report-quality gap.
 
-Every dollar P0-3 (validator hardening) earns is forfeit if the report submitted at the end of the chain looks like AI slop. Per `docs/RESEARCH_H1_REPORT_QUALITY.md` triage signals: "no raw HTTP request/response pairs", "perfectly formatted prose with extensive bullet lists", "generic impact without specific data" — current `toMarkdown()` output trips multiple of these.
+Every dollar P0-3 (validator hardening) earns is forfeit if the report submitted at the end of the chain looks like AI slop. Per `docs/RESEARCH_H1_REPORT_QUALITY.md` triage signals: "no raw HTTP request/response pairs", "perfectly formatted prose with extensive bullet lists", "generic impact without specific data" — older `toMarkdown()` output tripped multiple of these.
 
-**Quick wins (≤1 day each):**
+**Quick wins (a-e shipped 2026-04-28):**
 
-- **P0-5-a · Wire `REPORT_TEMPLATES` into `toMarkdown()`.** Pick template by `vuln.type`, `fillTemplate()` with extracted data (url, parameter, payload, severity, http_evidence, poc, quick_reproduction), fall back to current inline build for vuln types without a template. Single change makes every report 2× more H1-compliant.
-- **P0-5-b · Add the missing H1 sections to the inline-build fallback** for vuln types without a template: Prerequisites (per-vuln-type defaults), Vulnerability Details block (URL / Method / Parameter / Payload / Severity), **Expected vs Actual Behavior**, Affected Scope, Remediation. H1 docs explicitly require Expected vs Actual.
-- **P0-5-c · Raise `bodySnippet` cap from 500 → 2000 chars** on the response that proves the vuln; keep 500 for context responses. The difference between a $500 and $5000 report per research doc is "showed specific data accessed, not theoretical impact."
-- **P0-5-d · Show all relevant exchanges, not just 5.** Sort by relevance (exploitation step weighted higher than recon). Cap at 10.
-- **P0-5-e · Add per-vuln-type evidence checklist to `report_quality.ts`** based on the Evidence Decision Matrix in `docs/RESEARCH_H1_REPORT_QUALITY.md` §8. Quality scorer should fail reports missing the required evidence shape for their type (e.g. CORS without cross-origin fetch PoC → fail; XSS without `alert(document.domain)` → fail; cache poisoning without 3-step proof → fail; IDOR without two-account comparison → fail).
+- ✅ **P0-5-a · Wire `REPORT_TEMPLATES` into `toMarkdown()`.** New `getTemplateKey()` + `extractParameter()` helpers in `templates.ts`; `H1Report.vulnContext` carries type/url/parameter/payload/method through to render time; `buildTemplatedBody()` fills the matching template, falls back to enriched inline build otherwise. Empty `**Label:** ` lines are stripped post-fill.
+- ✅ **P0-5-b · Inline-build fallback now carries every H1-required section** via per-vuln-type `H1_SECTION_DEFAULTS` covering 9 specific types + an "other" default. Vulnerability Details, Prerequisites, Expected vs Actual, Affected Scope, Remediation all populated.
+- ✅ **P0-5-c · Body snippet cap raised** to 2000 chars on the most-relevant exchange (typically the exploitation step), 500 chars on context exchanges.
+- ✅ **P0-5-d · Up to 10 exchanges shown**, ranked by relevance (non-GET +3, anomalous status +2, indicator pattern in body +1, position bonus). Display order preserves original sequence so multi-step chains read top-to-bottom.
+- ✅ **P0-5-e · Per-vuln-type evidence checklist** in `report_quality.ts` (`EVIDENCE_REQUIREMENTS`). Covers cors_misconfiguration / cache_poisoning / xss_reflected / xss_dom / xss_stored / idor / bola / ssrf / ssrf_blind / open_redirect / sqli_error / sqli_blind_time / race_condition. Reports missing the required evidence shape are capped below the submission threshold (overall ≤ 55, `meetsThreshold=false`). 31 new tests in `p0_5_report_writer.test.ts`.
 
 **Medium (1-2 days each):**
 
@@ -187,15 +187,6 @@ Phase 1 (Q1-Q4 + Q6 Gap 5/7) is shipped and verified. Four Phase 2 items have no
 C1/C2 apply a global severity calibration prompt. Only `host_header.ts` carries type-specific guidance (preconnect reflection ≠ SSRF). Other agents with well-known misclassification patterns would benefit from the same treatment.
 
 **Acceptance:** Each agent whose type has a documented false-positive pattern includes explicit guidance in its system prompt.
-
-### P2-3 · Tinyproxy `PidFile` move + TCP startup probe (Session 25 #9)
-**File:** `docker/entrypoint.sh`
-
-PIPELINE.md previously claimed this was shipped (Session 25 #9). Code audit on 2026-04-28 found `entrypoint.sh` exists but neither the PidFile move nor the TCP startup probe is present. Either ship the change or strike the claim — currently the doc and the code disagree.
-
-**Acceptance:** `tinyproxy.conf` `PidFile` set to `/tmp/tinyproxy.pid`. `entrypoint.sh` waits for tinyproxy to accept TCP on 127.0.0.1:3128 before exec'ing the agent command.
-
-**Estimate:** ~1 hour.
 
 ### P2-4 · I7 / I8 architecture verified — add agent-count tests
 The Blackboard cross-agent sharing (I7) and WAF context injection (I8) infrastructure is shipped. **No test verifies that all 27 agents actually receive the injected context.** A future agent added without proper config would silently miss SharedFinding/WafContext. Add a test that enumerates the agent catalog and asserts every agent receives both contexts.
@@ -302,8 +293,8 @@ xss_reflected/dom/stored, sqli_error/blind_time, ssrf, idor, bola, open_redirect
 | Item | Evidence |
 |---|---|
 | Recon `success=true` on `iteration_limit` with ≥3 tool calls | `react_loop.ts:542-552` (16 tests) |
-| `dnsx` and `wafw00f` added to attack-machine Dockerfile | `docker/Dockerfile.attack-machine` |
-| ~~Tinyproxy `PidFile` to `/tmp` + TCP startup probe~~ | **NOT FOUND in code** — see P2-3 |
+| `dnsx` and `wafw00f` added to attack-machine Dockerfile | `docker/Dockerfile.attack-machine:60,88` |
+| Tinyproxy `PidFile` to `/tmp` + TCP startup probe (Session 25 #9) | `docker/tinyproxy.conf:28` (`PidFile "/tmp/tinyproxy.pid"`); `docker/entrypoint.sh:40-46` (TCP probe via `/dev/tcp`); live-verified 2026-04-28: in-scope returns 200, out-of-scope returns 000/exit 56 (blocked by filter, not exit 7) |
 | Recon emits `category: 'endpoint'` observations capped at 50 | `recon_agent.ts:332,361` |
 | `browser_fill` action + tool schema + ReactLoop handler | `tool_schemas.ts:469`; ReactLoop handler |
 | AuthWorkerAgent + `capture_complete`/`capture_failed` schemas + XHR interception | `auth_worker_agent.ts:1-80`; `tool_schemas.ts:426-469`; `react_loop.ts:1865-1908` |

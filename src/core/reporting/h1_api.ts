@@ -52,6 +52,22 @@ export interface H1Report {
   httpEvidence?: string;
   /** RQ5: Executable reproduction commands (curl, Python) */
   quickReproduction?: string;
+  /**
+   * P0-5-a: Original vuln context needed for template-driven rendering.
+   * Populated by `PoCGenerator.generateReport()` from the input Vulnerability.
+   * Drives template selection in `toMarkdown()` and supplies placeholder data
+   * (url, parameter, payload). Optional so test fixtures and external callers
+   * that build H1Report by hand still work — those fall through to the
+   * inline-build path in `toMarkdown()`.
+   */
+  vulnContext?: {
+    type: string;
+    url: string;
+    target: string;
+    parameter?: string;
+    payload?: string;
+    method?: string;
+  };
 }
 
 export interface Attachment {

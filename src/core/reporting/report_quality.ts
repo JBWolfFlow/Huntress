@@ -172,6 +172,113 @@ const PAYLOAD_PARAMETER_PATTERNS = [
   /\bpayload\b/i,
 ];
 
+// ─── P0-5-e: Per-vuln-type evidence requirements (H1 Decision Matrix) ──────
+
+interface EvidenceRequirement {
+  /** Human-readable description shown in the issue message. */
+  description: string;
+  /** Regex patterns; ANY match in the report's combined text counts as satisfied. */
+  patterns: RegExp[];
+  /** Concrete advice the report author should follow to satisfy the check. */
+  suggestion: string;
+}
+
+/**
+ * Per-vuln-type evidence requirements derived from
+ * `docs/RESEARCH_H1_REPORT_QUALITY.md` §8 (Evidence Decision Matrix). Reports
+ * whose `vulnContext.type` matches a key here MUST satisfy every listed
+ * requirement or the scorer caps the overall at MINIMUM_QUALITY_THRESHOLD-5.
+ *
+ * The intent is to prevent submission of reports that are structurally weak
+ * for their vuln class — e.g. CORS without cross-origin fetch PoC, XSS with
+ * alert(1) instead of alert(document.domain), Open Redirect without a chain.
+ * These are the same shapes H1 triagers auto-reject.
+ *
+ * Add new entries when introducing new validators with known triage criteria.
+ */
+const EVIDENCE_REQUIREMENTS: Record<string, EvidenceRequirement[]> = {
+  cors_misconfiguration: [{
+    description: 'CORS report must demonstrate cross-origin data theft, not just header reflection',
+    patterns: [/cross[- ]?origin\s+(fetch|request|read)/i, /attacker[- ]?controlled\s+(html|page|origin)/i, /<html[\s\S]+fetch\(/i],
+    suggestion: 'Add a working PoC HTML page (hosted on attacker origin) that uses fetch() with credentials: \'include\' to read the target endpoint and extracts at least one sensitive value. Header reflection alone is H1 Core Ineligible.',
+  }],
+  cache_poisoning: [{
+    description: 'Cache poisoning needs 3-step proof: poison → cache HIT → clean request returns poisoned response',
+    patterns: [/(cf-cache-status|x-cache|age:)\s*[^\n]*hit/i, /clean\s+request|second\s+request|step\s*3|third\s+request/i],
+    suggestion: 'Show all 3 steps: (1) poison request with cache buster + attacker-controlled header, (2) confirm CF-Cache-Status: HIT or X-Cache: HIT in the response, (3) a clean request from a different client returns the poisoned content.',
+  }],
+  xss_reflected: [{
+    description: 'Reflected XSS PoC must use alert(document.domain) to prove execution context — not alert(1)',
+    patterns: [/alert\(document\.(domain|cookie)\)/i, /document\.location\s*=|document\.cookie/i],
+    suggestion: 'Replace alert(1) with alert(document.domain). Triagers reject XSS PoCs that only show alert(1) because they don\'t prove the execution context (vs. extension, sandbox, mismatched origin).',
+  }],
+  xss_dom: [{
+    description: 'DOM XSS PoC must use alert(document.domain) to prove execution context',
+    patterns: [/alert\(document\.(domain|cookie)\)/i, /document\.location\s*=|document\.cookie/i],
+    suggestion: 'Replace alert(1) with alert(document.domain). DOM XSS reports without execution-context proof are routinely closed as Informative.',
+  }],
+  xss_stored: [{
+    description: 'Stored XSS needs two-session proof: payload injected by Account A executes when triggered by Account B',
+    patterns: [/account\s+(a|b)\b|user\s+(a|b)\b|two\s+(account|user|session)|from\s+(another|different|second)\s+(account|user|browser)/i],
+    suggestion: 'Show both sides: (1) inject payload while authenticated as User A, (2) load the page in a different session (User B) and observe the script executing. Self-XSS is auto-rejected.',
+  }],
+  idor: [{
+    description: 'IDOR proof requires two accounts: User A accesses User B\'s resource by swapping the identifier',
+    // Patterns are deliberately specific — "attacker" or "user" alone matches
+    // most reports and would create false positives (every impact section
+    // mentions an attacker). Require explicit two-account language.
+    patterns: [
+      /\b(user|account)\s+a\b/i,
+      /\b(user|account)\s+b\b/i,
+      /\btwo[- ]?(account|user|session)s?\b/i,
+      /\bswap(ping|ped)?\s+(the\s+)?(user[- ]?)?id/i,
+      /\bcross[- ]user\s+(access|comparison|proof)/i,
+    ],
+    suggestion: 'Show two distinct authenticated requests: (1) as User A → returns A\'s data, (2) as User A but with B\'s ID → returns B\'s data. Include the differing Authorization headers / cookies to prove cross-user access.',
+  }],
+  bola: [{
+    description: 'BOLA proof requires two accounts: User A accesses User B\'s object by swapping the object ID',
+    patterns: [
+      /\b(user|account)\s+a\b/i,
+      /\b(user|account)\s+b\b/i,
+      /\btwo[- ]?(account|user|session)s?\b/i,
+      /\bswap(ping|ped)?\s+(the\s+)?(object|resource)?[- ]?id/i,
+      /\bcross[- ]user\s+(access|comparison|proof|object)/i,
+    ],
+    suggestion: 'Demonstrate cross-user object access: same endpoint, two authenticated sessions, identifier swapped, both responses captured.',
+  }],
+  ssrf: [{
+    description: 'Full SSRF must show actual internal data accessed (cloud metadata, internal service response, localhost-only endpoint)',
+    patterns: [/169\.254\.169\.254|metadata\.google\.internal|metadata\.azure\.com/i, /internal[^\w]+(network|service|endpoint|api|host)/i, /\b127\.0\.0\.1\b|\blocalhost\b|\b10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.|192\.168\./],
+    suggestion: 'Show concrete internal data: cloud metadata (169.254.169.254), an internal service response, or a localhost-only endpoint. SSRF on features designed to fetch URLs (image proxy, URL preview) without internal access is auto-rejected.',
+  }],
+  ssrf_blind: [{
+    description: 'Blind SSRF must include OOB callback proof (DNS or HTTP) from the target server',
+    patterns: [/interactsh|burp\s+collaborator|webhook\.site|oast\.|oob[- ]server|requestbin/i, /callback\s+(received|fired|hit|landed|observed)|dns\s+lookup\s+(received|observed)/i],
+    suggestion: 'Add OOB callback evidence: deploy interactsh-client or Burp Collaborator, trigger the SSRF with a unique callback URL, and capture the DNS or HTTP log proving the server fetched it.',
+  }],
+  open_redirect: [{
+    description: 'Open Redirect alone is auto-rejected — must chain to OAuth callback hijack, token theft, or credible phishing impact',
+    patterns: [/oauth[\s_-]?(callback|redirect|token)|token\s+(theft|hijack|leak)/i, /phish|account\s+takeover|ato\b/i, /chain(ed|s)?\s+(to|with)/i],
+    suggestion: 'Add the chain: show how the open redirect leads to OAuth callback hijack, session token theft via Referer leak, or a phishing page that mimics the trusted origin. Standalone redirects are H1 Core Ineligible.',
+  }],
+  sqli_error: [{
+    description: 'SQLi proof must show actual data extracted, not just a SQL error',
+    patterns: [/union\s+select|extracted|dumped|database\s+(name|version|user)|@@version|information_schema|select.*from\s+(users|admin|information)/i],
+    suggestion: 'Show real data extraction: a UNION SELECT result, @@version output, table list from information_schema, or auth bypass that grants login without credentials. "Error message looks SQL-y" is not enough.',
+  }],
+  sqli_blind_time: [{
+    description: 'Time-based blind SQLi needs differential timing proof: baseline vs SLEEP/BENCHMARK injection response times',
+    patterns: [/sleep\s*\(\s*\d+\s*\)|benchmark\s*\(|pg_sleep\s*\(|waitfor\s+delay/i, /baseline\s+(time|response|request)|timing\s+(diff|delta|comparison)|\b(\d+)s?\s+(longer|delay|slower)/i],
+    suggestion: 'Capture both timings: clean request (~Xms), SLEEP(5) injection (~5000ms+X), report the delta. Without paired timings the finding reads as "might be injectable" and gets closed.',
+  }],
+  race_condition: [{
+    description: 'Race condition needs HTTP/2 single-packet attack or N-concurrent-request proof showing a different outcome than 1 sequential request',
+    patterns: [/single[- ]?packet|http\/2|concurrent\s+(requests?|operations?)|turbo[- ]?intruder|asyncio\.gather|--parallel/i, /\b(10|20|30|40|50|100)\s+(requests?|threads?|connections?)/i],
+    suggestion: 'Show: baseline (1 sequential request → expected outcome) vs race (20+ concurrent requests via HTTP/2 single-packet or Turbo Intruder → multiple successful outcomes that should have been mutually exclusive).',
+  }],
+};
+
 // ─── Enhancement system prompt ──────────────────────────────────────────────
 
 const ENHANCEMENT_SYSTEM_PROMPT = `You are a HackerOne report quality expert. Your job is to improve vulnerability reports so they are clear, complete, and compelling to triagers.
@@ -249,7 +356,19 @@ export class ReportQualityScorer {
       }
     }
 
-    const adjustedOverall = Math.max(0, overall - severityPenalty);
+    let adjustedOverall = Math.max(0, overall - severityPenalty);
+
+    // P0-5-e: Hard cap when the report is missing an H1 Decision Matrix
+    // evidence shape for its vuln type. Caps below MINIMUM_QUALITY_THRESHOLD
+    // so meetsThreshold flips false and the submission gate blocks the
+    // report. Cap is applied AFTER severity penalty so both apply.
+    const hasVulnTypeEvidenceGap = issues.some(i =>
+      i.severity === 'critical' && i.message.startsWith('Missing required evidence shape for ')
+    );
+    if (hasVulnTypeEvidenceGap) {
+      adjustedOverall = Math.min(adjustedOverall, MINIMUM_QUALITY_THRESHOLD - 5);
+    }
+
     const meetsThreshold = adjustedOverall >= MINIMUM_QUALITY_THRESHOLD;
 
     if (!meetsThreshold) {
@@ -284,8 +403,46 @@ export class ReportQualityScorer {
     this.collectHttpEvidenceIssues(report, issues);
     this.collectExecutablePocIssues(report, issues);
     this.collectExpectedVsActualIssues(report, issues);
+    // P0-5-e: Per-vuln-type evidence shape check (H1 Decision Matrix).
+    this.collectVulnTypeEvidenceIssues(report, issues);
 
     return issues;
+  }
+
+  /**
+   * P0-5-e: Verify the report carries the evidence shape H1 triagers expect
+   * for its specific vuln class. Missing requirements add critical issues
+   * which `scoreReport` then uses to cap the overall score below the
+   * submission threshold.
+   */
+  private collectVulnTypeEvidenceIssues(report: H1Report, issues: QualityIssue[]): void {
+    const vulnType = report.vulnContext?.type;
+    if (!vulnType) return;
+
+    const reqs = EVIDENCE_REQUIREMENTS[vulnType];
+    if (!reqs || reqs.length === 0) return;
+
+    // Combine all report text once — patterns may match anywhere
+    const allText = [
+      report.title,
+      report.description,
+      report.impact,
+      ...report.steps,
+      report.httpEvidence ?? '',
+      report.quickReproduction ?? '',
+    ].join('\n');
+
+    for (const req of reqs) {
+      const passes = req.patterns.some(p => p.test(allText));
+      if (!passes) {
+        issues.push({
+          category: 'evidence',
+          severity: 'critical',
+          message: `Missing required evidence shape for ${vulnType}: ${req.description}`,
+          suggestion: req.suggestion,
+        });
+      }
+    }
   }
 
   /**

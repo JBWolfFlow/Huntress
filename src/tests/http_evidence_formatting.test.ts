@@ -165,17 +165,21 @@ describe('PoCGenerator.formatHttpEvidence', () => {
     expect(result).toBeUndefined();
   });
 
-  it('limits displayed exchanges to 5', () => {
-    const manyExchanges = Array.from({ length: 10 }, (_, i) => ({
+  it('limits displayed exchanges to 10 (P0-5-d: was 5, raised to give triagers more proof)', () => {
+    const manyExchanges = Array.from({ length: 15 }, (_, i) => ({
       request: { method: 'GET' as const, url: `https://target.com/path${i}` },
       response: { status: 200, bodySnippet: `Response ${i}` },
     }));
     const result = generator.formatHttpEvidence(manyExchanges);
     expect(result).toBeDefined();
-    // Should contain paths 0-4 but not 5-9
-    expect(result).toContain('path0');
-    expect(result).toContain('path4');
-    expect(result).not.toContain('path5');
+    // Cap is 10 — all 15 GETs have equal relevance score, so the rank-then-original-order
+    // logic preserves the first 10 by original position (later GETs get a slight position
+    // bonus, so they win, and then the result re-sorts by original index for display).
+    const labels = result!.match(/\*\*Request \d+:\*\*/g) ?? [];
+    expect(labels.length).toBe(10);
+    // Path11 (later, slight position bonus) should appear; path0 (earliest, lowest score) should not.
+    expect(result).toContain('path14');
+    expect(result).not.toContain('path0');
   });
 });
 
