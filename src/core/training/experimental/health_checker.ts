@@ -11,12 +11,12 @@
  */
 
 import { EventEmitter } from 'eventemitter3';
-import { QdrantClient } from '../memory/qdrant_client';
+import { QdrantClient } from '../../memory/qdrant_client';
 import { ModelVersionManager } from './model_manager';
 import { PerformanceMonitor } from './performance_monitor';
 import { LearningLoopOrchestrator } from './learning_loop';
 import { ModelDeploymentManager } from './deployment_manager';
-import { fs, path, getSystemInfo } from '../tauri_bridge';
+import { fs, path, getSystemInfo } from '../../tauri_bridge';
 
 /**
  * Health status for a component

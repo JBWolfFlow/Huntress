@@ -10,9 +10,9 @@
  */
 
 import { EventEmitter } from 'eventemitter3';
-import { QdrantClient } from '../memory/qdrant_client';
+import { QdrantClient, type SearchResult } from '../../memory/qdrant_client';
 import { TrainingExample } from './data_collector';
-import { fs, path } from '../tauri_bridge';
+import { fs, path } from '../../tauri_bridge';
 
 /**
  * Performance metrics snapshot
@@ -474,7 +474,7 @@ export class PerformanceMonitor extends EventEmitter {
   private async getRecentSessions(count: number): Promise<TrainingExample[]> {
     const zeroVector = new Array(1536).fill(0);
     const results = await this.qdrant.searchWithFilter(zeroVector, {}, count);
-    return results.map(r => r.payload.data as TrainingExample);
+    return results.map((r: SearchResult) => r.payload.data as TrainingExample);
   }
 
   /**

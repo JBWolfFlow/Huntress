@@ -8,7 +8,7 @@
  * rollback capability (<5 minutes), and metadata tracking.
  */
 
-import { fs, path } from '../tauri_bridge';
+import { fs, path } from '../../tauri_bridge';
 import { EventEmitter } from 'eventemitter3';
 
 /**

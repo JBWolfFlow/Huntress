@@ -1,18 +1,24 @@
 /**
- * Training Pipeline Manager
- * 
- * Orchestrates the complete training pipeline from data preparation through
- * model deployment. Handles Axolotl training job submission, progress monitoring,
- * checkpoint management, and error recovery.
- * 
- * Confidence: 10/10 - Production-ready with comprehensive error handling,
- * resource monitoring, and graceful degradation.
+ * EXPERIMENTAL — LoRA training pipeline manager
+ *
+ * STATUS: not on the production path. The orchestrator never instantiates
+ * this. Requires a 24GB+ VRAM GPU + Axolotl installed locally to actually
+ * run training. Gated behind the EXPERIMENTAL_TRAINING env var. Tests
+ * live under src/tests/experimental/ and are excluded from the default
+ * vitest run (see vitest.config.ts).
+ *
+ * Production-connected training surface lives at the top of
+ * src/core/training/ (reward_system.ts + feedback_loop.ts).
+ *
+ * Original purpose: orchestrate the complete training pipeline from data
+ * preparation through model deployment. Handles Axolotl training job
+ * submission, progress monitoring, checkpoint management, error recovery.
  */
 
-import { QdrantClient } from '../memory/qdrant_client';
+import { QdrantClient, type SearchResult } from '../../memory/qdrant_client';
 import { TrainingDataStorage, QualityFilter, TrainingExample } from './data_collector';
-import { fs, path, executeCommand, getSystemInfo } from '../tauri_bridge';
-import type { CommandResult } from '../tauri_bridge';
+import { fs, path, executeCommand, getSystemInfo } from '../../tauri_bridge';
+import type { CommandResult } from '../../tauri_bridge';
 import { EventEmitter } from 'eventemitter3';
 
 /**
@@ -235,7 +241,7 @@ export class TrainingPipelineManager extends EventEmitter {
       config.maxExamples || 1000
     );
 
-    return results.map(r => r.payload.data as TrainingExample);
+    return results.map((r: SearchResult) => r.payload.data as TrainingExample);
   }
 
   /**

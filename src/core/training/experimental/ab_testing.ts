@@ -11,7 +11,7 @@
 
 import { EventEmitter } from 'eventemitter3';
 import { ModelVersionManager, ModelVersion } from './model_manager';
-import { fs, path } from '../tauri_bridge';
+import { fs, path } from '../../tauri_bridge';
 
 /**
  * A/B test configuration

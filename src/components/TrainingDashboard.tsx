@@ -88,9 +88,10 @@ const SEVERITY_COLORS: Record<string, string> = {
  */
 async function fetchTrainingData(): Promise<DashboardData | null> {
   try {
-    // Dynamically import the training integration module
-    // This uses Node APIs (fs, EventEmitter) — only available via Tauri
-    const trainingModule = await import('../core/training/integration');
+    // Dynamically import the experimental training integration module
+    // (P3-1: moved under experimental/ behind EXPERIMENTAL_TRAINING flag).
+    // This uses Node APIs (fs, EventEmitter) — only available via Tauri.
+    const trainingModule = await import('../core/training/experimental/integration');
     if (!trainingModule.createContinuousLearningSystem) return null;
 
     // Training system requires Qdrant and is only available when backend is running

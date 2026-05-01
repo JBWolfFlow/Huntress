@@ -12,7 +12,7 @@
 import { EventEmitter } from 'eventemitter3';
 import { ModelVersionManager, ModelVersion, RollbackResult } from './model_manager';
 import { PerformanceMonitor } from './performance_monitor';
-import { fs, path } from '../tauri_bridge';
+import { fs, path } from '../../tauri_bridge';
 
 /**
  * Rollback reason categories

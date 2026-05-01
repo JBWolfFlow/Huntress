@@ -280,6 +280,27 @@ These items have been verified shipped via direct code inspection on 2026-04-28.
 | S7 | Token refresh (JWT exp parsing, rate-limited 1/30s) | `token_refresher.ts:83,86,148-152,180` |
 | S8 | Generic `RefreshConfig` 4-strategy union | `token_refresher.ts:21-68` |
 
+### Training pipeline isolation (P3-1 — shipped 2026-05-01)
+| Item | Evidence |
+|---|---|
+| **Files moved to `src/core/training/experimental/`** | 13 modules + 1 README. The LoRA/Axolotl pipeline (training_manager, learning_loop, ab_testing, deployment_manager, health_checker, readiness_checker, rollback_manager, scheduler, model_manager, performance_monitor, integration, htb_api, data_collector). `git mv` preserves history. |
+| **Production-connected modules stay top-level** | `src/core/training/reward_system.ts` and `feedback_loop.ts` remain — both are imported by HuntSessionContext / orchestrator at runtime. |
+| **Tests moved to `src/tests/experimental/`** | `phase5_unit.test.ts`, `phase5_validation.test.ts`, `phase5_test_utils.ts`. 64 tests total. |
+| **Default vitest run excludes experimental** | `vitest.config.ts:exclude` adds `src/tests/experimental/**` unless `RUN_EXPERIMENTAL=1`. Default suite count: 96 → 95 files (2,300 → 2,252 tests excluded; +16 added by P3-1 gate tests). |
+| **Coverage exclude** | `src/core/training/experimental/**` and `src/tests/experimental/**` excluded from coverage. |
+| **Runtime gate** | `createContinuousLearningSystem()` calls `isExperimentalTrainingEnabled()`. Returns true iff `process.env.EXPERIMENTAL_TRAINING ∈ {1, true, yes}` (case-insensitive, whitespace-trimmed) OR `globalThis.__HUNTRESS_EXPERIMENTAL_TRAINING__ === true` (test path). Throws with helpful message when gate is closed. |
+| **EXPERIMENTAL banner** | Added to the 3 entry points: `training_manager.ts`, `learning_loop.ts`, `integration.ts`. Each banner clearly states the module is not on the production path and lists the GPU + flag prerequisites. |
+| **`src/core/training/index.ts` updated** | Re-exports experimental modules via `./experimental/X` paths, so existing import sites (`from '../core/training'`) keep working. |
+| **`TrainingDashboard.tsx` updated** | Dynamic `import('../core/training/integration')` → `import('../core/training/experimental/integration')`. The dashboard already returns null gracefully on import failure, so the gate-throw is handled. |
+| **Tests** | `src/tests/p3_1_experimental_training_gate.test.ts` — 16 tests covering: env var truthy variants (1 / true / TRUE / yes / whitespace), env var falsy variants (0 / false / empty), global flag strict equality (true ≠ "true" ≠ 1), gate throws with helpful message, gate opens via either mechanism, top-level `training/index.ts` re-exports both production and experimental surfaces. |
+
+**How to run experimental tests explicitly:**
+```bash
+RUN_EXPERIMENTAL=1 npx vitest run \
+  src/tests/experimental/phase5_unit.test.ts \
+  src/tests/experimental/phase5_validation.test.ts
+```
+
 ### PentAGI quick wins (P2-3 — shipped 2026-04-30)
 | Item | Evidence |
 |---|---|

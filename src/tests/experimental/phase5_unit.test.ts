@@ -20,16 +20,16 @@ import {
 } from './phase5_test_utils';
 
 // Import Phase 5 components
-import { HTBAPIClient } from '../core/training/htb_api';
-import { TrainingDataCollector, TrainingDataCleaner, QualityFilter } from '../core/training/data_collector';
-import { TrainingPipelineManager } from '../core/training/training_manager';
-import { ModelVersionManager } from '../core/training/model_manager';
-import { LearningLoopOrchestrator } from '../core/training/learning_loop';
-import { ABTestingFramework } from '../core/training/ab_testing';
-import { PerformanceMonitor } from '../core/training/performance_monitor';
-import { ModelDeploymentManager } from '../core/training/deployment_manager';
-import { HealthCheckSystem } from '../core/training/health_checker';
-import { ProductionReadinessChecker } from '../core/training/readiness_checker';
+import { HTBAPIClient } from '../../core/training/experimental/htb_api';
+import { TrainingDataCollector, TrainingDataCleaner, QualityFilter } from '../../core/training/experimental/data_collector';
+import { TrainingPipelineManager } from '../../core/training/experimental/training_manager';
+import { ModelVersionManager } from '../../core/training/experimental/model_manager';
+import { LearningLoopOrchestrator } from '../../core/training/experimental/learning_loop';
+import { ABTestingFramework } from '../../core/training/experimental/ab_testing';
+import { PerformanceMonitor } from '../../core/training/experimental/performance_monitor';
+import { ModelDeploymentManager } from '../../core/training/experimental/deployment_manager';
+import { HealthCheckSystem } from '../../core/training/experimental/health_checker';
+import { ProductionReadinessChecker } from '../../core/training/experimental/readiness_checker';
 
 describe('Phase 5 Unit Tests', () => {
   let mockQdrant: MockQdrantClient;

@@ -8,7 +8,7 @@
  * retry logic, and defensive programming.
  */
 
-import { RateLimiter } from '../../utils/rate_limiter';
+import { RateLimiter } from '../../../utils/rate_limiter';
 
 /**
  * HTB machine metadata

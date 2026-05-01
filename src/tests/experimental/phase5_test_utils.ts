@@ -7,10 +7,10 @@
  * Confidence: 10/10 - Production-ready test utilities with comprehensive mocking.
  */
 
-import { TrainingExample } from '../core/training/data_collector';
-import { HTBMachine, SpawnResult, FlagResult } from '../core/training/htb_api';
-import { ModelVersion } from '../core/training/model_manager';
-import { PerformanceMetrics } from '../core/training/performance_monitor';
+import { TrainingExample } from '../../core/training/experimental/data_collector';
+import { HTBMachine, SpawnResult, FlagResult } from '../../core/training/experimental/htb_api';
+import { ModelVersion } from '../../core/training/experimental/model_manager';
+import { PerformanceMetrics } from '../../core/training/experimental/performance_monitor';
 
 /**
  * Mock HTB API Client

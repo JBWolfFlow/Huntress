@@ -16,11 +16,11 @@
  * statistical testing and comprehensive performance benchmarks.
  */
 
-import { ModelVersionManager } from '../core/training/model_manager';
-import { PerformanceMonitor } from '../core/training/performance_monitor';
-import { ABTestingFramework } from '../core/training/ab_testing';
-import { QdrantClient, QdrantConfig } from '../core/memory/qdrant_client';
-import { TrainingExample } from '../core/training/data_collector';
+import { ModelVersionManager } from '../../core/training/experimental/model_manager';
+import { PerformanceMonitor } from '../../core/training/experimental/performance_monitor';
+import { ABTestingFramework } from '../../core/training/experimental/ab_testing';
+import { QdrantClient, QdrantConfig } from '../../core/memory/qdrant_client';
+import { TrainingExample } from '../../core/training/experimental/data_collector';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 

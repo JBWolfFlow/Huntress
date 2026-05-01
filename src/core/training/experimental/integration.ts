@@ -1,16 +1,19 @@
 /**
- * Phase 5.3 Integration Layer
- * 
- * Unified integration layer connecting all continuous learning components with
- * existing Phase 5.1 and 5.2 infrastructure. Provides a single entry point for
- * the complete training loop system.
- * 
- * Confidence: 10/10 - Production-ready with comprehensive integration,
- * error handling, and graceful degradation.
+ * EXPERIMENTAL — Continuous learning system entry point
+ *
+ * STATUS: not on the production path. `createContinuousLearningSystem()` is
+ * the public factory for the LoRA training pipeline; nothing in the
+ * production orchestrator calls it. Requires 24GB+ GPU + Axolotl.
+ * Gated behind the EXPERIMENTAL_TRAINING env var. The factory throws if
+ * the flag is not set.
+ *
+ * Original purpose: unified integration layer connecting all continuous
+ * learning components, providing a single entry point for the complete
+ * training loop.
  */
 
 import { EventEmitter } from 'eventemitter3';
-import { QdrantClient } from '../memory/qdrant_client';
+import { QdrantClient } from '../../memory/qdrant_client';
 import { LearningLoopOrchestrator, LearningLoopConfig } from './learning_loop';
 import { ABTestingFramework, ABTestConfig } from './ab_testing';
 import { PerformanceMonitor, AlertConfig } from './performance_monitor';
@@ -559,12 +562,31 @@ export class ContinuousLearningSystem extends EventEmitter {
 }
 
 /**
- * Create continuous learning system with default configuration
+ * Create continuous learning system with default configuration.
+ *
+ * P3-1: GATED behind the EXPERIMENTAL_TRAINING env var. Throws when the
+ * flag is not set, so accidental imports from production code paths fail
+ * loud rather than silently consuming GPU/disk resources. Set the flag
+ * explicitly to opt in:
+ *
+ *   EXPERIMENTAL_TRAINING=1 npm run tauri dev
+ *
+ * The check honors both Node `process.env` (Tauri main process) and a
+ * window-level override (`globalThis.__HUNTRESS_EXPERIMENTAL_TRAINING__`)
+ * so test code can opt in without setting an env var.
  */
 export function createContinuousLearningSystem(
   qdrant: QdrantClient,
   config?: Partial<ContinuousLearningConfig>
 ): ContinuousLearningSystem {
+  if (!isExperimentalTrainingEnabled()) {
+    throw new Error(
+      'createContinuousLearningSystem(): the experimental LoRA training pipeline ' +
+      'is gated behind EXPERIMENTAL_TRAINING=1. Set the env var (or ' +
+      'globalThis.__HUNTRESS_EXPERIMENTAL_TRAINING__ = true in tests) to opt in. ' +
+      'Requires a 24GB+ VRAM GPU and Axolotl installed locally to actually run.',
+    );
+  }
   const defaultConfig: ContinuousLearningConfig = {
     learningLoop: {
       triggers: {
@@ -673,3 +695,25 @@ export function createContinuousLearningSystem(
 }
 
 export default ContinuousLearningSystem;
+
+/**
+ * P3-1: Returns true iff the experimental training pipeline has been
+ * explicitly opted into. Two opt-in mechanisms:
+ *   - `EXPERIMENTAL_TRAINING` env var set to a truthy non-zero value
+ *     (1 / true / yes — case-insensitive)
+ *   - `globalThis.__HUNTRESS_EXPERIMENTAL_TRAINING__ = true` for tests
+ *
+ * Exported so callers can pre-flight the gate without catching a throw.
+ */
+export function isExperimentalTrainingEnabled(): boolean {
+  // Window/global override (test path)
+  const g = globalThis as { __HUNTRESS_EXPERIMENTAL_TRAINING__?: unknown };
+  if (g.__HUNTRESS_EXPERIMENTAL_TRAINING__ === true) return true;
+
+  // process.env (Tauri main / Node path) — guarded for browser environments
+  const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+  const raw = proc?.env?.EXPERIMENTAL_TRAINING;
+  if (typeof raw !== 'string') return false;
+  const norm = raw.trim().toLowerCase();
+  return norm === '1' || norm === 'true' || norm === 'yes';
+}

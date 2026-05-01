@@ -8,8 +8,8 @@
  * type safety, and security filtering.
  */
 
-import { QdrantClient, VectorPoint } from '../memory/qdrant_client';
-import { fs, path } from '../tauri_bridge';
+import { QdrantClient, VectorPoint, type SearchResult } from '../../memory/qdrant_client';
+import { fs, path } from '../../tauri_bridge';
 
 /**
  * Training example with full execution trace
@@ -503,7 +503,7 @@ export class TrainingDataStorage {
       limit
     );
     
-    return results.map(r => r.payload.data as TrainingExample);
+    return results.map((r: SearchResult) => r.payload.data as TrainingExample);
   }
 }
 

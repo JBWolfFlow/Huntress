@@ -12,8 +12,8 @@
 import { EventEmitter } from 'eventemitter3';
 import { ModelVersionManager, ModelVersion } from './model_manager';
 import { PerformanceMonitor, PerformanceMetrics } from './performance_monitor';
-import { QdrantClient } from '../memory/qdrant_client';
-import { fs, path, executeCommand, getSystemInfo } from '../tauri_bridge';
+import { QdrantClient } from '../../memory/qdrant_client';
+import { fs, path, executeCommand, getSystemInfo } from '../../tauri_bridge';
 
 /**
  * Quality gate configuration

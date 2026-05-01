@@ -1,20 +1,22 @@
 /**
- * Learning Loop Orchestrator
- * 
- * Manages the complete continuous learning cycle from trigger detection through
- * deployment. Orchestrates data collection, training, validation, and deployment
- * with comprehensive state management and error recovery.
- * 
- * Confidence: 10/10 - Production-ready with event-driven architecture,
- * comprehensive error handling, and idempotent operations.
+ * EXPERIMENTAL — Learning loop orchestrator
+ *
+ * STATUS: not on the production path. The orchestrator engine never
+ * instantiates this. Requires the full LoRA training pipeline (24GB+ GPU
+ * + Axolotl) to actually run a learning cycle. Gated behind the
+ * EXPERIMENTAL_TRAINING env var.
+ *
+ * Original purpose: manage the complete continuous learning cycle from
+ * trigger detection through deployment. Orchestrates data collection,
+ * training, validation, and deployment with state management.
  */
 
 import { EventEmitter } from 'eventemitter3';
-import { QdrantClient } from '../memory/qdrant_client';
+import { QdrantClient } from '../../memory/qdrant_client';
 import { TrainingPipelineManager, TrainingJobConfig } from './training_manager';
 import { ModelVersionManager } from './model_manager';
 import { TrainingDataStorage, QualityFilter } from './data_collector';
-import { fs, path } from '../tauri_bridge';
+import { fs, path } from '../../tauri_bridge';
 
 /**
  * Learning loop state
