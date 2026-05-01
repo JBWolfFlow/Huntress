@@ -113,6 +113,32 @@ export interface ValidatorDomXssResult {
   sources: string[];
 }
 
+// ─── Crawler-specific shapes (P2-1: SPA-aware crawl) ────────────────────────
+
+export interface CrawlPageForm {
+  action: string;
+  method: string;
+  inputs: Array<{ name: string; type: string }>;
+}
+
+export interface CrawlPageApiEndpoint {
+  url: string;
+  method: string;
+}
+
+export interface CrawlPageResult {
+  finalUrl: string;
+  title: string;
+  /** Hrefs extracted from the rendered DOM (after JS-populated routes) */
+  links: string[];
+  /** Forms extracted from the rendered DOM */
+  forms: CrawlPageForm[];
+  /** XHR/fetch/document URLs the page made during render — typically API endpoints invisible to HTTP-only crawlers */
+  apiEndpoints: CrawlPageApiEndpoint[];
+  /** Set when navigation failed; partial results may still be present */
+  error?: string;
+}
+
 interface RawResponse<T> {
   id: string | null;
   ok: boolean;
@@ -208,6 +234,19 @@ export class AgentBrowserClient {
   /** Fresh-context sink/source scan for DOM-XSS validation. */
   async validatorDomXss(url: string, timeoutMs?: number): Promise<ValidatorDomXssResult> {
     return this.send<ValidatorDomXssResult>('validator_dom_xss', { url, timeoutMs });
+  }
+
+  /**
+   * P2-1: SPA-aware single-page crawl. Renders the page in a fresh context,
+   * waits for networkidle (or timeoutMs/2), captures rendered links + forms +
+   * XHR/fetch endpoints. The HTTP-only crawler cannot see API endpoints that
+   * an SPA lazy-loads after JS boots; this fills that gap.
+   *
+   * `timeoutMs` is clamped to [5000, 30000] in the subprocess.
+   * Caller is responsible for scope-filtering returned URLs.
+   */
+  async crawlPage(url: string, timeoutMs?: number): Promise<CrawlPageResult> {
+    return this.send<CrawlPageResult>('crawl_page', { url, timeoutMs });
   }
 
   /** Terminate the subprocess. Safe to call multiple times. */

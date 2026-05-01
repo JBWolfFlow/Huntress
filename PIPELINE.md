@@ -223,7 +223,7 @@ The Blackboard cross-agent sharing (I7) and WAF context injection (I8) infrastru
 
 | ID | Item | Reason |
 |---|---|---|
-| P3-1 | JS-rendering crawler for SPA endpoint discovery | Large lift (~2–3 days). Reconsider after P0 clears and hunt data shows measurable SPA blind spots. |
+| ~~P3-1~~ | ~~JS-rendering crawler for SPA endpoint discovery~~ | **PROMOTED & SHIPPED 2026-04-30** as P0-8 — see §7 Verified Complete. |
 | P3-2 | Training pipeline integration | Requires GPU infrastructure. Future phase, not on the current critical path. |
 | P3-3 | Auth Phase 3 — mTLS, Firebase SDK auth, Supabase JWT, TOTP-protected login, OAuth PKCE helper | Each is a small integration; bundle when one is needed by an actual target. |
 | P3-4 | Auth Phase 4 — MTProto sidecar (Telegram full automation), AWS SigV4 signing, magic-link login, Kerberos | Triggered by external signal — wait for a real target to demand each. |
@@ -279,6 +279,14 @@ These items have been verified shipped via direct code inspection on 2026-04-28.
 | S6 | Auth detection wizard | `auth_detector.ts:26-42`; `HuntSessionContext.tsx:664-708` |
 | S7 | Token refresh (JWT exp parsing, rate-limited 1/30s) | `token_refresher.ts:83,86,148-152,180` |
 | S8 | Generic `RefreshConfig` 4-strategy union | `token_refresher.ts:21-68` |
+
+### JS-rendered crawler (P0-8 — shipped 2026-04-30)
+| Item | Evidence |
+|---|---|
+| `crawl_page` action in `scripts/agent_browser.mjs` | Renders fresh-context, captures rendered DOM links + forms + XHR/fetch/document network requests via `page.on('request')` filter on resourceType. Timeout clamped 5–30s. |
+| `AgentBrowserClient.crawlPage()` method | `src/core/engine/agent_browser_client.ts` — typed wrapper around the new mjs action. `CrawlPageResult` interface exports `finalUrl/title/links/forms/apiEndpoints/error`. |
+| `WebCrawler` opt-in `useHeadlessBrowser` flag | `src/core/discovery/crawler.ts` — `CrawlConfig` gained `useHeadlessBrowser`, `headlessBrowser`, `browserTimeoutMs`. Default off (back-compat). When on, every fetched HTML page is also rendered; JS-discovered endpoints carry `source: 'javascript'`; HTML-discovered endpoints get their source upgraded to `'javascript'` when JS render confirms them. Browser failures degrade silently. |
+| Tests | `src/tests/p2_1_js_crawler.test.ts` — 9 tests covering SPA endpoint discovery, source upgrade, JS-link queueing, JS-injected forms, scope filtering, graceful degradation, default-off behavior, browser-timeout clamping. |
 
 ### Orchestration / agent infrastructure
 | ID | Area | Evidence |

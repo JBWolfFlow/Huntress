@@ -20,6 +20,7 @@
  *   finish_auth_capture  {}                            -> CapturedAuth-shaped payload
  *   validator_analyze    { url, timeoutMs? }           -> BrowserResult-shaped payload (fresh context)
  *   validator_dom_xss    { url, timeoutMs? }           -> { sinks, sources } (fresh context)
+ *   crawl_page           { url, timeoutMs? }           -> { finalUrl, title, links, forms, apiEndpoints } (fresh context, P2-1 SPA crawl)
  *   close                {}                            -> { ok: true }  (exits process)
  *
  * evaluate runs the expression inside the Chromium renderer sandbox (via
@@ -542,6 +543,120 @@ async function doValidatorDomXss(req) {
   }
 }
 
+/**
+ * P2-1: SPA-aware crawl of a single page.
+ *
+ * Renders the page in a fresh Chromium context, waits for networkidle (or
+ * timeout), then captures:
+ *   - All links from the rendered DOM (after JS has populated route registrations)
+ *   - All forms with action / method / input names
+ *   - All XHR/fetch requests the page made (these are typically API endpoints
+ *     that the HTTP-only crawler can never see — modern SPAs lazy-load them)
+ *
+ * Resource types other than `xhr`, `fetch`, and `document` are ignored when
+ * collecting apiEndpoints (no point reporting font/image/CSS requests).
+ *
+ * Returned URLs are NOT scope-filtered here — that's the caller's job (the
+ * subprocess has no scope context). Caller intersects with HuntressScope.
+ */
+async function doCrawlPage(req) {
+  if (typeof req.url !== 'string' || !req.url) {
+    throw new Error('crawl_page requires a string url');
+  }
+  if (!browser) {
+    const executablePath = findChrome();
+    if (!executablePath) {
+      throw new Error('Chrome/Chromium not found. Install with: apt install chromium');
+    }
+    browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+    });
+  }
+
+  // Cap timeoutMs at 30s per P2-1 plan; floor at 5s.
+  const timeoutMs = Math.min(Math.max(req.timeoutMs ?? 15_000, 5_000), 30_000);
+  const crawlContext = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    ignoreHTTPSErrors: true,
+  });
+
+  // We collect all requests the page makes; only API-relevant resourceTypes
+  // make it into apiEndpoints. Document requests show navigation / iframes.
+  const apiEndpoints = [];
+  const seenEndpointKeys = new Set();
+  let error;
+
+  try {
+    const p = await crawlContext.newPage();
+    p.on('request', (request) => {
+      const rType = request.resourceType();
+      if (rType !== 'xhr' && rType !== 'fetch' && rType !== 'document') return;
+      const url = request.url();
+      const method = request.method();
+      const key = `${method}:${url}`;
+      if (seenEndpointKeys.has(key)) return;
+      seenEndpointKeys.add(key);
+      apiEndpoints.push({ url, method });
+    });
+
+    try {
+      // domcontentloaded first to bound initial render, then networkidle for SPA boot
+      await p.goto(req.url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+      // Best-effort networkidle — many SPAs never reach idle, so cap at half the
+      // overall budget and swallow the timeout (we keep what we got).
+      try {
+        await p.waitForLoadState('networkidle', { timeout: Math.floor(timeoutMs / 2) });
+      } catch {
+        // Slow SPA — proceed with what's loaded so far.
+      }
+    } catch (navErr) {
+      error = navErr instanceof Error ? navErr.message : String(navErr);
+      // Don't throw — we may still have captured useful endpoints from the
+      // requests that fired before the failure.
+    }
+
+    const finalUrl = p.url();
+    const title = await p.title().catch(() => '');
+
+    // Extract links + forms from the rendered DOM
+    const domData = await p.evaluate(() => {
+      const linkSet = new Set();
+      for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+        const href = a.getAttribute('href');
+        if (href && href.length > 0) linkSet.add(href);
+      }
+      const forms = [];
+      for (const form of Array.from(document.querySelectorAll('form'))) {
+        const inputs = [];
+        for (const inp of Array.from(form.querySelectorAll('input,select,textarea'))) {
+          const name = inp.getAttribute('name');
+          if (!name) continue;
+          inputs.push({ name, type: inp.getAttribute('type') ?? 'text' });
+        }
+        forms.push({
+          action: form.getAttribute('action') ?? '',
+          method: (form.getAttribute('method') ?? 'GET').toUpperCase(),
+          inputs,
+        });
+      }
+      return { links: Array.from(linkSet), forms };
+    }).catch(() => ({ links: [], forms: [] }));
+
+    return {
+      finalUrl,
+      title,
+      links: domData.links,
+      forms: domData.forms,
+      apiEndpoints,
+      error,
+    };
+  } finally {
+    await crawlContext.close().catch(() => {});
+  }
+}
+
 async function handle(request) {
   switch (request.action) {
     case 'navigate':             return doNavigate(request);
@@ -553,6 +668,7 @@ async function handle(request) {
     case 'finish_auth_capture':  return doFinishAuthCapture();
     case 'validator_analyze':    return doValidatorAnalyze(request);
     case 'validator_dom_xss':    return doValidatorDomXss(request);
+    case 'crawl_page':           return doCrawlPage(request);
     case 'close':
       await shutdown();
       return { closed: true };

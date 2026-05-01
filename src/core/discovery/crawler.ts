@@ -16,6 +16,27 @@
 
 import type { HttpClient, HttpResponse } from '../http/request_engine';
 
+/**
+ * P2-1: Minimal interface for the headless browser dependency. Matches the
+ * shape of `AgentBrowserClient.crawlPage` so we can inject the real client
+ * in production and a mock in tests without dragging Playwright into the
+ * crawler module's import graph.
+ */
+export interface HeadlessBrowserCrawler {
+  crawlPage(url: string, timeoutMs?: number): Promise<{
+    finalUrl: string;
+    title: string;
+    links: string[];
+    forms: Array<{
+      action: string;
+      method: string;
+      inputs: Array<{ name: string; type: string }>;
+    }>;
+    apiEndpoints: Array<{ url: string; method: string }>;
+    error?: string;
+  }>;
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface CrawlConfig {
@@ -25,6 +46,22 @@ export interface CrawlConfig {
   scope: string[];
   respectRobotsTxt?: boolean;
   httpClient: HttpClient;
+  /**
+   * P2-1: When true, every successfully-fetched HTML page is ALSO rendered
+   * via `headlessBrowser.crawlPage()` to extract SPA-only endpoints (XHR/
+   * fetch URLs lazy-loaded after JS boot, plus links/forms in the rendered
+   * DOM that the static HTML doesn't contain).
+   *
+   * Default: false (preserves existing behavior). Requires `headlessBrowser`
+   * to also be set; if omitted, the flag is silently ignored.
+   *
+   * Per-page browser timeout is hard-capped at 30s upstream. Browser failures
+   * degrade gracefully — the HTTP-only crawl results are still returned.
+   */
+  useHeadlessBrowser?: boolean;
+  headlessBrowser?: HeadlessBrowserCrawler;
+  /** Per-page browser render timeout, clamped to [5000, 30000] ms. Default 15000. */
+  browserTimeoutMs?: number;
 }
 
 export interface CrawlResult {
@@ -297,12 +334,19 @@ export class WebCrawler {
   private maxDepth: number;
   private maxPages: number;
   private respectRobots: boolean;
+  private useHeadlessBrowser: boolean;
+  private browserTimeoutMs: number;
 
   constructor(config: CrawlConfig) {
     this.config = config;
     this.maxDepth = config.maxDepth ?? 3;
     this.maxPages = config.maxPages ?? 500;
     this.respectRobots = config.respectRobotsTxt !== false;
+    // P2-1: only enable browser rendering when both flag AND client are set.
+    // A bare flag without a client is a no-op (silent) — easier than throwing
+    // on construction in callers that haven't wired the browser yet.
+    this.useHeadlessBrowser = !!config.useHeadlessBrowser && !!config.headlessBrowser;
+    this.browserTimeoutMs = Math.min(Math.max(config.browserTimeoutMs ?? 15_000, 5_000), 30_000);
   }
 
   async crawl(): Promise<CrawlResult> {
@@ -426,6 +470,13 @@ export class WebCrawler {
           } catch { /* invalid URL */ }
         }
 
+        // P2-1: Optional JS-rendered crawl. Renders the page in a headless
+        // browser to discover SPA endpoints (XHR/fetch URLs lazy-loaded
+        // after JS boot) that the HTTP-only crawler can never see.
+        if (this.useHeadlessBrowser && this.config.headlessBrowser) {
+          await this.crawlWithHeadlessBrowser(url, depth);
+        }
+
       } catch {
         // Request failed — skip this page
       }
@@ -453,6 +504,100 @@ export class WebCrawler {
       queued: this.queue.length,
       depth: maxDepthVisited,
     };
+  }
+
+  /**
+   * P2-1: Render `url` via the headless browser to discover SPA-only
+   * artifacts: XHR/fetch endpoints loaded after JS boot, links from the
+   * post-render DOM, and forms attached by JS.
+   *
+   * Failures degrade silently — the HTTP-only results from the calling
+   * loop remain intact. Per-page browser timeout is bounded by
+   * `browserTimeoutMs` (clamped 5–30s in the constructor).
+   *
+   * Discovered endpoints get `source: 'javascript'` so downstream
+   * consumers (recon agent, attack-surface mapper) can prioritize them
+   * — SPA endpoints are typically more interesting than static-HTML ones.
+   */
+  private async crawlWithHeadlessBrowser(url: string, depth: number): Promise<void> {
+    if (!this.config.headlessBrowser) return;
+
+    let result;
+    try {
+      result = await this.config.headlessBrowser.crawlPage(url, this.browserTimeoutMs);
+    } catch {
+      // Browser failed — treat as no-op. HTTP results from the calling
+      // loop are still preserved.
+      return;
+    }
+
+    // 1. JS-discovered API endpoints (the unique value of this whole pass)
+    for (const ep of result.apiEndpoints) {
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(ep.url);
+      } catch {
+        continue;
+      }
+      if (!isInScope(ep.url, this.config.scope)) continue;
+      // Deduplicate by (method, base-url-without-query)
+      const base = `${parsedUrl.origin}${parsedUrl.pathname}`;
+      const params = Array.from(parsedUrl.searchParams.keys());
+      const key = `${ep.method}:${base}`;
+      const existing = this.endpoints.find(e => `${e.method}:${e.url}` === key);
+      if (existing) {
+        const merged = new Set([...existing.parameters, ...params]);
+        existing.parameters = [...merged];
+        // Upgrade source to javascript when JS render confirms an HTML-discovered endpoint
+        if (existing.source === 'html') existing.source = 'javascript';
+      } else {
+        this.endpoints.push({
+          url: base,
+          method: ep.method,
+          source: 'javascript',
+          parameters: params,
+        });
+      }
+    }
+
+    // 2. JS-discovered forms (forms injected by JS, not in static HTML)
+    for (const form of result.forms) {
+      if (!form.action) continue;
+      let absoluteAction: string;
+      try {
+        absoluteAction = new URL(form.action, url).toString();
+      } catch {
+        continue;
+      }
+      if (!isInScope(absoluteAction, this.config.scope)) continue;
+      // Dedup against existing forms by (action, method)
+      const exists = this.forms.some(f => f.action === absoluteAction && f.method === form.method);
+      if (!exists) {
+        this.forms.push({
+          action: absoluteAction,
+          method: form.method,
+          inputs: form.inputs.map(i => ({ name: i.name, type: i.type })),
+          pageUrl: url,
+        });
+        // Also queue as endpoint
+        this.endpoints.push({
+          url: absoluteAction,
+          method: form.method,
+          source: 'javascript',
+          parameters: form.inputs.map(i => i.name),
+          contentType: form.method === 'POST' ? 'application/x-www-form-urlencoded' : undefined,
+        });
+      }
+    }
+
+    // 3. JS-discovered links (queue for further crawl, depth+1)
+    for (const rawLink of result.links) {
+      const normalized = normalizeUrl(rawLink, url);
+      if (!normalized) continue;
+      if (this.visited.has(normalized)) continue;
+      if (!isInScope(normalized, this.config.scope)) continue;
+      this.queue.push({ url: normalized, depth: depth + 1 });
+    }
   }
 
   private async fetchRobotsTxt(origin: string): Promise<void> {
