@@ -105,6 +105,34 @@ export function getIterationBudget(agentType: string): number {
 }
 
 /**
+ * P1-3-b: Per-agent tool-call cap.
+ *
+ * Distinct from the iteration budget: a single iteration can produce zero
+ * tool calls (text-only response from the model) or several. The cap exists
+ * as a backstop for "agent burns through 90 tool calls without progress" —
+ * the 2026-04-23 SSTI burn pattern where the agent kept replaying the same
+ * probe shape with minor variations and never made forward progress.
+ *
+ * Set at 1.5× the iteration budget so productive runs are unaffected. Hits
+ * before the iteration limit because most iterations produce >=1 tool call.
+ *
+ * Caps:
+ *   simple   →  45  (iteration budget 30 × 1.5)
+ *   moderate → 120  (iteration budget 80 × 1.5)
+ *   complex  → 180  (iteration budget 120 × 1.5)
+ */
+const TOOL_CALL_BUDGETS: Record<TaskComplexity, number> = {
+  simple: 45,
+  moderate: 120,
+  complex: 180,
+};
+
+export function getToolCallBudget(agentType: string): number {
+  const complexity = AGENT_COMPLEXITY[agentType] ?? 'moderate';
+  return TOOL_CALL_BUDGETS[complexity];
+}
+
+/**
  * Get the complexity tier for an agent type.
  * Returns 'moderate' for unknown agent types.
  */

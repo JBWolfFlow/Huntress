@@ -140,12 +140,12 @@ Cross-reference with [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi) (
 
 | ID | Item | Effort | Unblocks |
 |---|---|---|---|
-| P1-3-a | **3-identical-toolcall hard guardrail** — single line in every specialist system prompt + ReactLoop enforcement after 3 consecutive identical `(toolName, argsHash)` calls | ~2 hours | The 2026-04-23 SSTI 90-tool-call burn pattern; cheapest first-line defense |
-| P1-3-b | **Per-agent-type tool-call cap** — `maxToolCallsPerAgent` config in ReactLoop; counts tool calls (not LLM iterations); hard-stops at limit | ~2 hours | Same as P1-3-a, second line |
+| ~~P1-3-a~~ | ~~**3-identical-toolcall hard guardrail**~~ ✅ shipped 2026-04-30 | — | See §7 Verified Complete |
+| ~~P1-3-b~~ | ~~**Per-agent-type tool-call cap**~~ ✅ shipped 2026-04-30 | — | See §7 Verified Complete |
 | P1-3-c | **Adviser execution-monitor sub-agent** — wakes on no-progress patterns (>5 identical calls OR >10 total without finding); receives recent messages + tool call history; answers six diagnostic questions; output guides next agent step | ~1 day | Smart fallback when P1-3-a/b aren't enough; pentagi's signature pattern |
 | P1-3-d | **Chain summarizer** (port of `pkg/csum/chain_summary.go`) — multi-strategy summarization with byte budgets (50KB last, 16KB pair, 64KB QA, 25% reserve); preserves tool-call/response pairs as atomic units | ~1 day | Long real-program hunts (>1hr) without context degradation |
 | P1-3-e | **Sploitus exploit-DB tool** — agent-callable tool that hits `https://sploitus.com/search` for exploits + tools matching a query; returns CVSS, source previews, CVE refs | ~½ day | Direct boost to P0-4 / P0-5 (real CVE references in PoC reports = triage-friendly evidence) |
-| P1-3-f | **Reporter "Independent Judgment" reviewer agent** — second-pass agent (Sonnet) that reads the validator's confirmation evidence, ignores the `confirmed` claim, forms own conclusion (upgrade/downgrade/flag-for-review). Synthetic accept/reject signal. Same item as P0-5-i. | ~1 day | P0-4 enabler — gives us a calibration signal **before** live H1 triage data accumulates |
+| ~~P1-3-f~~ | ~~**Reporter "Independent Judgment" reviewer agent**~~ ✅ shipped 2026-04-30 (same item as P0-5-i) | — | See §7 Verified Complete |
 | P1-3-g | **DB-persisted Flow / Task / Subtask state** — Tauri SQLite store; orchestrator writes state transitions; restart resumes from last checkpoint | ~2-3 days | Required before any real-program hunt >30 minutes (we currently lose all state on crash) |
 | P1-3-h | **Prompt template validator + typed variable registry** — build-time check that every prompt template's `${var}` references resolve against a typed registry; CI blocks on unauthorized var | ~1 day | Defensive eng — catches the class of bugs that landed users at `codacontent.io` (P1-0-c regression) before they ship |
 | P1-3-i | **Authorization-status preamble** — shared `AUTHORIZATION_PREAMBLE` constant prepended to every specialist system prompt | ~2 hours | Small ergonomic win; reduces agent-hesitation cycles on aggressive payloads. Must NOT leak into report-render layer (audience there needs responsible-disclosure framing) |
@@ -279,6 +279,14 @@ These items have been verified shipped via direct code inspection on 2026-04-28.
 | S6 | Auth detection wizard | `auth_detector.ts:26-42`; `HuntSessionContext.tsx:664-708` |
 | S7 | Token refresh (JWT exp parsing, rate-limited 1/30s) | `token_refresher.ts:83,86,148-152,180` |
 | S8 | Generic `RefreshConfig` 4-strategy union | `token_refresher.ts:21-68` |
+
+### PentAGI quick wins (P2-3 — shipped 2026-04-30)
+| Item | Evidence |
+|---|---|
+| **P1-3-a · 3-identical-toolcall guardrail** | `react_loop.ts:243-310` — `IDENTICAL_TOOLCALL_THRESHOLD=3`, FNV-1a hash with key-canonicalized JSON args (so `{a:1,b:2}` and `{b:2,a:1}` collapse). New `stopReason: 'identical_toolcall_loop'`. Rule line ("Maximum 3 attempts of identical tool calls...") added to `buildSystemPrompt()` so every specialist agent inherits it automatically. |
+| **P1-3-b · Per-agent tool-call cap** | `cost_router.ts:107-138` — new `getToolCallBudget(agentType)`, returns 1.5× iteration budget per complexity tier (45/120/180). `react_loop.ts:438-451` enforces; new `stopReason: 'tool_call_limit'`. Rule line ("Hard tool-call cap: N") in `buildSystemPrompt()` interpolates the actual cap so the LLM self-regulates. |
+| **P1-3-f / P0-5-i · Independent Reporter Agent** | `src/core/reporting/independent_reviewer.ts` — full new module. `IndependentReviewer.review()` over Sonnet, system prompt enforces H1 Decision Matrix (CORS PoC, alert(document.domain), two-account proof, etc.). 4-verdict outcome (upgrade/confirm/downgrade/flag_for_review). Pure `applyReviewVerdict()` helper for orchestrator integration. JSON parsing tolerates ```json fences and surrounding prose; rejects malformed/out-of-range inputs. Cost estimation per known model rates. Never throws — failures collapse to `flag_for_review` with error captured. |
+| Tests | `src/tests/p2_3_toolcall_guardrail.test.ts` — 19 tests (2-vs-3 threshold, key-order canonicalization, mixed-call interleaving, cap budgets per tier, cap-vs-iteration interaction, system prompt advertisement). `src/tests/p2_3_independent_reviewer.test.ts` — 39 tests (parseReviewerResponse positive/negative matrix incl. fence-stripping & gap-coercion, formatReviewPrompt structure, applyReviewVerdict for all 4 verdicts, integration paths for clean/error/malformed responses, cost estimation accuracy, end-to-end verdict-to-effect matrix). 58 new tests total. |
 
 ### JS-rendered crawler (P0-8 — shipped 2026-04-30)
 | Item | Evidence |

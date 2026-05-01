@@ -34,7 +34,7 @@ import type { HttpExchange, SharedFinding, WafContext } from '../../agents/base_
 import type { CapturedAuth } from '../auth/auth_browser_capture';
 import { ParamFuzzer } from '../fuzzer/param_fuzzer';
 import type { VulnType } from '../fuzzer/payload_db';
-import { getIterationBudget } from '../orchestrator/cost_router';
+import { getIterationBudget, getToolCallBudget } from '../orchestrator/cost_router';
 import type { SessionManager } from '../auth/session_manager';
 import { AgentBrowserClient } from './agent_browser_client';
 import type {
@@ -191,7 +191,7 @@ export interface ReactLoopResult {
   httpRequestCount: number;
   totalTokensUsed: { input: number; output: number };
   duration: number;
-  stopReason: 'task_complete' | 'no_vulnerabilities' | 'target_hardened' | 'blocker' | 'iteration_limit' | 'error' | 'killed';
+  stopReason: 'task_complete' | 'no_vulnerabilities' | 'target_hardened' | 'blocker' | 'iteration_limit' | 'tool_call_limit' | 'identical_toolcall_loop' | 'error' | 'killed';
   summary: string;
   iterationLog: IterationLog[];
   /** Captured HTTP request/response exchanges for report evidence */
@@ -271,6 +271,22 @@ export class ReactLoop {
   /** Stashed by browser_finish_auth_capture — survives browser cleanup so the ReactLoopResult can carry it out. */
   private capturedAuth: CapturedAuth | null = null;
   private maxIterations: number;
+  /**
+   * P1-3-b: Per-agent hard cap on tool calls. Distinct from `maxIterations`:
+   * counts tool invocations rather than LLM iterations (a single iteration
+   * can produce 0-N tool calls). Backstop for the 2026-04-23 SSTI burn
+   * pattern where the agent ran 90 productive-looking tool calls without
+   * forward progress. Lookup via `cost_router.getToolCallBudget(agentType)`.
+   */
+  private maxToolCalls: number;
+  /**
+   * P1-3-a: Rolling buffer of `(toolName, argsHash)` keys for the most recent
+   * tool calls. After 3 consecutive identical entries, the loop stops with
+   * `stopReason: 'identical_toolcall_loop'`. Bounded to the last
+   * IDENTICAL_TOOLCALL_THRESHOLD entries.
+   */
+  private recentToolCallKeys: string[] = [];
+  private static readonly IDENTICAL_TOOLCALL_THRESHOLD = 3;
   /** Lazy-initialized Node subprocess client — Playwright runs out-of-WebView (I2). */
   private browserClient: AgentBrowserClient | null = null;
 
@@ -301,6 +317,60 @@ export class ReactLoop {
       tools,
     };
     this.maxIterations = this.config.maxIterations ?? defaultBudget;
+
+    // P1-3-b: Tool-call cap is derived from agentType the same way the
+    // iteration budget is. Unknown agents get the moderate-tier cap (120).
+    this.maxToolCalls = config.agentType
+      ? getToolCallBudget(config.agentType)
+      : 120;
+  }
+
+  /**
+   * P1-3-a: Compute the dedup key for a tool call. Uses FNV-1a over the
+   * canonicalized JSON of the input so semantically-identical args (just in
+   * different key order) collapse to the same key.
+   */
+  private computeToolCallKey(name: string, input: unknown): string {
+    let argsStr: string;
+    try {
+      // Canonicalize: sort keys recursively so {a:1,b:2} == {b:2,a:1}
+      argsStr = JSON.stringify(input, (_k, v) => {
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          const sorted: Record<string, unknown> = {};
+          for (const k of Object.keys(v).sort()) sorted[k] = (v as Record<string, unknown>)[k];
+          return sorted;
+        }
+        return v;
+      });
+    } catch {
+      argsStr = String(input);
+    }
+    return `${name}:${hashString(argsStr)}`;
+  }
+
+  /**
+   * P1-3-a: Returns true when the last `IDENTICAL_TOOLCALL_THRESHOLD`
+   * (currently 3) tool calls have all been the same `(name, argsHash)`.
+   * Caller should stop the loop and surface `identical_toolcall_loop`.
+   */
+  private shouldStopForIdenticalToolCallLoop(): boolean {
+    const threshold = ReactLoop.IDENTICAL_TOOLCALL_THRESHOLD;
+    if (this.recentToolCallKeys.length < threshold) return false;
+    const tail = this.recentToolCallKeys.slice(-threshold);
+    return tail.every(k => k === tail[0]);
+  }
+
+  /**
+   * P1-3-a: Append a tool-call key to the rolling buffer and prune to the
+   * last `IDENTICAL_TOOLCALL_THRESHOLD` entries. Called once per processed
+   * tool call inside the THINK→ACT→OBSERVE loop.
+   */
+  private trackToolCallKey(key: string): void {
+    this.recentToolCallKeys.push(key);
+    const max = ReactLoop.IDENTICAL_TOOLCALL_THRESHOLD;
+    if (this.recentToolCallKeys.length > max) {
+      this.recentToolCallKeys = this.recentToolCallKeys.slice(-max);
+    }
   }
 
   /** Emergency stop — halts the loop at the next iteration boundary */
@@ -420,8 +490,47 @@ export class ReactLoop {
           logEntry.toolCalls.push(toolCall);
           this.toolCallCount++;
 
+          // P1-3-a: track for identical-tool-call-loop detection
+          const callKey = this.computeToolCallKey(toolCall.name, toolCall.input);
+          this.trackToolCallKey(callKey);
+
+          // P1-3-b: hard cap on tool calls regardless of iteration count
+          if (this.toolCallCount > this.maxToolCalls) {
+            stopReason = 'tool_call_limit';
+            summary = `Tool-call cap reached (${this.toolCallCount}/${this.maxToolCalls}). ` +
+              `Agent burned its tool budget without completing the task.`;
+            this.emitStatus('error', summary, iteration);
+            this.conversationHistory.push({
+              role: 'user',
+              content: '',
+              toolResults,
+            });
+            this.iterationLog.push(logEntry);
+            this.stopped = true;
+            break;
+          }
+
           const result = await this.processToolCall(toolCall, iteration);
           toolResults.push(result);
+
+          // P1-3-a: stop after THRESHOLD consecutive identical tool calls.
+          // Run AFTER processing so the result lands in toolResults and the
+          // model sees what happened on the final repeat.
+          if (this.shouldStopForIdenticalToolCallLoop()) {
+            stopReason = 'identical_toolcall_loop';
+            summary = `Stopped: ${ReactLoop.IDENTICAL_TOOLCALL_THRESHOLD} consecutive identical tool calls ` +
+              `to '${toolCall.name}' with the same arguments. The agent appears stuck in a loop. ` +
+              `Try a different approach or stop the hunt for this target.`;
+            this.emitStatus('error', summary, iteration);
+            this.conversationHistory.push({
+              role: 'user',
+              content: '',
+              toolResults,
+            });
+            this.iterationLog.push(logEntry);
+            this.stopped = true;
+            break;
+          }
 
           if (result.content) {
             logEntry.toolResult = result.content.substring(0, 1000); // Truncate for log
@@ -2043,6 +2152,8 @@ export class ReactLoop {
 - Avoid redundant tool calls — if a command returned useful data, analyze it before running more commands.
 - If a command fails or is blocked, adapt your approach rather than retrying the same command.
 - Rate limit your requests — the target is a production system, not a CTF box.
+- **Maximum ${ReactLoop.IDENTICAL_TOOLCALL_THRESHOLD} attempts of identical tool calls.** If the same tool with the same arguments has not produced useful information after ${ReactLoop.IDENTICAL_TOOLCALL_THRESHOLD} tries, change the tool, the arguments, or the approach — never repeat. The runtime enforces this and will hard-stop your loop on the ${ReactLoop.IDENTICAL_TOOLCALL_THRESHOLD}rd repeat.
+- **Hard tool-call cap: ${this.maxToolCalls}.** Independent of iteration budget. Make every tool call earn its keep.
 
 ## Evidence Requirements (MANDATORY)
 Every finding you report MUST include:
