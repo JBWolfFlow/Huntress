@@ -41,18 +41,18 @@ Priority levels use a fixed rubric:
 ### P0-3 · Deterministic validators for the remaining pass-through types (in progress — bigger than previously documented)
 **File:** `src/core/validation/validator.ts`
 
-**Verified state (2026-04-28 audit):** validator.ts dispatches on **58 vulnerability types**. **24 have deterministic verification routines.** **34 are pass-through** (return based on agent confidence only). Prior PIPELINE versions claimed "only 3-4 pass-through remain" — that was wrong.
+**Verified state (2026-04-30 — post P2-2 batch):** validator.ts dispatches on **58 vulnerability types**. **33 have deterministic verification routines** (24 original + 9 added in P2-2). **25 are pass-through** (was 34 before P2-2).
 
-**Deterministic (24):**
-xss_reflected, xss_dom, xss_stored (4-variant payload sweep + dialog/console detection), sqli_error (POST-body sweep × 4 triggers), sqli_blind_time (`deriveSqlBaselineUrl` + timing diff), ssrf (active OOB injection via interactsh), idor + bola (`validateBrokenAccess` two-identity differential), open_redirect (Playwright redirect chain), xxe (blind-OOB DTD fetch), command_injection (5 shell-exec OOB shapes), path_traversal (5 encoding bypass variants), ssti (10 SSTI_BODY_FIELDS), cors_misconfiguration (preconnect + clean-origin control), host_header_injection (7 override headers), prototype_pollution (browser chain mutation), nosql_injection (MongoDB pattern + differential), oauth_missing_state, oauth_downgrade_attack, oauth_weak_verifier, oauth_scope_escalation.
+**Deterministic (33):**
+xss_reflected, xss_dom, xss_stored (4-variant payload sweep + dialog/console detection), sqli_error (POST-body sweep × 4 triggers), sqli_blind_time (`deriveSqlBaselineUrl` + timing diff), ssrf (active OOB injection via interactsh), idor + bola (`validateBrokenAccess` two-identity differential), open_redirect (Playwright redirect chain), xxe (blind-OOB DTD fetch), command_injection (5 shell-exec OOB shapes), path_traversal (5 encoding bypass variants), ssti (10 SSTI_BODY_FIELDS), cors_misconfiguration (preconnect + clean-origin control), host_header_injection (7 override headers), prototype_pollution (browser chain mutation), nosql_injection (MongoDB pattern + differential), oauth_missing_state, oauth_downgrade_attack, oauth_weak_verifier, oauth_scope_escalation. **+9 added P2-2 (2026-04-30):** ssrf_blind / xxe_blind / command_injection_blind (aliases that re-use the existing OOB-aware validators), cache_poisoning (3-step proof: poison → cache HIT → propagation across 5 header vectors), cache_deception (auth'd extension probe + cache HIT + PII + secondary-identity re-fetch), jwt_none (alg=none token forge + replay), jwt_alg_confusion (HS256 with weak/empty key forge + replay), business_logic (6 abuse-marker patterns + accepted + no-rejection-keyword), race_condition (20 concurrent requests with 2xx/4xx/409 distribution analysis).
 
 **Pass-through by design (3) — leave alone:**
 - `sqli_blind_boolean` — stateful, requires custom scaffolding
 - `csrf` — stateful, requires custom scaffolding
 - `subdomain_takeover` — heuristic-only is correct (no definitive verification for dangling CNAMEs)
 
-**Pass-through that should become deterministic (31) — backlog:**
-ssrf_blind, xxe_blind, command_injection_blind, lfi, lfi_rce, oauth_redirect_uri, oauth_state, oauth_pkce, jwt_vulnerability, jwt_alg_confusion, jwt_none, jwt_kid_injection, information_disclosure, rate_limit_bypass, graphql_introspection, graphql_batching, mass_assignment, rce, race_condition, toctou, double_spend, http_smuggling, cache_poisoning, cache_deception, deserialization, saml_attack, mfa_bypass, websocket, crlf_injection, prompt_injection, business_logic.
+**Pass-through that should become deterministic (22 remaining) — backlog:**
+lfi, lfi_rce, oauth_redirect_uri, oauth_state, oauth_pkce, jwt_vulnerability, jwt_kid_injection, information_disclosure, rate_limit_bypass, graphql_introspection, graphql_batching, mass_assignment, rce, toctou, double_spend, http_smuggling, deserialization, saml_attack, mfa_bypass, websocket, crlf_injection, prompt_injection.
 
 **Acceptance:**
 - Each high-frequency type listed above gets a concrete verification routine (timing probe, browser state check, state-machine replay, OOB callback, etc.).
