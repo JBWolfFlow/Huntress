@@ -2,9 +2,10 @@
 
 Single source of truth for outstanding work, verified status, and delivery priorities.
 
-- **Last updated:** 2026-04-28 (consolidation pass — verified every claim against code)
-- **Project score:** 8.9 / 10 — all four real-H1 UX blockers shipped; PentAGI roadmap defined but no items implemented yet; report writer needs sectioning work
-- **Test health:** 2,172 TypeScript tests passing (91 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean
+- **Last updated:** 2026-05-02 (XBOW benchmark first-end-to-end run completed)
+- **XBOW Validation Benchmark score: 0/104 = 0.0%** _first end-to-end run, 2026-05-02, Opus 4.7, $85.11, 6h 37m, simplified CTF stub agent — see §11_
+- **Project score:** 8.9 / 10 — infrastructure remains solid; the 0% benchmark exposes a capability gap between the stub-agent benchmark wiring and the full orchestrator (see §11 follow-ups)
+- **Test health:** 2,300 TypeScript tests passing (98 files) • 108 Rust tests passing • `tsc --noEmit` clean • `cargo clippy -D warnings` clean
 - **External research:** PentAGI deep-dive at `docs/research/PENTAGI_DEEP_DIVE.md` — informs P1-3 adoption order. H1 report quality research at `docs/RESEARCH_H1_REPORT_QUALITY.md` — informs P0-4 + report writer rebuild.
 
 ---
@@ -414,3 +415,66 @@ After those, in priority order:
 9. **P1-3-g DB-persisted state** (~2-3 days) — gate before any real-program hunt >30 minutes.
 
 *Total to "production-ready report writer + 5 submissions + most P1-3": ~10 focused days.*
+
+---
+
+## 11. XBOW Benchmark — first end-to-end run (2026-05-02)
+
+| Metric | Value |
+|---|---|
+| **Score** | **0 / 104 solved (0.0%)** |
+| Real attempts (FAILED) | 70 (67%) — agent ran 40 iterations, made hundreds of probes, didn't crack the flag |
+| Infrastructure errors (ERROR) | 34 (33%) |
+| Cost | $85.11 (Opus 4.7) |
+| Duration | 6h 37m |
+| Cost per real attempt | ~$1.22 |
+| Most expensive single challenge | XBEN-071 ($10.24) |
+
+### Error breakdown (34 of 104)
+
+| Cause | Count | Status |
+|---|---|---|
+| Bullseye+ apt-get exit 100 | 21 | FIXED in `63b6b56` (v3 conditional patch) — wasn't live for this run |
+| Agent timed out at 600s | 7 | Real fails — agent ran productively but couldn't solve |
+| Port not ready in 180s | 6 | Could bump to 300s; some genuinely slow JVM/PHP starts |
+| PHP composer install (XBEN-044) | 1 | Archived deps; no general fix |
+| API credit exhausted (final ~5) | 5 | Account-side; nothing to fix in code |
+
+### What this score means (and doesn't)
+
+The benchmark runner uses a **simplified CTF stub agent** in `src/core/benchmark/xbow_runner.ts` with only three tools (`execute_command`, `analyze_response`, `submit_flag`). It is structurally **NOT** the full Huntress orchestrator with its 27 specialist hunters, 24 deterministic validators, evidence pipeline, OOB callback infrastructure, browser tools, etc.
+
+So this 0% score is "the bench-mode CTF stub agent on real XBOW challenges." It is **not directly comparable** to:
+- XBOW's own published 85% (their own production agent)
+- Cyber-AutoAgent's 84.62% (their multi-agent system)
+- The 2026-04-28 reviewer's "30-55% prediction" (which assumed full Huntress capability)
+
+**What it IS comparable to:** a baseline of "what minimal AI + curl can do on real CTFs." That baseline is 0% — the simplified agent is a coordination weakness, not a security-tooling weakness.
+
+### Infrastructure validation (the real win)
+
+What this run conclusively proved works end-to-end:
+- ✅ XBOW repo discovery + build + run + flag-check + teardown loop runs across 104 challenges without crashing
+- ✅ SQLite persistence captures the per-challenge outcome
+- ✅ Cost tracking is accurate (no more $0 bug — fixed in `4e6f53f`)
+- ✅ Memory pressure managed via `parallel=1` + readiness probe (no more host freezes)
+- ✅ Dockerfile + compose patchers run idempotently per-challenge
+- ✅ Diagnostic `console.error` traces every error to source (essential for the next iteration)
+
+### Next-iteration follow-ups (do these before the next benchmark run)
+
+1. **Re-run with v3 patches active** (`63b6b56`) — recovers ~21 bullseye+ ERRORs → real attempts. Expected ERROR drop: 34 → ~13.
+2. **Switch model from Opus 4.7 → Sonnet 4.6** — ~5× cheaper ($85 → ~$17 estimated), comparable CTF capability for level 1-3 challenges.
+3. **Wire the full orchestrator into the benchmark runner** (the big lever) — replace the 3-tool CTF stub with `OrchestratorEngine.dispatchAgent()` per challenge so the agent has access to the 27 specialist hunters, validators, browser tools, OOB callbacks. This is a 2-3 day refactor but is the single highest-impact change for the benchmark score. Without it, the score will remain near 0% no matter what infrastructure improvements we ship.
+4. **Mark agent timeouts as FAILED, not ERROR** — they're real attempts, not infrastructure bugs. ~½ hour change in `runSingleChallenge`'s catch block.
+5. **Bump readiness probe to 300s** — recovers ~6 slow-start challenges (Java/Spring/PHP backends).
+6. **Document `unbuildable.json`** — XBEN-044 (PHP composer) and any others that genuinely can't be built. Skip them from the score denominator.
+
+### What this means for the project score
+
+The 8.9/10 in §1 reflects infrastructure quality, not capability. **The honest read after this run:**
+- Infrastructure: 9/10 — proven end-to-end on 104 real challenges
+- Capability (as measured by XBOW): **0/10** — stub agent
+- True capability (the full orchestrator on real H1 targets): unknown — has never been benchmarked because the benchmark runner doesn't exercise it
+
+The path to a meaningful XBOW number is item #3 above. Until then, this 0% is just a baseline showing the infrastructure works.
