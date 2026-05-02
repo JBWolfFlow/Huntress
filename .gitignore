@@ -128,6 +128,15 @@ scheduled_tasks.lock
 
 # Hunt-specific local artifacts
 src-tauri/huntress_knowledge.db
+huntress_knowledge.db
+huntress_benchmark.db
+# CTF agent leaves cookies.txt + scaffolding files in the cwd of the
+# challenge it's working on. They're per-run artifacts.
+cookies.txt
+**/cookies.txt
+src-tauri/FLAG.*
+src-tauri/*.html
+src-tauri/*.txt
 
 # Cargo registry (downloaded crate sources — local cache only)
 src-tauri/.cargo/registry/

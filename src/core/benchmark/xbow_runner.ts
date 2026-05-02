@@ -427,10 +427,15 @@ export class XBOWBenchmarkRunner {
         throw new Error(`Docker build failed: ${buildResult.stderr}`);
       }
 
-      // Start the container
+      // Start the container WITHOUT --wait. Many XBOW challenges have
+      // overly-aggressive healthchecks (e.g. MySQL with timeout: 1s while
+      // mysqld init takes 30-60s on first start). `--wait` honors the
+      // healthcheck chain and times out before MySQL becomes ready, even
+      // though the app would actually work fine. We do our own readiness
+      // probe below — poll the exposed port until it accepts connections.
       const upResult = await executeCommand(
         'docker',
-        ['compose', 'up', '-d', '--wait'],
+        ['compose', 'up', '-d'],
         challenge.directory,
       );
       if (!upResult.success) {
@@ -444,6 +449,16 @@ export class XBOWBenchmarkRunner {
       }
 
       const targetUrl = `http://localhost:${port}`;
+
+      // Readiness probe — bypass docker healthchecks (which are often
+      // unreliable for these challenges) and just poll the exposed port
+      // ourselves. A response of any HTTP status (even 5xx) is good
+      // enough — the agent can work with a half-broken backend, and
+      // many challenges intentionally return non-2xx for the root.
+      const ready = await this.waitForChallengeReady(targetUrl, 90_000);
+      if (!ready) {
+        throw new Error(`Challenge port ${port} did not accept connections within 90s`);
+      }
 
       // Run the CTF solver agent with a timeout
       const agentResult = await this.runWithTimeout(
@@ -464,6 +479,11 @@ export class XBOWBenchmarkRunner {
       };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      // Diagnostic: surface the per-challenge error so it appears in the Tauri
+      // dev log (otherwise it's only visible after the entire run completes
+      // and persists to SQLite). Helps debug systemic-error situations live.
+      // eslint-disable-next-line no-console
+      console.error(`[xbow] challenge ${challengeId} ERROR: ${errMsg}\n${err instanceof Error ? err.stack ?? '' : ''}`);
       return {
         challengeId,
         solved: false,
@@ -777,6 +797,10 @@ export class XBOWBenchmarkRunner {
         response = await this.provider.sendMessage(messages, sendOptions);
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
+        // Diagnostic: surface the LLM-call failure live so we can tell rate
+        // limits apart from context-window apart from auth issues.
+        // eslint-disable-next-line no-console
+        console.error(`[xbow] runCtfAgent sendMessage failed (iter ${iteration}): ${lastError}`);
         break;
       }
 
@@ -988,6 +1012,34 @@ export class XBOWBenchmarkRunner {
   }
 
   // ─── Private: Docker Helpers ─────────────────────────────────────────────
+
+  /**
+   * Poll an HTTP target until it accepts a TCP connection (any HTTP response,
+   * even 5xx, counts as ready — the CTF agent can work with a partially-up
+   * backend). Replaces dependence on `docker compose up --wait` which honors
+   * per-service healthchecks; many XBOW challenges have unreliable healthcheck
+   * configs (e.g. MySQL `timeout: 1s` against ~60s init time).
+   *
+   * Returns true when reachable within `maxWaitMs`, false on timeout.
+   */
+  private async waitForChallengeReady(targetUrl: string, maxWaitMs: number): Promise<boolean> {
+    const deadline = Date.now() + maxWaitMs;
+    const pollIntervalMs = 3_000;
+    while (Date.now() < deadline) {
+      // Use curl with a short connect timeout so we don't block on a single try.
+      // exit 0 = response received, exit 7 = connection refused (try again),
+      // exit 28 = timeout (try again), other = treat as still-coming-up.
+      const probe = await executeCommand(
+        'curl',
+        ['-s', '-o', '/dev/null', '--connect-timeout', '2', '--max-time', '5', '-w', '%{http_code}', targetUrl],
+      );
+      if (probe.exitCode === 0 && probe.stdout && probe.stdout !== '000') {
+        return true;
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+    return false;
+  }
 
   /** Discover the host-mapped port for the challenge container */
   private async getExposedPort(challengeDir: string): Promise<number> {

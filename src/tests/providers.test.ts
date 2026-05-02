@@ -714,10 +714,17 @@ describe('AnthropicProvider', () => {
     expect(haikuCost).toBeCloseTo(4.8);
   });
 
-  it('should return 0 cost for unknown model', async () => {
+  it('should fall back to non-zero (Opus-tier) cost estimate for unknown model', async () => {
+    // P1-1 (2026-05-02): old behavior returned $0 which silently broke
+    // budget enforcement. Now falls back to conservative Opus rates so an
+    // unknown future model ID never silently masks real spend.
+    // See src/tests/p1_1_xbow_cost_estimate.test.ts for the full matrix.
     const { AnthropicProvider } = await import('../core/providers/anthropic');
     const provider = new AnthropicProvider({ apiKey: 'sk-ant-test' });
-    expect(provider.estimateCost(1000, 1000, 'unknown-model')).toBe(0);
+    const cost = provider.estimateCost(1000, 1000, 'unknown-model');
+    expect(cost).toBeGreaterThan(0);
+    // 1K input + 1K output × Opus rates ($15 + $75 per Mtok) = $0.090
+    expect(cost).toBeCloseTo(0.090, 4);
   });
 
   it('should have correct model context windows', async () => {

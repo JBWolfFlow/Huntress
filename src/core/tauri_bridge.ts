@@ -17,31 +17,35 @@ function checkIsTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
-/** True when running in Node.js (e.g. vitest tests) */
+/** True when running in Node.js (e.g. vitest tests, headless CLI). */
 const isNode = typeof process !== 'undefined' && !!process.versions?.node;
 
-// Lazy-loaded Node.js modules (only in Node.js context, never in browser)
-let _nodeFs: typeof import('fs/promises') | null = null;
-let _nodePath: typeof import('path') | null = null;
-let _nodeChildProcess: typeof import('child_process') | null = null;
+/**
+ * Lazy-loaded Node.js modules. Pre-loaded at module init via top-level await
+ * dynamic import — works in both CJS (vitest classic) and ESM (tsx, scripts/).
+ *
+ * Previous version used `require()` which throws "require is not defined" in
+ * ESM contexts. The dynamic-import + TLA approach is the standard ESM-compatible
+ * pattern. Browser bundles tree-shake the `isNode` branch (it's a constant
+ * expression at build time after Vite resolves `process.versions?.node`),
+ * so this never tries to load Node built-ins in the WebView.
+ */
+const _nodeFs: typeof import('fs/promises') | null =
+  isNode ? await import('fs/promises') : null;
+const _nodePath: typeof import('path') | null =
+  isNode ? await import('path') : null;
+const _nodeChildProcess: typeof import('child_process') | null =
+  isNode ? await import('child_process') : null;
+const _nodeOs: typeof import('os') | null =
+  isNode ? await import('os') : null;
+const _nodeUtil: typeof import('util') | null =
+  isNode ? await import('util') : null;
 
-function getNodeFs() {
-  if (!isNode) return null;
-  if (!_nodeFs) { _nodeFs = require('fs/promises'); }
-  return _nodeFs;
-}
-
-function getNodePath() {
-  if (!isNode) return null;
-  if (!_nodePath) { _nodePath = require('path'); }
-  return _nodePath;
-}
-
-function getNodeChildProcess() {
-  if (!isNode) return null;
-  if (!_nodeChildProcess) { _nodeChildProcess = require('child_process'); }
-  return _nodeChildProcess;
-}
+function getNodeFs() { return _nodeFs; }
+function getNodePath() { return _nodePath; }
+function getNodeChildProcess() { return _nodeChildProcess; }
+function getNodeOs() { return _nodeOs; }
+function getNodeUtil() { return _nodeUtil; }
 
 // ─── CORS-free HTTP (replaces browser fetch for external APIs) ───────────────
 
@@ -236,8 +240,8 @@ export async function getSystemInfo(): Promise<SystemInfo> {
     return invoke<SystemInfo>('get_system_info');
   }
   // Node.js fallback (vitest tests) — use os module for real values
-  if (isNode) {
-    const os = require('os');
+  const os = getNodeOs();
+  if (os) {
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
     return {
@@ -282,13 +286,14 @@ export async function executeCommand(
   if (checkIsTauri()) {
     return invoke<CommandResult>('execute_training_command', { program, args, cwd });
   }
-  // Node.js fallback (vitest tests)
+  // Node.js fallback (vitest tests, headless CLI)
   const cp = getNodeChildProcess();
-  if (cp) {
-    const { promisify } = require('util');
-    const execFile = promisify(cp.execFile);
+  const util = getNodeUtil();
+  if (cp && util) {
+    const execFile = util.promisify(cp.execFile);
     try {
-      const { stdout, stderr } = await execFile(program, args, { cwd, timeout: 30000 });
+      // Long timeout for benchmark commands (git clone, docker build can take minutes)
+      const { stdout, stderr } = await execFile(program, args, { cwd, timeout: 600_000, maxBuffer: 50 * 1024 * 1024 });
       return { exitCode: 0, stdout: stdout ?? '', stderr: stderr ?? '', success: true };
     } catch (err: any) {
       return { exitCode: err.code ?? 1, stdout: err.stdout ?? '', stderr: err.stderr ?? '', success: false };

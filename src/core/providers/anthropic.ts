@@ -24,6 +24,17 @@ import type {
 import { getMessageText } from './types';
 
 const ANTHROPIC_MODELS: ModelInfo[] = [
+  // Latest generation (4.7 / 4.6)
+  {
+    id: 'claude-opus-4-7',
+    displayName: 'Claude Opus 4.7',
+    contextWindow: 200000,
+    maxOutputTokens: 32000,
+    supportsStreaming: true,
+    supportsSystemPrompt: true,
+    inputCostPer1M: 15,
+    outputCostPer1M: 75,
+  },
   {
     id: 'claude-opus-4-6',
     displayName: 'Claude Opus 4.6',
@@ -33,6 +44,16 @@ const ANTHROPIC_MODELS: ModelInfo[] = [
     supportsSystemPrompt: true,
     inputCostPer1M: 15,
     outputCostPer1M: 75,
+  },
+  {
+    id: 'claude-sonnet-4-6',
+    displayName: 'Claude Sonnet 4.6',
+    contextWindow: 200000,
+    maxOutputTokens: 16000,
+    supportsStreaming: true,
+    supportsSystemPrompt: true,
+    inputCostPer1M: 3,
+    outputCostPer1M: 15,
   },
   {
     id: 'claude-sonnet-4-5-20250929',
@@ -55,6 +76,15 @@ const ANTHROPIC_MODELS: ModelInfo[] = [
     outputCostPer1M: 4,
   },
 ];
+
+/**
+ * Default per-Mtok rates for unknown / future model IDs. Used as the
+ * fallback in `estimateCost` so cost tracking and budget enforcement
+ * never silently report $0 for a real spend. Conservative defaults
+ * (Opus-tier rates) so we OVERESTIMATE rather than underestimate.
+ */
+const FALLBACK_INPUT_PER_M = 15;
+const FALLBACK_OUTPUT_PER_M = 75;
 
 export class AnthropicProvider implements ModelProvider {
   readonly providerId = 'anthropic';
@@ -202,9 +232,13 @@ export class AnthropicProvider implements ModelProvider {
 
   estimateCost(inputTokens: number, outputTokens: number, model: string): number {
     const modelInfo = ANTHROPIC_MODELS.find(m => m.id === model);
-    if (!modelInfo) return 0;
-    return (inputTokens / 1_000_000) * modelInfo.inputCostPer1M +
-           (outputTokens / 1_000_000) * modelInfo.outputCostPer1M;
+    // Returning 0 for unknown models silently breaks cost tracking and budget
+    // enforcement (the 90%/100% caps never trigger). Fall back to conservative
+    // Opus-tier rates so we OVERESTIMATE — better than underestimating spend.
+    const inputRate = modelInfo?.inputCostPer1M ?? FALLBACK_INPUT_PER_M;
+    const outputRate = modelInfo?.outputCostPer1M ?? FALLBACK_OUTPUT_PER_M;
+    return (inputTokens / 1_000_000) * inputRate +
+           (outputTokens / 1_000_000) * outputRate;
   }
 
   /** Convert our generic messages to Anthropic's format */
