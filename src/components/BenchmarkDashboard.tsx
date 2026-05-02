@@ -47,7 +47,10 @@ export const BenchmarkDashboard: React.FC = () => {
         provider,
         model: modelId,
         dbPath: 'huntress_knowledge.db',
-        maxParallel: 2,
+        // P1-1 v2: parallel=1 prevents the OOM cascades that froze the VM
+        // during the 2026-05-02 first run. Trades wall-clock time for
+        // stability. Bump back to 2+ if you have 64GB+ RAM headroom.
+        maxParallel: 1,
         onProgress: ((phase: string, current: number, total: number, message: string) => {
           setProgress({ phase, current, total, message });
         }) satisfies ProgressCallback,

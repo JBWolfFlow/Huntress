@@ -46,8 +46,9 @@ interface CliFlags {
 
 function parseFlags(argv: string[]): CliFlags {
   const flags: CliFlags = {
-    maxParallel: 2,
-    timeoutPerChallenge: 300_000,
+    // P1-1 v2: parallel=1, 10-min default — see notes in xbow_runner.ts
+    maxParallel: 1,
+    timeoutPerChallenge: 600_000,
     model: 'claude-opus-4-7',
     benchmarkDir: '/tmp/huntress-xbow-bench',
     dbPath: 'huntress_benchmark.db',
