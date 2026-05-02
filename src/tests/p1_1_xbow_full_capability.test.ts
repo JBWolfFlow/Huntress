@@ -82,10 +82,16 @@ describe('selectAgentForChallenge — direct tag mapping', () => {
     expect(selectAgentForChallenge(ch({ tags: ['ssti'] }))).toBe('ssti-hunter');
   });
 
-  it('routes idor / privilege_escalation / default_credentials all to idor-hunter', () => {
+  it('routes idor / privilege_escalation to idor-hunter (Tier 2)', () => {
     expect(selectAgentForChallenge(ch({ tags: ['idor'] }))).toBe('idor-hunter');
     expect(selectAgentForChallenge(ch({ tags: ['privilege_escalation'] }))).toBe('idor-hunter');
-    expect(selectAgentForChallenge(ch({ tags: ['default_credentials'] }))).toBe('idor-hunter');
+  });
+
+  it('routes default_credentials / brute_force / cve to recon (Tier 3 — recon owns nuclei + wordlists)', () => {
+    expect(selectAgentForChallenge(ch({ tags: ['default_credentials'] }))).toBe('recon');
+    expect(selectAgentForChallenge(ch({ tags: ['brute_force'] }))).toBe('recon');
+    expect(selectAgentForChallenge(ch({ tags: ['cve'] }))).toBe('recon');
+    expect(selectAgentForChallenge(ch({ tags: ['information_disclosure'] }))).toBe('recon');
   });
 
   it('routes ssrf challenges to ssrf-hunter', () => {
@@ -123,9 +129,73 @@ describe('selectAgentForChallenge — direct tag mapping', () => {
     expect(selectAgentForChallenge(ch({ tags: ['insecure_deserialization'] }))).toBe('deserialization-hunter');
   });
 
-  it('first matching tag wins when a challenge has multiple tags', () => {
+  it('first matching tag wins WITHIN a tier (Tier 1 self-resolution)', () => {
     expect(selectAgentForChallenge(ch({ tags: ['sqli', 'xss'] }))).toBe('sqli-hunter');
     expect(selectAgentForChallenge(ch({ tags: ['xss', 'sqli'] }))).toBe('xss-hunter');
+  });
+});
+
+describe('selectAgentForChallenge — v5 tag tier prioritization', () => {
+  // These cases were misrouted by the v4 first-match-wins algorithm.
+  // Audit on 2026-05-02 found 14 of 104 XBOW challenges (13.5%) hit this.
+  it('Tier 1 (specific exploit) beats Tier 3 (meta) — cve+command_injection → command-injection-hunter', () => {
+    // Real challenge: XBEN-030-24 ['cve', 'command_injection']
+    expect(selectAgentForChallenge(ch({ tags: ['cve', 'command_injection'] })))
+      .toBe('command-injection-hunter');
+  });
+
+  it('Tier 1 beats Tier 3 — cve+path_traversal+lfi → path-traversal-hunter', () => {
+    // Real challenge: XBEN-026-24 ['cve', 'path_traversal', 'lfi']
+    expect(selectAgentForChallenge(ch({ tags: ['cve', 'path_traversal', 'lfi'] })))
+      .toBe('path-traversal-hunter');
+  });
+
+  it('Tier 1 beats Tier 3 — brute_force+graphql+idor → graphql-hunter (graphql is Tier 1)', () => {
+    // Real challenge: XBEN-007-24 ['brute_force', 'graphql', 'idor']
+    expect(selectAgentForChallenge(ch({ tags: ['brute_force', 'graphql', 'idor'] })))
+      .toBe('graphql-hunter');
+  });
+
+  it('Tier 1 beats Tier 2 — privilege_escalation+insecure_deserialization → deserialization-hunter', () => {
+    // Real challenge: XBEN-014-24 ['privilege_escalation', 'insecure_deserialization']
+    expect(selectAgentForChallenge(ch({ tags: ['privilege_escalation', 'insecure_deserialization'] })))
+      .toBe('deserialization-hunter');
+  });
+
+  it('Tier 1 beats Tier 2 — privilege_escalation+jwt+information_disclosure → jwt-hunter', () => {
+    // Real challenge: XBEN-084-24 ['privilege_escalation', 'jwt', 'information_disclosure']
+    expect(selectAgentForChallenge(ch({ tags: ['privilege_escalation', 'jwt', 'information_disclosure'] })))
+      .toBe('jwt-hunter');
+  });
+
+  it('Tier 1 beats Tier 3 — default_credentials+race_condition → race-condition-hunter', () => {
+    // Real challenge: XBEN-088-24 ['default_credentials', 'race_condition']
+    expect(selectAgentForChallenge(ch({ tags: ['default_credentials', 'race_condition'] })))
+      .toBe('race-condition-hunter');
+  });
+
+  it('Tier 2 beats Tier 3 — privilege_escalation+business_logic → business-logic-hunter (Tier 1)', () => {
+    // Real challenge: XBEN-052-24 ['privilege_escalation', 'business_logic']
+    // business_logic is Tier 1 (specific technique), so it wins over privilege_escalation (Tier 2)
+    expect(selectAgentForChallenge(ch({ tags: ['privilege_escalation', 'business_logic'] })))
+      .toBe('business-logic-hunter');
+  });
+
+  it('Tier 2 beats Tier 3 — information_disclosure+idor+crypto → crypto routes via Tier 1 (jwt-hunter)', () => {
+    // Real challenge: XBEN-103-24 ['information_disclosure', 'idor', 'crypto', 'privilege_escalation']
+    // crypto is Tier 1 (specific exploit), so it wins over idor and the meta tags.
+    expect(selectAgentForChallenge(ch({ tags: ['information_disclosure', 'idor', 'crypto', 'privilege_escalation'] })))
+      .toBe('jwt-hunter');
+  });
+
+  it('Tier 3 only — falls through to that tier (default_credentials+brute_force → recon)', () => {
+    expect(selectAgentForChallenge(ch({ tags: ['default_credentials', 'brute_force'] })))
+      .toBe('recon');
+  });
+
+  it('Tier 2 only — picks the broad-category agent (privilege_escalation alone → idor-hunter)', () => {
+    expect(selectAgentForChallenge(ch({ tags: ['privilege_escalation'] })))
+      .toBe('idor-hunter');
   });
 });
 

@@ -41,7 +41,7 @@ const MAX_AGENT_ITERATIONS = 40;
 const DEFAULT_READINESS_TIMEOUT_MS = 180_000; // was 90s — slow JVM/PHP starts need more
 
 /**
- * P1-1 v4: XBOW challenge tag → Huntress specialist agent ID.
+ * P1-1 v4/v5: XBOW challenge tag → Huntress specialist agent ID.
  *
  * Maps the tag set in XBOW's benchmark.json files to the agent ID
  * registered in the agent catalog. Used by `selectAgentForChallenge`
@@ -49,15 +49,17 @@ const DEFAULT_READINESS_TIMEOUT_MS = 180_000; // was 90s — slow JVM/PHP starts
  * better than the prior 3-tool stub agent because each specialist comes
  * with its expert system prompt, attack playbook, and tool wiring.
  *
- * When a challenge has multiple tags, the FIRST matching tag wins. When
- * no tag maps, we fall back to a tag→class fuzzy lookup via
- * `findAgentsForVulnClass`. When even that fails, we use the recon agent
- * as a generic fallback (every challenge can benefit from recon).
+ * v5 (2026-05-02): Tag selection is TIERED, not first-match-wins.
+ * Real XBOW challenges typically list tags in alphabetical order
+ * (e.g. `['cve', 'command_injection']`), which under naive first-match
+ * sent every cve+something challenge to the recon agent — wrong, those
+ * are exploit challenges that happen to come from a CVE writeup. Audit
+ * of the 104-challenge set found 14 challenges (13.5%) misrouted by
+ * tag-order. Tiered selection fixes this without changing the map.
  */
 export const XBOW_TAG_TO_AGENT_ID: Record<string, string> = {
   // Authentication / authorization
   idor: 'idor-hunter',
-  default_credentials: 'idor-hunter',
   privilege_escalation: 'idor-hunter',
   jwt: 'jwt-hunter',
   crypto: 'jwt-hunter',
@@ -82,31 +84,74 @@ export const XBOW_TAG_TO_AGENT_ID: Record<string, string> = {
   smuggling_desync: 'http-smuggling-hunter',
   // API / protocol
   graphql: 'graphql-hunter',
-  // Recon / generic
+  // Recon / generic — recon agent has nuclei templates for default-creds,
+  // CVE detection, brute-forcing, and method-tampering via execute_command.
   information_disclosure: 'recon',
-  cve: 'recon',
+  default_credentials: 'recon',
   brute_force: 'recon',
+  cve: 'recon',
   http_method_tamper: 'recon',
   ssh: 'recon',
 };
 
 /**
+ * Tag tiers for v5 prioritization. We walk Tier 1 across all of a
+ * challenge's tags before considering Tier 2, etc. This ensures a
+ * challenge tagged ['cve', 'command_injection'] picks the
+ * command-injection-hunter (the actual exploit) rather than the recon
+ * agent (which the `cve` tag would route to under first-match-wins).
+ *
+ * Tier 1 — direct exploit techniques. The challenge IS this thing.
+ * Tier 2 — broad categories. The challenge USES this technique.
+ * Tier 3 — meta / recon-flavored. The challenge BELONGS to this group.
+ */
+const SPECIFIC_TAGS = new Set([
+  'sqli', 'blind_sqli', 'nosqli', 'xss', 'ssti', 'ssrf', 'xxe',
+  'command_injection', 'lfi', 'path_traversal', 'arbitrary_file_upload',
+  'jwt', 'graphql', 'race_condition', 'smuggling_desync',
+  'insecure_deserialization', 'crypto', 'business_logic',
+]);
+
+const BROAD_TAGS = new Set([
+  'idor', 'privilege_escalation',
+]);
+
+const META_TAGS = new Set([
+  'cve', 'brute_force', 'default_credentials',
+  'information_disclosure', 'http_method_tamper', 'ssh',
+]);
+
+/**
  * Pick the best specialist agent ID for a challenge by inspecting its tags.
- * Falls back to fuzzy class lookup, then to recon as a last resort.
+ *
+ * v5 algorithm (2026-05-02):
+ *   1. Walk Tier 1 (specific exploit) tags — first match wins
+ *   2. Walk Tier 2 (broad category) tags — first match wins
+ *   3. Walk Tier 3 (meta / recon) tags — first match wins
+ *   4. Fuzzy class lookup via findAgentsForVulnClass
+ *   5. recon as the irreducible fallback (every challenge benefits from recon)
  */
 export function selectAgentForChallenge(challenge: Challenge): string {
-  // 1. Direct tag mapping (preferred — explicit, reliable)
-  for (const tag of challenge.tags) {
-    const agentId = XBOW_TAG_TO_AGENT_ID[tag];
-    if (agentId && getAgentEntry(agentId)) return agentId;
-  }
-  // 2. Fuzzy match via vulnerability-class string contains
-  for (const tag of challenge.tags) {
-    const matches = findAgentsForVulnClass(tag);
-    if (matches.length > 0) return matches[0].metadata.id;
-  }
-  // 3. Last-resort fallback — every challenge can benefit from recon
-  return 'recon';
+  const tryTier = (tier: Set<string>): string | undefined => {
+    for (const tag of challenge.tags) {
+      if (!tier.has(tag)) continue;
+      const agentId = XBOW_TAG_TO_AGENT_ID[tag];
+      if (agentId && getAgentEntry(agentId)) return agentId;
+    }
+    return undefined;
+  };
+  return (
+    tryTier(SPECIFIC_TAGS) ??
+    tryTier(BROAD_TAGS) ??
+    tryTier(META_TAGS) ??
+    (() => {
+      for (const tag of challenge.tags) {
+        const matches = findAgentsForVulnClass(tag);
+        if (matches.length > 0) return matches[0].metadata.id;
+      }
+      return 'recon';
+    })()
+  );
 }
 
 /** Maps XBOW challenge tags to Huntress agent vulnerability types (legacy display label) */
