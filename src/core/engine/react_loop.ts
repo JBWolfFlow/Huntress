@@ -442,16 +442,30 @@ export class ReactLoop {
         if (!response.toolCalls?.length) {
           logEntry.thinking = response.content;
 
+          // Anthropic /v1/messages rejects empty text content blocks with 400
+          // Bad Request. If the model returned no tool calls AND no content
+          // (rare but happens — e.g., when extended thinking is filtered out
+          // or the response is truncated), pushing { content: "" } poisons
+          // the conversation history: every subsequent retry replays the
+          // empty turn and hits another 400. Substitute a placeholder so
+          // the loop can continue.
+          // Bug observed 2026-05-02 against XBEN-005-24 (jwt-hunter): 5x
+          // 400s in 60s → react_loop's error-window stop fires → challenge
+          // marked ERROR even though the underlying state was recoverable.
+          const safeContent = response.content && response.content.trim()
+            ? response.content
+            : '(model returned no content this turn — continuing)';
+
           // Add assistant response to conversation
           this.conversationHistory.push({
             role: 'assistant',
-            content: response.content,
+            content: safeContent,
           });
 
           // Check if it wants to stop (said something like "I'm done")
           if (response.stopReason === 'end_turn') {
             stopReason = 'task_complete';
-            summary = response.content;
+            summary = safeContent;
             this.iterationLog.push(logEntry);
             break;
           }

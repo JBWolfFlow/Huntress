@@ -250,6 +250,14 @@ export class AnthropicProvider implements ModelProvider {
 
     const anthropicMessages: Anthropic.MessageParam[] = [];
 
+    // Anthropic /v1/messages rejects empty text content blocks AND empty
+    // plain-string messages with 400 Bad Request. Substitute a placeholder
+    // so the conversation stays valid even if upstream code accidentally
+    // built an empty turn. Belt-and-suspenders for react_loop.ts:442-449.
+    const EMPTY_PLACEHOLDER = '(empty)';
+    const safeText = (t: string | undefined | null): string =>
+      t && t.trim() ? t : EMPTY_PLACEHOLDER;
+
     for (const msg of messages) {
       if (msg.role === 'system') {
         // Anthropic uses a top-level system param; merge system messages
@@ -260,7 +268,7 @@ export class AnthropicProvider implements ModelProvider {
         const contentBlocks: Anthropic.ToolResultBlockParam[] = msg.toolResults.map(tr => ({
           type: 'tool_result' as const,
           tool_use_id: tr.tool_use_id,
-          content: tr.content,
+          content: typeof tr.content === 'string' ? safeText(tr.content) : tr.content,
           ...(tr.is_error ? { is_error: true } : {}),
         }));
         anthropicMessages.push({ role: 'user', content: contentBlocks });
@@ -268,7 +276,7 @@ export class AnthropicProvider implements ModelProvider {
         // Assistant message with structured content blocks (text + tool_use)
         const contentBlocks: Array<Anthropic.TextBlockParam | Anthropic.ToolUseBlockParam> = msg.content.map(block => {
           if (block.type === 'text') {
-            return { type: 'text' as const, text: block.text };
+            return { type: 'text' as const, text: safeText(block.text) };
           }
           // tool_use block
           return {
@@ -278,10 +286,14 @@ export class AnthropicProvider implements ModelProvider {
             input: block.input,
           };
         });
+        // Defensive: an assistant turn with zero content blocks would also 400
+        if (contentBlocks.length === 0) {
+          contentBlocks.push({ type: 'text', text: EMPTY_PLACEHOLDER });
+        }
         anthropicMessages.push({ role: 'assistant', content: contentBlocks });
       } else {
-        // Plain text message
-        const text = getMessageText(msg.content);
+        // Plain text message — same empty-rejection rule applies
+        const text = safeText(getMessageText(msg.content));
         anthropicMessages.push({ role: msg.role, content: text });
       }
     }
