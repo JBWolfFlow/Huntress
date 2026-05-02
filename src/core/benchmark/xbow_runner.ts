@@ -432,12 +432,11 @@ export class XBOWBenchmarkRunner {
       //   1. Rewrite Debian apt sources to archive.debian.org for EOL bases
       //      (recovers ~20 challenges using python:2.x / old-httpd that
       //       fail with apt-get update exit 100).
-      //   2. Drop a docker-compose.override.yml that disables broken
-      //      service-level healthchecks and adds memory limits so DB
-      //      containers can't OOM the host (which froze the VM in the
-      //      first 2026-05-02 run).
+      //   2. Patch docker-compose.yml to relax service_healthy depends_on
+      //      conditions (the broken healthchecks were blocking `up`). Our
+      //      waitForChallengeReady port probe handles real readiness.
       await this.patchChallengeDockerfiles(challenge.directory);
-      await this.writeComposeOverride(challenge.directory);
+      await this.patchChallengeCompose(challenge.directory);
 
       // Build the Docker container with the unique flag
       const buildResult = await executeCommand(
@@ -1114,54 +1113,61 @@ export class XBOWBenchmarkRunner {
   }
 
   /**
-   * P1-1 v2: Drop a `docker-compose.override.yml` next to the challenge's
-   * compose file. The override does two things:
+   * P1-1 v2: Patch the challenge's docker-compose.yml in place to relax
+   * fragile depends_on constraints.
    *
-   *   1. **Disables fragile service-level healthchecks** by replacing
-   *      `db`/`database`/`mysql`/`postgres` healthchecks with a no-op that
-   *      always passes. Without this, `up -d` blocks on
-   *      `depends_on: condition: service_healthy` even when the actual
-   *      service IS reachable on its port (the XBEN MySQL healthcheck
-   *      uses `timeout: 1s` against a service that takes ~60s to init).
-   *      Our own `waitForChallengeReady` port probe handles real readiness.
+   * The XBEN challenges declare `depends_on: <svc>: condition: service_healthy`,
+   * which makes `docker compose up` block until the dependency's healthcheck
+   * passes. Several of those healthchecks are broken (MySQL with `timeout:
+   * 1s` against a 60-second init) and never report healthy → `up` errors
+   * with "dependency failed to start".
    *
-   *   2. **Caps memory per service at 1GB** to prevent the OOM cascades
-   *      that froze the VM during the first full run. Total cap across
-   *      a 4-service challenge is 4GB which still leaves the host headroom.
+   * Fix: replace `condition: service_healthy` with `condition: service_started`.
+   * Compose then waits for the dependency CONTAINER to start (not be
+   * healthy). Our `waitForChallengeReady` port probe handles actual
+   * readiness via direct TCP polling — that's what the agent really cares
+   * about.
    *
-   * Idempotent: re-writing the override file with identical content is a
-   * no-op. The override targets common service names (db / database /
-   * mysql / postgres / web / app) — services with other names get the
-   * memory cap via the wildcard catch-all under `x-huntress-memlimit`.
+   * Idempotent via a `# huntress-archive-patch` marker comment. The first
+   * implementation tried writing a docker-compose.override.yml that named
+   * services not present in the base file — that broke ALL challenges with
+   * "service X has neither an image nor a build context specified" because
+   * Compose treats unknown override services as new invalid declarations.
+   * In-place patch sidesteps that entirely.
    */
-  async writeComposeOverride(challengeDir: string): Promise<void> {
-    const overridePath = path.join(challengeDir, 'docker-compose.override.yml');
-    // Common XBOW service-name conventions
-    const serviceNames = ['db', 'database', 'mysql', 'postgres', 'web', 'app', 'frontend', 'backend', 'nginx', 'apache'];
-    const indent = '  ';
-    const lines: string[] = [
-      `# huntress-archive-patch — generated to bypass broken healthchecks + cap memory`,
-      `# DO NOT COMMIT — regenerated per challenge run`,
-      `services:`,
-    ];
-    for (const svc of serviceNames) {
-      lines.push(`${indent}${svc}:`);
-      lines.push(`${indent}${indent}healthcheck:`);
-      lines.push(`${indent}${indent}${indent}test: ["CMD-SHELL", "exit 0"]`);
-      lines.push(`${indent}${indent}${indent}interval: 1s`);
-      lines.push(`${indent}${indent}${indent}timeout: 1s`);
-      lines.push(`${indent}${indent}${indent}retries: 1`);
-      lines.push(`${indent}${indent}deploy:`);
-      lines.push(`${indent}${indent}${indent}resources:`);
-      lines.push(`${indent}${indent}${indent}${indent}limits:`);
-      lines.push(`${indent}${indent}${indent}${indent}${indent}memory: 1g`);
-      lines.push(`${indent}${indent}mem_limit: 1g`);
+  async patchChallengeCompose(challengeDir: string): Promise<{ patched: boolean }> {
+    const composeNames = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
+    let composePath: string | null = null;
+    for (const name of composeNames) {
+      const p = path.join(challengeDir, name);
+      try {
+        await fs.access(p);
+        composePath = p;
+        break;
+      } catch { /* try next */ }
     }
+    if (!composePath) return { patched: false };
+
+    let content: string;
+    try {
+      content = await fs.readFile(composePath, 'utf-8');
+    } catch { return { patched: false }; }
+
+    // Idempotency check
+    if (content.includes('# huntress-archive-patch')) return { patched: false };
+
+    // Only patch when there's something to patch
+    if (!/condition:\s*service_healthy/.test(content)) return { patched: false };
+
+    const patched = content
+      .replace(/condition:\s*service_healthy/g, 'condition: service_started')
+      .replace(/^/, '# huntress-archive-patch — service_healthy → service_started\n');
 
     try {
-      await fs.writeFile(overridePath, lines.join('\n') + '\n');
+      await fs.writeFile(composePath, patched);
+      return { patched: true };
     } catch {
-      // best-effort — proceed even if override can't be written
+      return { patched: false };
     }
   }
 

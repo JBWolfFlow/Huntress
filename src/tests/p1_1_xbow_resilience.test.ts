@@ -170,56 +170,142 @@ describe('P1-1 v2 · patchChallengeDockerfiles', () => {
   });
 });
 
-// ─── B. writeComposeOverride ────────────────────────────────────────────────
+// ─── B. patchChallengeCompose ───────────────────────────────────────────────
+// IMPORTANT: this REPLACES the original writeComposeOverride() approach
+// which broke 100% of challenges by declaring services in an override file
+// that didn't exist in the base compose file (Compose error: "service X
+// has neither an image nor a build context specified"). The in-place patch
+// only modifies content that already exists, sidestepping that pitfall
+// entirely.
 
-describe('P1-1 v2 · writeComposeOverride', () => {
-  it('writes a docker-compose.override.yml with no-op healthchecks', async () => {
-    await makeRunner().writeComposeOverride(testDir);
-    const overridePath = join(testDir, 'docker-compose.override.yml');
-    expect(existsSync(overridePath)).toBe(true);
-    const content = readFileSync(overridePath, 'utf-8');
-    expect(content).toContain('huntress-archive-patch');
-    expect(content).toContain('exit 0'); // the no-op healthcheck
+describe('P1-1 v2 · patchChallengeCompose', () => {
+  function writeCompose(content: string, name = 'docker-compose.yml'): string {
+    const p = join(testDir, name);
+    writeFileSync(p, content);
+    return p;
+  }
+
+  it('rewrites condition: service_healthy → condition: service_started', async () => {
+    const composePath = writeCompose([
+      'services:',
+      '  db:',
+      '    image: mysql:8',
+      '    healthcheck:',
+      '      test: ["CMD", "mysqladmin", "ping"]',
+      '      timeout: 1s',
+      '  app:',
+      '    build: ./app',
+      '    depends_on:',
+      '      db:',
+      '        condition: service_healthy',
+    ].join('\n'));
+    const result = await makeRunner().patchChallengeCompose(testDir);
+    expect(result.patched).toBe(true);
+    const after = readFileSync(composePath, 'utf-8');
+    expect(after).toContain('condition: service_started');
+    expect(after).not.toContain('condition: service_healthy');
+    expect(after).toContain('# huntress-archive-patch');
   });
 
-  it('targets common XBOW service names (db, database, mysql, postgres, web, app)', async () => {
-    await makeRunner().writeComposeOverride(testDir);
-    const content = readFileSync(join(testDir, 'docker-compose.override.yml'), 'utf-8');
-    for (const svc of ['db', 'database', 'mysql', 'postgres', 'web', 'app']) {
-      expect(content).toMatch(new RegExp(`^\\s+${svc}:`, 'm'));
+  it('handles multiple service_healthy occurrences in one file', async () => {
+    const composePath = writeCompose([
+      'services:',
+      '  db:',
+      '    image: mysql:8',
+      '  cache:',
+      '    image: redis',
+      '  app:',
+      '    depends_on:',
+      '      db:',
+      '        condition: service_healthy',
+      '      cache:',
+      '        condition: service_healthy',
+    ].join('\n'));
+    await makeRunner().patchChallengeCompose(testDir);
+    const after = readFileSync(composePath, 'utf-8');
+    // Count occurrences in `condition:` lines only (the marker comment also
+    // contains the words "service_started" and "service_healthy")
+    expect((after.match(/condition:\s*service_started/g) ?? []).length).toBe(2);
+    expect(after).not.toMatch(/condition:\s*service_healthy/);
+  });
+
+  it('is idempotent — second call is a no-op', async () => {
+    writeCompose([
+      'services:',
+      '  app:',
+      '    depends_on:',
+      '      db:',
+      '        condition: service_healthy',
+    ].join('\n'));
+    const runner = makeRunner();
+    const first = await runner.patchChallengeCompose(testDir);
+    const second = await runner.patchChallengeCompose(testDir);
+    expect(first.patched).toBe(true);
+    expect(second.patched).toBe(false);
+  });
+
+  it('returns patched=false when no service_healthy exists (no work to do)', async () => {
+    writeCompose([
+      'services:',
+      '  app:',
+      '    image: nginx',
+      '    depends_on:',
+      '      db:',
+      '        condition: service_started',
+    ].join('\n'));
+    const result = await makeRunner().patchChallengeCompose(testDir);
+    expect(result.patched).toBe(false);
+  });
+
+  it('returns patched=false when no compose file exists', async () => {
+    const result = await makeRunner().patchChallengeCompose(testDir);
+    expect(result.patched).toBe(false);
+  });
+
+  it('discovers compose.yml as well as docker-compose.yml', async () => {
+    writeCompose([
+      'services:',
+      '  app:',
+      '    depends_on:',
+      '      db:',
+      '        condition: service_healthy',
+    ].join('\n'), 'compose.yml');
+    const result = await makeRunner().patchChallengeCompose(testDir);
+    expect(result.patched).toBe(true);
+  });
+
+  it('preserves the rest of the file content verbatim', async () => {
+    const original = [
+      'services:',
+      '  db:',
+      '    image: mysql:8',
+      '    expose:',
+      '      - 3306',
+      '    environment:',
+      '      MYSQL_ROOT_PASSWORD: secret',
+      '  app:',
+      '    build:',
+      '      context: ./app',
+      '    depends_on:',
+      '      db:',
+      '        condition: service_healthy',
+      '    ports:',
+      '      - 80',
+    ].join('\n');
+    const composePath = writeCompose(original);
+    await makeRunner().patchChallengeCompose(testDir);
+    const after = readFileSync(composePath, 'utf-8');
+    // Every original line except the patched one must be preserved
+    for (const line of original.split('\n')) {
+      if (line.includes('service_healthy')) continue;
+      expect(after).toContain(line);
     }
   });
 
-  it('caps memory per service at 1g (prevents OOM cascades)', async () => {
-    await makeRunner().writeComposeOverride(testDir);
-    const content = readFileSync(join(testDir, 'docker-compose.override.yml'), 'utf-8');
-    expect(content).toMatch(/memory:\s*1g/);
-    expect(content).toMatch(/mem_limit:\s*1g/);
-  });
-
-  it('is idempotent — re-writing produces identical content', async () => {
-    const runner = makeRunner();
-    await runner.writeComposeOverride(testDir);
-    const first = readFileSync(join(testDir, 'docker-compose.override.yml'), 'utf-8');
-    await runner.writeComposeOverride(testDir);
-    const second = readFileSync(join(testDir, 'docker-compose.override.yml'), 'utf-8');
-    expect(second).toBe(first);
-  });
-
-  it('output is valid YAML structure (services tree)', async () => {
-    await makeRunner().writeComposeOverride(testDir);
-    const content = readFileSync(join(testDir, 'docker-compose.override.yml'), 'utf-8');
-    // Top-level `services:` then 2-space-indented service names then 4-space-indented properties
-    expect(content).toMatch(/^services:$/m);
-    expect(content).toMatch(/^  [a-z]+:$/m);
-    expect(content).toMatch(/^    healthcheck:$/m);
-    expect(content).toMatch(/^      test:/m);
-  });
-
-  it('does not throw when destination directory is missing (best-effort)', async () => {
-    // Point at a nonexistent dir — writeFile will fail silently per design
-    const ghost = join(testDir, 'gone');
-    await expect(makeRunner().writeComposeOverride(ghost)).resolves.not.toThrow();
+  it('does NOT generate a docker-compose.override.yml (regression for first failed run)', async () => {
+    writeCompose('services:\n  app:\n    depends_on:\n      db:\n        condition: service_healthy\n');
+    await makeRunner().patchChallengeCompose(testDir);
+    expect(existsSync(join(testDir, 'docker-compose.override.yml'))).toBe(false);
   });
 });
 
