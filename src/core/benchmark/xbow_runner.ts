@@ -304,6 +304,14 @@ export class XBOWBenchmarkRunner {
         throw new Error(`Failed to clone benchmark repo: ${cloneResult.stderr}`);
       }
     } else {
+      // P1-1 v3: wipe stale Dockerfile/compose patches from prior runs
+      // BEFORE pulling. The per-challenge patcher is idempotent (won't
+      // double-apply), but a stale v1 Dockerfile patch from an earlier
+      // run still breaks the build. `git checkout -- .` resets the
+      // working tree to HEAD so each run starts clean.
+      this.emitProgress('setup', 1, 3, 'Resetting any prior local patches...');
+      await executeCommand('git', ['checkout', '--', '.'], this.benchmarkDir).catch(() => {});
+
       this.emitProgress('setup', 1, 3, 'Benchmark repo already present, pulling latest...');
       const pullResult = await executeCommand('git', ['pull', '--ff-only'], this.benchmarkDir);
       if (!pullResult.success) {
@@ -1089,14 +1097,24 @@ export class XBOWBenchmarkRunner {
       // (some archived repos have expired GPG signing keys). The
       // `--allow-insecure-repositories` and `Acquire::Check-Valid-Until=false`
       // flags handle expired Release files.
+      // P1-1 v3: SHELL-CONDITIONAL — only rewrite when sources.list points
+      // to an actually-archived suite (buster and older). The v1 patch
+      // unconditionally rewrote deb.debian.org → archive, which BROKE
+      // current releases (bullseye/bookworm/trixie still live at
+      // deb.debian.org and DO NOT exist on archive.debian.org). On 20
+      // bullseye+ challenges, the v1 patch caused apt-get update exit 100
+      // by sending requests to archive.debian.org/debian/dists/bullseye/
+      // which returns 404. The grep guard makes the patch a no-op when
+      // the base is current.
       const PATCH = [
-        `# huntress-archive-patch — recover EOL Debian bases`,
-        `RUN if [ -f /etc/apt/sources.list ]; then \\`,
+        `# huntress-archive-patch v2 — conditional rewrite for EOL Debian only`,
+        `RUN if [ -f /etc/apt/sources.list ] && \\`,
+        `       grep -qE '(buster|stretch|jessie|wheezy)' /etc/apt/sources.list 2>/dev/null; then \\`,
         `      sed -i -e 's|deb.debian.org|archive.debian.org|g' \\`,
         `             -e 's|security.debian.org|archive.debian.org/debian-security|g' \\`,
         `             -e '/-security/d' /etc/apt/sources.list ; \\`,
+        `      echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99-archive ; \\`,
         `    fi`,
-        `RUN echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99-archive`,
         ``,
       ].join('\n');
 

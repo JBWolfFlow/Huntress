@@ -168,6 +168,62 @@ describe('P1-1 v2 · patchChallengeDockerfiles', () => {
     const patched = readFileSync(dfPath, 'utf-8');
     expect(patched).toContain('Check-Valid-Until');
   });
+
+  // ─── v3: shell-conditional (regression for the bullseye+ break) ──────────
+
+  it('v3 patch is shell-conditional — guarded by grep for archived suite names', async () => {
+    // The v1 patch unconditionally rewrote deb.debian.org → archive, which
+    // broke 20 bullseye+ challenges (bullseye lives at deb.debian.org, not
+    // archive). The v2/v3 fix wraps the rewrite in a shell condition that
+    // only fires when sources.list mentions buster/stretch/jessie/wheezy.
+    const dfPath = join(testDir, 'Dockerfile');
+    writeFileSync(dfPath, [
+      'FROM debian:bullseye-slim',
+      'RUN apt-get update && apt-get install -y curl',
+    ].join('\n'));
+    await makeRunner().patchChallengeDockerfiles(testDir);
+    const patched = readFileSync(dfPath, 'utf-8');
+    // The patch must contain the conditional guard — we look for the
+    // grep that gates the sed
+    expect(patched).toMatch(/grep -qE.*buster\|stretch\|jessie\|wheezy/);
+    // And the marker should be v2 (not v1)
+    expect(patched).toContain('huntress-archive-patch v2');
+  });
+
+  it('v3 patch on bullseye base is no-op at build time (grep finds nothing)', async () => {
+    // Smoke: the if/then structure should be present and the sed should
+    // be inside the then-branch (not unconditional). Without spinning up
+    // an actual docker build (which would require docker in CI), we
+    // can only verify the SHAPE of the patch.
+    const dfPath = join(testDir, 'Dockerfile');
+    writeFileSync(dfPath, 'FROM debian:bullseye-slim\nRUN apt-get update');
+    await makeRunner().patchChallengeDockerfiles(testDir);
+    const patched = readFileSync(dfPath, 'utf-8');
+
+    // Find the patch section — between the marker and the original RUN
+    const markerIdx = patched.indexOf('# huntress-archive-patch v2');
+    const aptIdx = patched.indexOf('RUN apt-get update');
+    expect(markerIdx).toBeGreaterThanOrEqual(0);
+    expect(aptIdx).toBeGreaterThan(markerIdx);
+    const patchBlock = patched.substring(markerIdx, aptIdx);
+    // The sed must be INSIDE the if/then (so it's a no-op when grep fails)
+    expect(patchBlock).toMatch(/if \[/);
+    expect(patchBlock).toMatch(/grep -qE/);
+    expect(patchBlock).toMatch(/sed -i/);
+    expect(patchBlock).toMatch(/fi$/m);
+  });
+
+  it('v3 patch on buster base would activate the rewrite (grep finds match)', async () => {
+    // Same shape, but for a base that the patch SHOULD help. The
+    // conditional inside the Dockerfile would evaluate true at build
+    // time and the sed would fire.
+    const dfPath = join(testDir, 'Dockerfile');
+    writeFileSync(dfPath, 'FROM python:2.7-slim\nRUN apt-get update');
+    await makeRunner().patchChallengeDockerfiles(testDir);
+    const patched = readFileSync(dfPath, 'utf-8');
+    expect(patched).toContain('archive.debian.org');
+    expect(patched).toContain('huntress-archive-patch v2');
+  });
 });
 
 // ─── B. patchChallengeCompose ───────────────────────────────────────────────
