@@ -143,12 +143,21 @@ export interface BenchmarkRun {
 
 // ─── Internal Types ──────────────────────────────────────────────────────────
 
-/** Raw benchmark-config.json shape from the XBOW repo */
+/**
+ * Raw benchmark.json shape from the XBOW validation-benchmarks repo.
+ *
+ * Real layout (verified against the public repo on 2026-05-02):
+ *   <repo>/benchmarks/<id>/benchmark.json
+ *   <repo>/benchmarks/<id>/docker-compose.yml
+ *
+ * `level` is shipped as a string ("1", "2", etc.) so this interface
+ * accepts either string or number — `listChallenges()` coerces.
+ */
 interface RawBenchmarkConfig {
   id?: string;
   name?: string;
   description?: string;
-  level?: number;
+  level?: number | string;
   tags?: string[];
   win_condition?: 'flag' | 'question';
 }
@@ -303,30 +312,67 @@ export class XBOWBenchmarkRunner {
 
   /**
    * Scan the benchmark directory for all available challenges.
-   * Each challenge directory must contain a benchmark-config.json.
+   *
+   * XBOW layout: `<repo>/benchmarks/<id>/benchmark.json` (verified
+   * against the public repo on 2026-05-02). The runner falls back to
+   * scanning the top-level `<repo>/<id>/` if the `benchmarks/` subdir
+   * doesn't exist — keeps things working with a flat layout (e.g. a
+   * future repo restructure or a custom benchmark dir).
+   *
+   * Each challenge dir must contain `benchmark.json`. Older XBOW
+   * versions used `benchmark-config.json`; both names are checked.
    */
   async listChallenges(): Promise<Challenge[]> {
-    const entries = await fs.readdir(this.benchmarkDir);
+    // Prefer `benchmarks/` subdirectory (real XBOW layout); fall back
+    // to scanning benchmarkDir directly so a flat layout still works.
+    let scanRoot = this.benchmarkDir;
+    try {
+      const benchmarksSubdir = path.join(this.benchmarkDir, 'benchmarks');
+      await fs.access(benchmarksSubdir);
+      scanRoot = benchmarksSubdir;
+    } catch {
+      // No `benchmarks/` subdir — scan the top level (legacy layout)
+    }
+
+    const entries = await fs.readdir(scanRoot);
     const challenges: Challenge[] = [];
 
     for (const entry of entries) {
-      const configPath = path.join(this.benchmarkDir, entry, 'benchmark-config.json');
-      try {
-        const raw = await fs.readFile(configPath, 'utf-8');
-        const parsed: RawBenchmarkConfig = JSON.parse(raw) as RawBenchmarkConfig;
+      const dir = path.join(scanRoot, entry);
+      // Try modern filename first, then the legacy one
+      const candidates = [
+        path.join(dir, 'benchmark.json'),
+        path.join(dir, 'benchmark-config.json'),
+      ];
 
-        challenges.push({
-          id: parsed.id ?? entry,
-          name: parsed.name ?? entry,
-          description: parsed.description ?? '',
-          level: parsed.level ?? 1,
-          tags: parsed.tags ?? [],
-          winCondition: parsed.win_condition ?? 'flag',
-          directory: path.join(this.benchmarkDir, entry),
-        });
-      } catch {
-        // Not a challenge directory — skip
+      let parsed: RawBenchmarkConfig | null = null;
+      for (const configPath of candidates) {
+        try {
+          const raw = await fs.readFile(configPath, 'utf-8');
+          parsed = JSON.parse(raw) as RawBenchmarkConfig;
+          break;
+        } catch {
+          // Try next candidate
+        }
       }
+      if (!parsed) continue;
+
+      // Coerce level — XBOW ships it as string ("2"), older custom
+      // configs may ship a number. Default 1 on parse failure.
+      const rawLevel = parsed.level;
+      const level = typeof rawLevel === 'number'
+        ? rawLevel
+        : (typeof rawLevel === 'string' ? (parseInt(rawLevel, 10) || 1) : 1);
+
+      challenges.push({
+        id: parsed.id ?? entry,
+        name: parsed.name ?? entry,
+        description: parsed.description ?? '',
+        level,
+        tags: parsed.tags ?? [],
+        winCondition: parsed.win_condition ?? 'flag',
+        directory: dir,
+      });
     }
 
     // Sort by level ascending, then by name
