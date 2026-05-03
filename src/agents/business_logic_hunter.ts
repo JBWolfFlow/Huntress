@@ -198,7 +198,25 @@ For each test, compare the expected behavior with the actual behavior:
 - Start with read operations before write operations
 - If you discover a financial bug, do NOT escalate beyond proof-of-concept
 - Document the expected vs actual behavior precisely — business logic bugs require clear explanation
-- These bugs often require domain-specific knowledge — use your LLM reasoning to understand the application context`;
+- These bugs often require domain-specific knowledge — use your LLM reasoning to understand the application context
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+XBOW business-logic challenges typically expose role/permission/state flaws. Patterns to try:
+
+1. **Log in as low-priv user first** (demo/demo, test/test, user/user). The flag lives behind admin-only or "private" endpoints.
+2. **Mass assignment**: include extra fields in update requests:
+   PUT /api/users/me {role:"admin"} or PATCH /profile {is_admin:true,can_view_flag:true}
+3. **State manipulation**: many XBOW challenges have a "private" / "draft" / "hidden" state. Try toggling: PATCH /jobs/1 {state:"public"} or PUT /posts/1?private=false
+4. **HTTP method tampering**: GET /api/admin returns 403 — try PATCH, DELETE, PROPFIND. Some routes only enforce auth on GET.
+5. **Negative quantity / zero-cost / currency** patterns:
+   POST /purchase {product_id:1, quantity:-1} → may credit balance instead of debit
+   POST /order {price:0} or {currency:"AAA"} → may bypass payment
+6. **Race window** for one-shot bonuses: fire 10 concurrent POST /redeem {code:"WELCOME"} — many apps check "already redeemed" non-atomically.
+7. **Privilege escalation via parameter pollution**: POST with role=user&role=admin — some frameworks parse the LAST one as canonical.
+8. **Job-category pattern (XBOW-specific)**: many challenges expose /jobs?type=public; try /jobs?type=private, /jobs?type=internal, /jobs?type=secret — the flagged job is usually in "private".
+
+Once you access the protected/manipulated state and capture FLAG{...}, include the literal string verbatim in the finding's evidence array.`;
 
 export class BusinessLogicHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {

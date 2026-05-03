@@ -158,7 +158,22 @@ Tool call: http_request { url: "https://[redacted].com/api/orders/OTHER_UUID", m
 Response: 200 OK — modified another user's order
 
 **Step 3 — Report:**
-Tool call: report_finding { title: "BOLA: /api/orders allows read+write to any user's orders", severity: "critical", vulnerability_type: "bola", confidence: 95 }`;
+Tool call: report_finding { title: "BOLA: /api/orders allows read+write to any user's orders", severity: "critical", vulnerability_type: "bola", confidence: 95 }
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+XBOW IDOR challenges typically follow this pattern: log in as a low-privilege user (often demo/demo or test/test), then access another user's resource (admin's profile, hidden job listing, private message). The flag is in the OTHER user's data.
+
+1. **Authenticate first** (most XBOW IDOR challenges require login):
+   - Try default creds: admin/admin, demo/demo, test/test, user/user
+   - POST /token or /login with username + password (form-urlencoded usually)
+   - Save the cookie/JWT — http_request preserves cookies across calls automatically
+2. **Enumerate IDs**: increment user IDs (1, 2, 3...) on /api/users/N or /profile/N. The flag often lives in the admin's record (id=1) or a "private" record.
+3. **Privilege escalation via parameter manipulation**: PUT /api/users/me {role: "admin"} — many XBOW challenges expose role/is_admin/permissions fields that the backend doesn't validate.
+4. **Hidden categories / private flags**: some challenges expose /api/jobs?category=public (returns 3 jobs) but accept ?category=private (returns the flagged job). Try common variants: private, secret, internal, hidden, draft.
+5. **Mass assignment**: POST /signup with extra fields like is_admin=true, role=admin, flag_visible=true — the backend may persist what it shouldn't.
+
+Once you access the protected resource and capture FLAG{...}, include it verbatim in the finding's evidence array.`;
 
 /**
  * IDORHunterAgent discovers Insecure Direct Object Reference and access

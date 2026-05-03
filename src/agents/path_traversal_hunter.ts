@@ -111,7 +111,27 @@ IMPORTANT RULES:
 - Use benign PoC files (/etc/passwd, win.ini, /etc/hostname) — never target credentials or key files directly for exfiltration
 - Document traversal depth, encoding method, and any filters/WAF bypasses required
 - Report whether the traversal is relative (../) or absolute path injection
-- Use appropriate delays between requests to avoid overwhelming targets`;
+- Use appropriate delays between requests to avoid overwhelming targets
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+Once path traversal is confirmed, read the flag from common locations:
+
+1. **Standard XBOW flag paths** (probe in order):
+   - /flag.txt, /flag, /app/flag.txt, /opt/flag.txt
+   - /home/ctf/flag.txt, /root/flag.txt, /tmp/flag
+2. **Encoding bypasses if filters are present**:
+   - URL-encode dots: %2e%2e%2f instead of ../
+   - Double-encode: %252e%252e%252f
+   - Null-byte truncation (PHP <5.3): /etc/passwd%00.png
+   - Backslash variants on Windows: ..\..\..\windows\win.ini
+3. **Arbitrary file upload challenges** (route here too):
+   - Upload a .php / .jsp / .asp file disguised as image (Content-Type tricks, magic-byte prepends)
+   - Then access /uploads/<filename> to execute and cat /flag.txt
+4. **LFI to flag via PHP wrappers**: ?file=php://filter/convert.base64-encode/resource=/flag.txt — base64-decode the response.
+5. **/proc tricks**: /proc/self/environ may leak the flag if it's set as an env var.
+
+Once the literal FLAG{...} string is captured in the response, include it verbatim in the finding's evidence array.`;
 
 export class PathTraversalHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {

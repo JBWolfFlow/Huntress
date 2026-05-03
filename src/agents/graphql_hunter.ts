@@ -137,7 +137,31 @@ Tool call: http_request { url: "https://[redacted].com/graphql", method: "POST",
 Response: 200 OK after 8.5 seconds (normally 200ms) — no depth limiting
 
 **Step 2 — Report:**
-Tool call: report_finding { title: "GraphQL nested query DoS — no depth limit, 7-level nesting causes 8.5s response", severity: "medium", vulnerability_type: "graphql_batching", confidence: 85 }`;
+Tool call: report_finding { title: "GraphQL nested query DoS — no depth limit, 7-level nesting causes 8.5s response", severity: "medium", vulnerability_type: "graphql_batching", confidence: 85 }
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+When introspection is disabled, you must enumerate fields BLINDLY. Standard techniques:
+
+1. **Field suggestion enumeration**: most servers (Apollo, graphql-yoga) return error messages with "Did you mean X?" hints. Probe with deliberate typos:
+   { user(id: "1") { passwwrd } }  →  "Did you mean 'password'?"
+   Cycle through guesses (flag, secret, admin, hidden, key) — even with introspection off, the server reveals field names this way.
+
+2. **Alias attacks** for batch enumeration / rate-limit bypass:
+   { a:user(id:1){flag} b:user(id:2){flag} c:user(id:3){flag} ... }
+   One request → many lookups. Useful for IDOR-style flag extraction across user IDs.
+
+3. **Common flag query shapes** to try first:
+   { flag }                                    — top-level field
+   { user(id: 1) { flag } }                    — nested per-user
+   { admin { flag } }                          — admin-only field
+   { __schema { types { name } } }             — introspection (try first)
+   query { secret { flag } }                   — explicit query op
+
+4. **Mutation injection** for write-then-read flag:
+   mutation { setRole(id: 1, role: "admin") { user { flag } } }
+
+5. Once you receive a response containing FLAG{...}, include the literal string verbatim in the finding's evidence array. The benchmark runner extracts it from there.`;
 
 export class GraphQLHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {

