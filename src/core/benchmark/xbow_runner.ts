@@ -38,7 +38,12 @@ const FLAG_REGEX = /FLAG\{[^}]+\}|flag\{[^}]+\}/g;
 const DEFAULT_MAX_PARALLEL = 1;
 const DEFAULT_TIMEOUT_PER_CHALLENGE = 600_000; // 10 minutes (was 5)
 const MAX_AGENT_ITERATIONS = 40;
-const DEFAULT_READINESS_TIMEOUT_MS = 180_000; // was 90s — slow JVM/PHP starts need more
+// P1-1 v7: bumped 180→240s after research surfaced MAPTA's data showing
+// MySQL/JVM init can take ~150s on slower hosts. 180s leaves no margin
+// — challenges that boot in 175s spuriously timed out. 240s gives 30%
+// headroom without significantly extending total run time (only
+// challenges that ACTUALLY take that long pay the cost).
+const DEFAULT_READINESS_TIMEOUT_MS = 240_000;
 
 /**
  * P1-1 v4/v5: XBOW challenge tag → Huntress specialist agent ID.
@@ -656,6 +661,11 @@ export class XBOWBenchmarkRunner {
         results.push(result);
         completedCount++;
 
+        // P1-1 v7: persist each result IMMEDIATELY so a kill mid-run
+        // preserves all completed challenges. Aggregate row is still
+        // written at the end via persistBenchmarkRun().
+        await this.persistChallengeResult(runId, result);
+
         const status = result.solved ? 'SOLVED' : result.error ? 'ERROR' : 'FAILED';
         this.emitProgress(
           'benchmark',
@@ -1233,7 +1243,7 @@ export class XBOWBenchmarkRunner {
 
   // ─── Private: Database ───────────────────────────────────────────────────
 
-  /** Create the benchmark_runs table if it does not exist */
+  /** Create the benchmark tables if they do not exist */
   private async initDatabase(): Promise<void> {
     await knowledgeDbExecute(
       this.dbPath,
@@ -1253,6 +1263,67 @@ export class XBOWBenchmarkRunner {
         by_level_json TEXT NOT NULL
       )`,
     );
+
+    // P1-1 v7: Per-challenge incremental persistence. Without this, killing
+    // the runner mid-benchmark loses every completed challenge — the
+    // aggregate row is only written when runBenchmark() finishes. Now each
+    // ChallengeResult is written to benchmark_results as soon as it
+    // completes, so a kill-on-39/104 still leaves 39 rows of data we can
+    // analyze afterward.
+    await knowledgeDbExecute(
+      this.dbPath,
+      `CREATE TABLE IF NOT EXISTS benchmark_results (
+        run_id TEXT NOT NULL,
+        challenge_id TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        solved INTEGER NOT NULL,
+        flag TEXT,
+        expected_flag TEXT NOT NULL,
+        iterations INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        cost_usd REAL NOT NULL,
+        tokens_used INTEGER NOT NULL,
+        error TEXT,
+        PRIMARY KEY (run_id, challenge_id)
+      )`,
+    );
+    await knowledgeDbExecute(
+      this.dbPath,
+      `CREATE INDEX IF NOT EXISTS idx_benchmark_results_run ON benchmark_results(run_id)`,
+    );
+  }
+
+  /** P1-1 v7: Persist a single ChallengeResult immediately after the
+   * challenge finishes. Idempotent via PRIMARY KEY (run_id, challenge_id);
+   * if the same challenge runs twice in a single run (rare, but possible
+   * if a retry path is added), the second write replaces the first. */
+  private async persistChallengeResult(runId: string, result: ChallengeResult): Promise<void> {
+    await knowledgeDbExecute(
+      this.dbPath,
+      `INSERT OR REPLACE INTO benchmark_results
+        (run_id, challenge_id, timestamp, solved, flag, expected_flag,
+         iterations, duration_ms, cost_usd, tokens_used, error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        runId,
+        result.challengeId,
+        new Date().toISOString(),
+        String(result.solved ? 1 : 0),
+        result.flag ?? '',
+        result.expectedFlag,
+        String(result.iterations),
+        String(result.durationMs),
+        String(result.costUsd),
+        String(result.tokensUsed),
+        result.error ?? '',
+      ],
+    ).catch((err) => {
+      // Persistence failure must not crash the benchmark — log and continue.
+      // Worst case: we lose ONE challenge's row; the aggregate run still
+      // captures it via results_json on completion.
+      // eslint-disable-next-line no-console
+      console.error(`[xbow] failed to persist ${result.challengeId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   /** Persist a benchmark run to the database */

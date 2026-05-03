@@ -499,6 +499,29 @@ export class ReactLoop {
         // Process each tool call
         const toolResults: ToolResultBlock[] = [];
 
+        // P1-1 v7: Helper to build a complete user/tool_result reply for an
+        // assistant turn that contained tool_use blocks. CRITICAL: Anthropic's
+        // API rejects with 400 if any tool_use_id in the assistant turn
+        // doesn't have a matching tool_result. Without this helper, breaking
+        // mid-loop (tool_call_limit, identical_toolcall_loop, stop_hunting,
+        // capture_*, processToolCall throw) leaves orphan tool_use blocks in
+        // history → every subsequent /v1/messages call 400s with
+        // "tool_use_id X is missing tool_result". The cascade observed
+        // 2026-05-02 during the partial XBOW run (30+ 400s/run).
+        const fillMissingToolResults = (reason: string): void => {
+          const fulfilled = new Set(toolResults.map(r => r.tool_use_id));
+          for (const tc of response.toolCalls ?? []) {
+            if (!fulfilled.has(tc.id)) {
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: tc.id,
+                content: `Tool execution skipped: ${reason}`,
+                is_error: true,
+              });
+            }
+          }
+        };
+
         for (const toolCall of response.toolCalls) {
           if (!logEntry.toolCalls) logEntry.toolCalls = [];
           logEntry.toolCalls.push(toolCall);
@@ -514,6 +537,7 @@ export class ReactLoop {
             summary = `Tool-call cap reached (${this.toolCallCount}/${this.maxToolCalls}). ` +
               `Agent burned its tool budget without completing the task.`;
             this.emitStatus('error', summary, iteration);
+            fillMissingToolResults('tool-call cap reached');
             this.conversationHistory.push({
               role: 'user',
               content: '',
@@ -536,6 +560,7 @@ export class ReactLoop {
               `to '${toolCall.name}' with the same arguments. The agent appears stuck in a loop. ` +
               `Try a different approach or stop the hunt for this target.`;
             this.emitStatus('error', summary, iteration);
+            fillMissingToolResults('stopped after identical-toolcall loop detected');
             this.conversationHistory.push({
               role: 'user',
               content: '',
@@ -556,6 +581,7 @@ export class ReactLoop {
             stopReason = input.reason as ReactLoopResult['stopReason'];
             summary = input.summary;
             // Push tool results before breaking
+            fillMissingToolResults('agent invoked stop_hunting before processing remaining tools');
             this.conversationHistory.push({
               role: 'user',
               content: '',
@@ -575,6 +601,7 @@ export class ReactLoop {
             stopReason = 'task_complete';
             summary = input.summary || 'Auth capture complete';
             this.captureTerminal = { kind: 'complete', input: toolCall.input as Record<string, unknown> };
+            fillMissingToolResults('agent invoked capture_complete before processing remaining tools');
             this.conversationHistory.push({
               role: 'user',
               content: '',
@@ -589,6 +616,7 @@ export class ReactLoop {
             stopReason = 'blocker';
             summary = `Auth capture failed (${input.reason || 'unknown'}): ${input.detail || ''}`;
             this.captureTerminal = { kind: 'failed', input: toolCall.input as Record<string, unknown> };
+            fillMissingToolResults('agent invoked capture_failed before processing remaining tools');
             this.conversationHistory.push({
               role: 'user',
               content: '',
@@ -615,22 +643,60 @@ export class ReactLoop {
 
         this.emitStatus('error', `Error: ${errMsg}`, iteration);
 
-        // Add error to conversation so the model can adapt
-        this.conversationHistory.push({
-          role: 'user',
-          content: `Error occurred: ${errMsg}. Please adjust your approach and continue.`,
-        });
+        // P1-1 v7: If we already pushed an assistant message with tool_use
+        // blocks (line ~494) and a throw landed us here, those tool_use_ids
+        // need tool_result fulfillments — otherwise the next API call 400s
+        // with "tool_use_id X is missing tool_result". Inspect the last
+        // assistant message; if it contains unfulfilled tool_use blocks,
+        // emit error tool_results for each AND fold the diagnostic into one
+        // of them instead of pushing a separate plain-text user message
+        // (which would break tool_use/tool_result pairing).
+        const lastMsg = this.conversationHistory[this.conversationHistory.length - 1];
+        const lastWasAssistantWithToolUse = lastMsg
+          && lastMsg.role === 'assistant'
+          && Array.isArray(lastMsg.content)
+          && lastMsg.content.some(b => b.type === 'tool_use');
+
+        if (lastWasAssistantWithToolUse && Array.isArray(lastMsg.content)) {
+          const toolResults: ToolResultBlock[] = [];
+          for (const block of lastMsg.content) {
+            if (block.type === 'tool_use') {
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: block.id,
+                content: `Tool execution failed: ${errMsg}. Please adjust your approach and continue.`,
+                is_error: true,
+              });
+            }
+          }
+          this.conversationHistory.push({
+            role: 'user',
+            content: '',
+            toolResults,
+          });
+        } else {
+          // No tool_use to fulfill — safe to push a plain-text user message
+          this.conversationHistory.push({
+            role: 'user',
+            content: `Error occurred: ${errMsg}. Please adjust your approach and continue.`,
+          });
+        }
 
         // Push logEntry BEFORE checking recent errors so it's included in the count
         this.iterationLog.push(logEntry);
 
-        // Stop after 5 errors within a 60-second window (not all-time consecutive)
+        // P1-1 v7: bumped 5→10 after the orphan-tool_use bug caused
+        // cascades that tripped the old threshold on the FIRST few
+        // iterations of a challenge. Now that orphan tool_use is fixed,
+        // remaining errors are likely transient (rate limit, network),
+        // and 10 in 60s is still a hard wall against runaway loops.
+        // Stop after 10 errors within a 60-second window (not all-time consecutive)
         const errorWindowMs = 60_000;
         const now = Date.now();
         const recentErrors = this.iterationLog.filter(
           l => l.error && (now - l.timestamp) < errorWindowMs
         );
-        if (recentErrors.length >= 5) {
+        if (recentErrors.length >= 10) {
           stopReason = 'error';
           summary = `Stopped after 5 errors within 60s window. Last error: ${errMsg}`;
           break;

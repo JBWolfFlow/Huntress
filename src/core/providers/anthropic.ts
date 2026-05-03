@@ -126,7 +126,39 @@ export class AnthropicProvider implements ModelProvider {
       }
     }
 
-    const response = await this.client.messages.create(requestParams as unknown as Anthropic.MessageCreateParamsNonStreaming);
+    let response: Anthropic.Message;
+    try {
+      response = await this.client.messages.create(requestParams as unknown as Anthropic.MessageCreateParamsNonStreaming);
+    } catch (err) {
+      // P1-1 v7: Surface the ACTUAL Anthropic error reason so we can debug
+      // recurring 400s. Without this, the loop's catch sees only "400 Bad
+      // Request" and we have no signal on what was malformed (orphan
+      // tool_use, empty content, oversized message, invalid schema, etc.).
+      // Logs the structured error from the SDK and a compact request
+      // shape (NOT the full bodies — would dump 100KB+ of tool results).
+      const e = err as { status?: number; message?: string; error?: { error?: { message?: string; type?: string } } };
+      if (e?.status === 400) {
+        const reason = e?.error?.error?.message ?? e?.message ?? 'unknown';
+        const type = e?.error?.error?.type ?? 'unknown';
+        const lastFew = anthropicMessages.slice(-3).map((m, i, arr) => {
+          const idx = anthropicMessages.length - arr.length + i;
+          if (typeof m.content === 'string') return `[${idx}] ${m.role}: text(${m.content.length}b)`;
+          const blocks = (m.content as Array<{ type: string; id?: string; tool_use_id?: string }>).map(b => {
+            if (b.type === 'tool_use') return `tool_use(${b.id})`;
+            if (b.type === 'tool_result') return `tool_result(${b.tool_use_id})`;
+            return b.type;
+          });
+          return `[${idx}] ${m.role}: [${blocks.join(', ')}]`;
+        });
+        // eslint-disable-next-line no-console
+        console.error(
+          `[anthropic 400] type=${type} reason="${reason}"\n` +
+          `  model=${options.model} messages=${anthropicMessages.length} tools=${(options.tools ?? []).length}\n` +
+          `  last 3 messages:\n    ${lastFew.join('\n    ')}`,
+        );
+      }
+      throw err;
+    }
 
     // Extract text and tool use blocks
     const textParts: string[] = [];
