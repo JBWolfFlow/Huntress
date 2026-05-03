@@ -105,22 +105,55 @@ export class AnthropicProvider implements ModelProvider {
   async sendMessage(messages: ChatMessage[], options: SendMessageOptions): Promise<ChatResponse> {
     const { systemPrompt, anthropicMessages } = this.formatMessages(messages, options);
 
+    // P1-1 v8: Prompt caching. The system prompt + tool defs are stable
+    // across every iteration of an agent run; without cache_control we
+    // re-pay for ~15K tokens (5K system + 10K tools) on every API call.
+    // With cache_control on the LAST tool def AND the system prompt as
+    // a content-block array, Anthropic caches the entire prefix and we
+    // pay 90% less on subsequent reads.
+    //
+    // Strict prefix order: tools → system → messages. Mark the LAST tool
+    // (caches all prior tools) and convert system to a [{text, cache_control}]
+    // block (caches the system text). Two breakpoints, max savings.
+    //
+    // Verify in production via `usage.cache_read_input_tokens` > 0 from
+    // iteration 2+. If 0, look for cache invalidators (Date.now(),
+    // randomUUID, unsorted JSON) in the prompt builder.
+    //
+    // Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
     const requestParams: Record<string, unknown> = {
       model: options.model,
-      max_tokens: options.maxTokens ?? 4096,
-      ...(systemPrompt ? { system: systemPrompt } : {}),
+      max_tokens: options.maxTokens ?? 16000,
       ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
       ...(options.stopSequences?.length ? { stop_sequences: options.stopSequences } : {}),
       messages: anthropicMessages,
     };
 
-    // Native tool use support
+    // System prompt as cached content block array (caches text+tools prefix)
+    if (systemPrompt) {
+      requestParams.system = [{
+        type: 'text',
+        text: systemPrompt,
+        cache_control: { type: 'ephemeral' },
+      }];
+    }
+
+    // Native tool use support — mark the LAST tool with cache_control
+    // to cache the entire tools array as a single prefix segment.
     if (options.tools?.length) {
-      requestParams.tools = options.tools.map(t => ({
-        name: t.name,
-        description: t.description,
-        input_schema: t.input_schema,
-      }));
+      const tools = options.tools.map((t, i, arr) => {
+        const base: Record<string, unknown> = {
+          name: t.name,
+          description: t.description,
+          input_schema: t.input_schema,
+        };
+        // Mark the last tool only — caches all prior tools as one prefix.
+        if (i === arr.length - 1) {
+          base.cache_control = { type: 'ephemeral' };
+        }
+        return base;
+      });
+      requestParams.tools = tools;
       if (options.toolChoice) {
         requestParams.tool_choice = this.formatToolChoice(options.toolChoice);
       }

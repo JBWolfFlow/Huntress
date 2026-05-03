@@ -417,11 +417,19 @@ export class ReactLoop {
         // ── THINK: Send context + tools to model ──
         this.emitStatus('thinking', 'Reasoning about next action...', iteration);
 
+        // P1-1 v8: maxTokens 4096 → 16000.
+        // 4096 truncates mid-tool-call when the model emits a long
+        // execute_command (e.g., a sqlmap with many flags) or wants to
+        // emit multiple parallel tool_uses. Truncation forces a retry
+        // with the full prompt re-sent, wasting tokens. 16000 is the
+        // recommended default for agentic tool-use loops on Opus 4.7.
+        // We only PAY for tokens actually generated, so the ceiling
+        // increase is a reliability win at zero cost.
         const response = await this.config.provider.sendMessage(
           this.conversationHistory,
           {
             model: this.config.model,
-            maxTokens: 4096,
+            maxTokens: 16000,
             systemPrompt,
             tools: this.config.tools,
             toolChoice: 'auto',

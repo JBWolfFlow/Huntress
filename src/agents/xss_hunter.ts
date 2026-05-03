@@ -84,9 +84,22 @@ Your attack playbook — follow these steps methodically:
 
 10. **Validation** — For each candidate finding, confirm exploitability:
     - Construct a complete PoC URL or payload
-    - Verify the payload executes in the target context
+    - **CRITICAL: actually run the payload in a real browser via browser_navigate.**
+      curl + body-match only proves REFLECTION, not EXECUTION. Modern XSS
+      challenges (Vue/React/Angular SPAs, server-side template engines that
+      render via PhantomJS check scripts) require a real browser to fire
+      the payload. Steps:
+        a. browser_navigate { url: "TARGET_WITH_PAYLOAD" }
+        b. browser_evaluate { expression: "document.body.innerHTML" } — confirm payload landed in the DOM
+        c. browser_evaluate { expression: "window.__xss_fired === true" } — many challenges set a global flag when alert/onload fires
+        d. browser_get_content — read the rendered page; the FLAG often appears in the rendered output (not in the raw HTTP response)
+    - For DOM/client-side XSS: payload may NOT appear in the HTTP response body at all — only browser_navigate + browser_evaluate can detect it.
     - Document the full reproduction steps
     - Assess impact: cookie theft, session hijacking, keylogging, phishing
+
+11. **Flag extraction (CTF context)** — If running against a CTF target (challenge name starts with XBEN- or has CTF flag format FLAG{...}):
+    - Once XSS fires, the flag may be embedded in the rendered page, in document.cookie, in localStorage, or surfaced via an alert() dialog.
+    - browser_evaluate { expression: "document.cookie + ' | ' + JSON.stringify(localStorage) + ' | ' + document.body.innerText" } — combined dump is the highest-yield extraction.
 
 IMPORTANT RULES:
 - Only test targets that are explicitly in scope

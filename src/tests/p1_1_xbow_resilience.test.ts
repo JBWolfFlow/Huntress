@@ -139,12 +139,12 @@ describe('P1-1 v2 · patchChallengeDockerfiles', () => {
     expect(result.patched).toBe(1); // only the top-level Dockerfile
   });
 
-  it('preserves the rest of the Dockerfile content verbatim', async () => {
+  it('preserves non-targeted Dockerfile content verbatim', async () => {
     const dfPath = join(testDir, 'Dockerfile');
     writeFileSync(dfPath, [
       'FROM python:2.7-slim',
       'WORKDIR /app',
-      'RUN apt-get update && apt-get install -y phantomjs',
+      'RUN apt-get update && apt-get install -y curl',
       'COPY . .',
       'EXPOSE 80',
       'CMD ["python", "run.py"]',
@@ -152,13 +152,102 @@ describe('P1-1 v2 · patchChallengeDockerfiles', () => {
 
     await makeRunner().patchChallengeDockerfiles(testDir);
     const patched = readFileSync(dfPath, 'utf-8');
-    // Original lines must still be present
+    // Original lines must still be present (no phantomjs/netcat/composer to strip)
     expect(patched).toContain('FROM python:2.7-slim');
     expect(patched).toContain('WORKDIR /app');
     expect(patched).toContain('COPY . .');
     expect(patched).toContain('EXPOSE 80');
     expect(patched).toContain('CMD ["python", "run.py"]');
-    expect(patched).toContain('RUN apt-get update && apt-get install -y phantomjs');
+    expect(patched).toContain('RUN apt-get update && apt-get install -y curl');
+  });
+
+  // P1-1 v8 — additional Dockerfile fix patterns. Each rescues a known
+  // class of broken XBOW challenges. Counts cited from agent C audit
+  // 2026-05-02 against /tmp/huntress-xbow-bench/benchmarks.
+
+  it('v8: strips phantomjs from apt-get install (rescues 23 challenges)', async () => {
+    const dfPath = join(testDir, 'Dockerfile');
+    writeFileSync(dfPath, [
+      'FROM python:2.7-slim',
+      'RUN apt-get update && apt-get install -y curl phantomjs build-essential',
+      'CMD ["python", "run.py"]',
+    ].join('\n'));
+
+    await makeRunner().patchChallengeDockerfiles(testDir);
+    const patched = readFileSync(dfPath, 'utf-8');
+    expect(patched).not.toContain('phantomjs');
+    // Other packages must still be there
+    expect(patched).toMatch(/apt-get install[^\n]*curl/);
+    expect(patched).toMatch(/apt-get install[^\n]*build-essential/);
+  });
+
+  it('v8: rewrites bare `netcat` to `netcat-traditional` (rescues 5 challenges)', async () => {
+    const dfPath = join(testDir, 'Dockerfile');
+    writeFileSync(dfPath, [
+      'FROM debian:buster',
+      'RUN apt-get update && apt-get install -y curl netcat jq',
+      'CMD ["bash"]',
+    ].join('\n'));
+
+    await makeRunner().patchChallengeDockerfiles(testDir);
+    const patched = readFileSync(dfPath, 'utf-8');
+    expect(patched).toContain('netcat-traditional');
+    // Should not match BARE `netcat` followed by space/end (word-boundary check)
+    expect(patched).not.toMatch(/[ \t]netcat[ \t]/);
+  });
+
+  it('v8: hardens `RUN composer install` with --no-scripts/--no-dev (rescues 2 challenges)', async () => {
+    const dfPath = join(testDir, 'Dockerfile');
+    writeFileSync(dfPath, [
+      'FROM php:8.0-apache',
+      'COPY composer.json composer.lock ./',
+      'RUN composer install',
+      'CMD ["apache2-foreground"]',
+    ].join('\n'));
+
+    await makeRunner().patchChallengeDockerfiles(testDir);
+    const patched = readFileSync(dfPath, 'utf-8');
+    expect(patched).toContain('composer install --no-scripts --no-dev --ignore-platform-reqs --no-interaction');
+    expect(patched).not.toMatch(/^RUN composer install\s*$/m);
+  });
+
+  it('v8: bullseye fix injects Check-Valid-Until=false branch alongside the buster branch', async () => {
+    const dfPath = join(testDir, 'Dockerfile');
+    writeFileSync(dfPath, [
+      'FROM debian:bullseye-slim',
+      'RUN apt-get update && apt-get install -y curl',
+      'CMD ["bash"]',
+    ].join('\n'));
+
+    await makeRunner().patchChallengeDockerfiles(testDir);
+    const patched = readFileSync(dfPath, 'utf-8');
+    // The conditional patch must contain BOTH branches:
+    //   if buster/stretch/jessie/wheezy → rewrite deb→archive
+    //   elif bullseye → just relax Check-Valid-Until (no URL rewrite)
+    // The shell at build time picks the right branch based on the
+    // actual sources.list contents, so the same Dockerfile patch is
+    // safe across all Debian generations.
+    expect(patched).toContain('bullseye-relax');
+    expect(patched).toContain("grep -qE '(buster|stretch|jessie|wheezy)'");
+    expect(patched).toContain("grep -qE 'bullseye'");
+  });
+
+  it('v8: applies multiple fixes to one Dockerfile in a single pass', async () => {
+    const dfPath = join(testDir, 'Dockerfile');
+    writeFileSync(dfPath, [
+      'FROM python:2.7-slim',
+      'RUN apt-get update && apt-get install -y phantomjs netcat',
+      'COPY composer.json ./',
+      'RUN composer install',
+      'CMD ["python", "run.py"]',
+    ].join('\n'));
+
+    await makeRunner().patchChallengeDockerfiles(testDir);
+    const patched = readFileSync(dfPath, 'utf-8');
+    expect(patched).not.toContain('phantomjs');
+    expect(patched).toContain('netcat-traditional');
+    expect(patched).toContain('composer install --no-scripts');
+    expect(patched).toContain('huntress-archive-patch'); // marker present
   });
 
   it('inserts a Check-Valid-Until=false config (handles expired Release files)', async () => {
